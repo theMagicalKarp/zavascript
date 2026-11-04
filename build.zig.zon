@@ -1,0 +1,14 @@
+.{
+    .name = .zavascript,
+    .version = "0.0.0",
+    .fingerprint = 0xa344111f372fa55b,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}
