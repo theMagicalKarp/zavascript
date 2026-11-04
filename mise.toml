@@ -1,0 +1,44 @@
+[tools]
+zig = "0.17.0"
+node = "24.22.2"
+"npm:typescript" = "6.0.3"
+
+[tasks.build]
+description = "Build the project"
+run = "zig build -Doptimize=${ZIG_OPTIMIZE:-Debug}"
+
+[tasks.run]
+description = "Build and run a TypeScript file"
+run = "zig build run -Doptimize=${ZIG_OPTIMIZE:-Debug} --"
+
+[tasks.repl]
+description = "Start the REPL"
+run = "zig build run -Doptimize=${ZIG_OPTIMIZE:-Debug}"
+
+[tasks.test]
+description = "Run unit tests and the conformance cases"
+run = "zig build test --summary all"
+
+[tasks.oracle]
+description = "Check the conformance annotations against tsc and node"
+run = "node tests/oracle.mjs"
+
+[tasks.bench]
+description = "Run the benchmarks and compare against .bench/baseline.json"
+run = "zig build bench -Doptimize=fast --"
+
+[tasks."bench:baseline"]
+description = "Save the latest benchmark run as the baseline"
+run = "cp .bench/latest.json .bench/baseline.json"
+
+[tasks.fmt]
+description = "Check formatting without writing changes"
+run = "zig fmt --check --exclude zig-pkg ."
+
+[tasks.fix]
+description = "Auto format all source files"
+run = "zig fmt --exclude zig-pkg ."
+
+[tasks.check]
+description = "Run everything CI runs"
+depends = ["test", "fmt", "oracle"]
