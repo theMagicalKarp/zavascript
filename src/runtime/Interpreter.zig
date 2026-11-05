@@ -2,10 +2,12 @@
 
 const std = @import("std");
 const ast = @import("../syntax/ast.zig");
+const Checker = @import("../check/Checker.zig");
 const value = @import("value.zig");
 const number = @import("number.zig");
 const Value = value.Value;
 const Expr = ast.Expr;
+const Stmt = ast.Stmt;
 
 const Interpreter = @This();
 
@@ -17,6 +19,14 @@ stdout: *std.Io.Writer,
 /// Where `console.error` and `console.warn` write.
 stderr: *std.Io.Writer,
 globals: std.StringHashMapUnmanaged(Value) = .empty,
+/// Every variable's value, indexed by the slot the checker gave it. There are no functions yet,
+/// so each declaration has exactly one slot, kept for the life of the runtime so the REPL can
+/// use it on later lines.
+slots: std.ArrayList(Value) = .empty,
+/// What the identifiers of the program being run resolve to.
+refs: []const Checker.Ref = &.{},
+/// The slot of the running program's first variable.
+slot_base: u32 = 0,
 
 pub const Error = error{ OutOfMemory, WriteFailed };
 
@@ -29,17 +39,201 @@ pub fn init(arena: std.mem.Allocator, stdout: *std.Io.Writer, stderr: *std.Io.Wr
     return interpreter;
 }
 
-/// Runs the statements in order, returning the value of the last expression statement, which
-/// is what the REPL prints.
-pub fn run(this: *Interpreter, program: ast.Program) Error!Value {
-    var completion: Value = .undefined;
-    for (program.statements) |stmt| {
-        switch (stmt.data) {
-            .expression => |e| completion = try this.evaluate(e),
-            .empty => {},
+/// A checked program, ready to run.
+pub const Program = struct {
+    ast: ast.Program,
+    resolved: Checker.Resolved,
+};
+
+/// Runs the statements in order, returning the program's completion value (ECMA-262 §8.4): for
+/// the most part, the value of the last expression statement that ran. It's what the REPL
+/// prints.
+pub fn run(this: *Interpreter, program: Program) Error!Value {
+    this.refs = program.resolved.refs;
+    this.slot_base = program.resolved.slot_base;
+    if (this.slots.items.len < program.resolved.slot_count) {
+        try this.slots.appendNTimes(this.arena, .undefined, program.resolved.slot_count - this.slots.items.len);
+    }
+    // There's nothing for a `break` to escape at the top level; the checker has made sure.
+    return switch (try this.statementList(program.ast.statements)) {
+        .normal => |v| v orelse .undefined,
+        else => unreachable,
+    };
+}
+
+// Statements
+
+/// How a statement finished. Null values are the spec's "empty".
+const Completion = union(enum) {
+    normal: ?Value,
+    @"break": Jump,
+    @"continue": Jump,
+
+    const Jump = struct {
+        label: ?[]const u8,
+        value: ?Value,
+    };
+
+    fn value(this: Completion) ?Value {
+        return switch (this) {
+            .normal => |v| v,
+            .@"break", .@"continue" => |j| j.value,
+        };
+    }
+
+    /// UpdateEmpty (§6.2.4.6): fills in the value if the statement didn't produce one.
+    fn updateEmpty(this: Completion, v: Value) Completion {
+        return switch (this) {
+            .normal => |current| .{ .normal = current orelse v },
+            .@"break" => |j| .{ .@"break" = .{ .label = j.label, .value = j.value orelse v } },
+            .@"continue" => |j| .{ .@"continue" = .{ .label = j.label, .value = j.value orelse v } },
+        };
+    }
+};
+
+fn statementList(this: *Interpreter, statements: []const *Stmt) Error!Completion {
+    var last: ?Value = null;
+    for (statements) |stmt| {
+        const completion = try this.statement(stmt, &.{});
+        if (completion != .normal) {
+            return if (last) |v| completion.updateEmpty(v) else completion;
         }
+        last = completion.normal orelse last;
+    }
+    return .{ .normal = last };
+}
+
+/// `labels` are the labels directly on this statement (LabelledEvaluation's label set).
+fn statement(this: *Interpreter, stmt: *const Stmt, labels: []const []const u8) Error!Completion {
+    switch (stmt.data) {
+        .expression => |e| return .{ .normal = try this.evaluate(e) },
+        .empty => return .{ .normal = null },
+        .variable => |v| {
+            for (v.declarators) |d| {
+                const initial: Value = if (d.init) |e| try this.evaluate(e) else .undefined;
+                this.slots.items[this.slotOf(d)] = initial;
+            }
+            return .{ .normal = null };
+        },
+        .block => |statements| return this.statementList(statements),
+        .@"if" => |i| {
+            const branch = if ((try this.evaluate(i.condition)).toBoolean()) i.then else i.otherwise orelse return .{ .normal = .undefined };
+            return (try this.statement(branch, &.{})).updateEmpty(.undefined);
+        },
+        .@"while", .do_while, .@"for" => return breakable(try this.loop(stmt, labels)),
+        .@"switch" => |sw| return breakable(try this.switchStatement(sw)),
+        .@"break" => |j| return .{ .@"break" = .{ .label = j.label, .value = null } },
+        .@"continue" => |j| return .{ .@"continue" = .{ .label = j.label, .value = null } },
+        .labeled => |*l| {
+            // Only `a: b: ...` needs a new list; a single label is used where it is.
+            const all = if (labels.len == 0) (&l.label)[0..1] else try std.mem.concat(this.arena, []const u8, &.{ labels, &.{l.label} });
+            const completion = try this.statement(l.body, all);
+            if (completion == .@"break" and completion.@"break".label != null and std.mem.eql(u8, completion.@"break".label.?, l.label)) {
+                return .{ .normal = completion.@"break".value };
+            }
+            return completion;
+        },
+    }
+}
+
+fn slotOf(this: *const Interpreter, d: ast.Declarator) u32 {
+    return this.slot_base + d.binding;
+}
+
+/// A loop or `switch` finishes normally when an unlabeled `break` leaves it.
+fn breakable(completion: Completion) Completion {
+    if (completion == .@"break" and completion.@"break".label == null) {
+        return .{ .normal = completion.@"break".value orelse .undefined };
     }
     return completion;
+}
+
+/// LoopContinues (§14.7.1.2).
+fn loopContinues(completion: Completion, labels: []const []const u8) bool {
+    return switch (completion) {
+        .normal => true,
+        .@"break" => false,
+        .@"continue" => |j| if (j.label) |label| for (labels) |l| {
+            if (std.mem.eql(u8, l, label)) {
+                break true;
+            }
+        } else false else true,
+    };
+}
+
+fn loop(this: *Interpreter, stmt: *const Stmt, labels: []const []const u8) Error!Completion {
+    var v: Value = .undefined;
+    switch (stmt.data) {
+        .@"while" => |w| while ((try this.evaluate(w.condition)).toBoolean()) {
+            const result = try this.statement(w.body, &.{});
+            if (!loopContinues(result, labels)) {
+                return result.updateEmpty(v);
+            }
+            v = result.value() orelse v;
+        },
+        .do_while => |d| while (true) {
+            const result = try this.statement(d.body, &.{});
+            if (!loopContinues(result, labels)) {
+                return result.updateEmpty(v);
+            }
+            v = result.value() orelse v;
+            if (!(try this.evaluate(d.condition)).toBoolean()) {
+                break;
+            }
+        },
+        .@"for" => |f| {
+            if (f.init) |s| {
+                _ = try this.statement(s, &.{});
+            }
+            while (true) {
+                if (f.condition) |c| {
+                    if (!(try this.evaluate(c)).toBoolean()) {
+                        break;
+                    }
+                }
+                const result = try this.statement(f.body, &.{});
+                if (!loopContinues(result, labels)) {
+                    return result.updateEmpty(v);
+                }
+                v = result.value() orelse v;
+                if (f.update) |u| {
+                    _ = try this.evaluate(u);
+                }
+            }
+        },
+        else => unreachable,
+    }
+    return .{ .normal = v };
+}
+
+/// CaseBlockEvaluation (§14.12.4): runs from the first matching `case` (or the `default` if none
+/// matches) to the end, unless something breaks out.
+fn switchStatement(this: *Interpreter, sw: ast.Switch) Error!Completion {
+    const discriminant = try this.evaluate(sw.discriminant);
+    var start: ?usize = null;
+    for (sw.clauses, 0..) |clause, i| {
+        const case = clause.case orelse continue;
+        if ((try this.evaluate(case)).strictEquals(discriminant)) {
+            start = i;
+            break;
+        }
+    }
+    if (start == null) {
+        for (sw.clauses, 0..) |clause, i| {
+            if (clause.case == null) {
+                start = i;
+            }
+        }
+    }
+    var v: Value = .undefined;
+    for (sw.clauses[start orelse return .{ .normal = v } ..]) |clause| {
+        const result = try this.statementList(clause.statements);
+        v = result.value() orelse v;
+        if (result != .normal) {
+            return result.updateEmpty(v);
+        }
+    }
+    return .{ .normal = v };
 }
 
 fn evaluate(this: *Interpreter, expr: *const Expr) Error!Value {
@@ -49,15 +243,64 @@ fn evaluate(this: *Interpreter, expr: *const Expr) Error!Value {
         .boolean => |b| .{ .boolean = b },
         .null => .null,
         .template => |t| this.template(t),
-        // The checker has already rejected unknown names.
-        .identifier => |name| this.globals.get(name).?,
+        .identifier => |id| this.get(id),
         .paren => |inner| this.evaluate(inner),
         .unary => |u| this.unary(u),
+        .update => |u| this.update(u),
+        .assign => |a| this.assign(a),
         .binary => |b| this.binary(b),
         .conditional => |c| if ((try this.evaluate(c.condition)).toBoolean()) this.evaluate(c.then) else this.evaluate(c.otherwise),
         .member => |m| this.member(m),
         .call => |c| this.call(c),
     };
+}
+
+fn get(this: *Interpreter, id: ast.Identifier) Value {
+    return switch (this.refs[id.ref]) {
+        .slot => |slot| this.slots.items[slot],
+        // The checker has already rejected unknown names.
+        .global => |name| this.globals.get(name).?,
+    };
+}
+
+/// The slot an assignment target writes to. The checker only lets variables through.
+fn targetSlot(this: *const Interpreter, target: *const Expr) u32 {
+    return this.refs[ast.skipParens(target).data.identifier.ref].slot;
+}
+
+fn update(this: *Interpreter, u: ast.Update) Error!Value {
+    const slot = this.targetSlot(u.operand);
+    const old = this.slots.items[slot].toNumber();
+    const new = if (u.increment) old + 1 else old - 1;
+    this.slots.items[slot] = .{ .number = new };
+    return .{ .number = if (u.prefix) new else old };
+}
+
+fn assign(this: *Interpreter, a: ast.Assign) Error!Value {
+    const slot = this.targetSlot(a.target);
+    const op = a.op orelse {
+        const v = try this.evaluate(a.value);
+        this.slots.items[slot] = v;
+        return v;
+    };
+    const current = this.slots.items[slot];
+    // The logical assignments only evaluate and assign the right side when they need it.
+    const skip = switch (op) {
+        .logical_and => !current.toBoolean(),
+        .logical_or => current.toBoolean(),
+        .nullish => current != .null and current != .undefined,
+        else => {
+            const result = try this.operate(op, current, try this.evaluate(a.value));
+            this.slots.items[slot] = result;
+            return result;
+        },
+    };
+    if (skip) {
+        return current;
+    }
+    const v = try this.evaluate(a.value);
+    this.slots.items[slot] = v;
+    return v;
 }
 
 fn template(this: *Interpreter, t: ast.Template) Error!Value {
@@ -107,7 +350,13 @@ fn binary(this: *Interpreter, b: ast.Binary) Error!Value {
 
     const left = try this.evaluate(b.left);
     const right = try this.evaluate(b.right);
-    return switch (b.op) {
+    return this.operate(b.op, left, right);
+}
+
+/// A binary operator other than the short-circuiting ones, applied to evaluated operands.
+fn operate(this: *Interpreter, op: ast.BinaryOp, left: Value, right: Value) Error!Value {
+    return switch (op) {
+        .comma => right,
         .add => this.add(left, right),
         .subtract => .{ .number = left.toNumber() - right.toNumber() },
         .multiply => .{ .number = left.toNumber() * right.toNumber() },

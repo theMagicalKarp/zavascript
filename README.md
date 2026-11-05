@@ -18,10 +18,12 @@ $ echo 'console.log("a" * 2)' | zavascript
 ```
 
 > [!NOTE]
-> zavascript is early. Today it runs expressions: literals, templates, every
-> operator, and `console.log`. Variables, functions, objects and the rest are
-> coming. Anything not supported yet is a compile error (`ZV9001`), never a
-> silent misbehavior.
+> zavascript is early. Today it runs `let` and `const` (with primitive type
+> annotations), every operator including assignment, `if`, the loops,
+> `switch`, labeled `break`/`continue`, and `console.log`, with tsc's checks
+> for definite assignment and narrowing by assignment. Functions, objects and
+> the rest are coming. Anything not supported yet is a compile error
+> (`ZV9001`), never a silent misbehavior.
 
 ## Usage
 

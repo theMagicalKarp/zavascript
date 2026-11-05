@@ -1,0 +1,13 @@
+let a: number = "s"; //! TS2322
+let b: string = 1; //! TS2322
+let c: boolean = 1; //! TS2322
+let d: null = undefined; //! TS2322
+let e: number = 1;
+e = null; //! TS2322
+e = "x"; //! TS2322
+let f: never = 1; //! TS2322
+let g: void = null; //! TS2322
+let h = 1;
+h = "x"; //! TS2322
+let t = typeof h;
+t = "nope"; //! TS2322

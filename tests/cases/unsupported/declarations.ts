@@ -1,6 +1,5 @@
 // Syntax that isn't implemented yet is a ZV9001 error, never silently wrong.
-let x = 1; //! ZV9001
-const y = 2; //! ZV9001
+var x = 1; //! ZV9001
 function f() { //! ZV9001
   return 1;
 }

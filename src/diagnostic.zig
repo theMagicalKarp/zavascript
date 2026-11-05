@@ -82,6 +82,12 @@ pub const Diagnostics = struct {
         return this.add(source, start, code, fmt, args);
     }
 
+    /// Drops every diagnostic after the first `len`, for a checker pass whose results are thrown
+    /// away.
+    pub fn truncate(this: *Diagnostics, len: usize) void {
+        this.list.shrinkRetainingCapacity(len);
+    }
+
     pub fn items(this: *const Diagnostics) []const Diagnostic {
         return this.list.items;
     }

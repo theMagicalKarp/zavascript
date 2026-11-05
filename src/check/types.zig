@@ -22,10 +22,18 @@ pub const Type = union(enum) {
     object: *const Object,
     function: *const Function,
 
-    pub const Literal = union(enum) {
-        number: f64,
-        string: []const u8,
-        boolean: bool,
+    pub const Literal = struct {
+        value: Value,
+        /// tsc's "fresh" literal types come straight from a literal in the source, and are the
+        /// only ones a `let` declaration widens: `let a = 1` is a `number`, but `let t = typeof x`
+        /// keeps the literal union `typeof` produces. Freshness doesn't affect identity.
+        fresh: bool = false,
+
+        pub const Value = union(enum) {
+            number: f64,
+            string: []const u8,
+            boolean: bool,
+        };
     };
 
     pub fn eql(a: *const Type, b: *const Type) bool {
@@ -33,7 +41,7 @@ pub const Type = union(enum) {
             return true;
         }
         return switch (a.*) {
-            .literal => |x| b.* == .literal and literalEql(x, b.literal),
+            .literal => |x| b.* == .literal and literalEql(x.value, b.literal.value),
             .@"union" => |ms| b.* == .@"union" and ms.len == b.@"union".len and for (ms) |m| {
                 if (!b.contains(m)) {
                     break false;
@@ -68,42 +76,16 @@ pub const Type = union(enum) {
 
     pub fn format(this: *const Type, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (this.*) {
-            .literal => |lit| switch (lit) {
+            .literal => |lit| switch (lit.value) {
                 .number => |n| try @import("../runtime/number.zig").format(writer, n),
                 .string => |s| try writer.print("\"{s}\"", .{s}),
                 .boolean => |b| try writer.writeAll(if (b) "true" else "false"),
             },
-            .@"union" => |ms| {
-                // tsc prints `boolean` for `true | false`.
-                var has_true = false;
-                var has_false = false;
-                for (ms) |m| {
-                    if (m.* == .literal and m.literal == .boolean) {
-                        if (m.literal.boolean) {
-                            has_true = true;
-                        } else {
-                            has_false = true;
-                        }
-                    }
+            .@"union" => |ms| for (ms, 0..) |m, i| {
+                if (i > 0) {
+                    try writer.writeAll(" | ");
                 }
-                var first = true;
-                for (ms) |m| {
-                    if (has_true and has_false and m.* == .literal and m.literal == .boolean) {
-                        if (!m.literal.boolean) {
-                            continue;
-                        }
-                        if (!first) {
-                            try writer.writeAll(" | ");
-                        }
-                        try writer.writeAll("boolean");
-                    } else {
-                        if (!first) {
-                            try writer.writeAll(" | ");
-                        }
-                        try writer.print("{f}", .{m});
-                    }
-                    first = false;
-                }
+                try writer.print("{f}", .{m});
             },
             .object => |o| try writer.writeAll(o.name),
             .function => |f| try f.format(writer),
@@ -112,7 +94,7 @@ pub const Type = union(enum) {
     }
 };
 
-fn literalEql(a: Type.Literal, b: Type.Literal) bool {
+fn literalEql(a: Type.Literal.Value, b: Type.Literal.Value) bool {
     return switch (a) {
         .number => |x| b == .number and (x == b.number or (std.math.isNan(x) and std.math.isNan(b.number))),
         .string => |x| b == .string and std.mem.eql(u8, x, b.string),
@@ -179,14 +161,16 @@ pub const @"null": *const Type = &.null;
 pub const boolean: *const Type = &.boolean;
 pub const number: *const Type = &.number;
 pub const string: *const Type = &.string;
-pub const @"true": *const Type = &.{ .literal = .{ .boolean = true } };
-pub const @"false": *const Type = &.{ .literal = .{ .boolean = false } };
+pub const @"true": *const Type = &.{ .literal = .{ .value = .{ .boolean = true } } };
+pub const @"false": *const Type = &.{ .literal = .{ .value = .{ .boolean = false } } };
+const fresh_true: *const Type = &.{ .literal = .{ .value = .{ .boolean = true }, .fresh = true } };
+const fresh_false: *const Type = &.{ .literal = .{ .value = .{ .boolean = false }, .fresh = true } };
 
 /// The primitive a literal type belongs to (`1` → `number`); other types are unchanged.
 /// `true | false` widens to `boolean`, and so on member by member for unions.
 pub fn widen(arena: std.mem.Allocator, t: *const Type) error{OutOfMemory}!*const Type {
     return switch (t.*) {
-        .literal => |lit| switch (lit) {
+        .literal => |lit| switch (lit.value) {
             .number => number,
             .string => string,
             .boolean => boolean,
@@ -202,8 +186,25 @@ pub fn widen(arena: std.mem.Allocator, t: *const Type) error{OutOfMemory}!*const
     };
 }
 
+/// Like `widen`, but only for fresh literals; what a `let` declaration does to its initializer's
+/// type (tsc's `getWidenedLiteralType`).
+pub fn widenFresh(arena: std.mem.Allocator, t: *const Type) error{OutOfMemory}!*const Type {
+    return switch (t.*) {
+        .literal => |lit| if (lit.fresh) widen(arena, t) else t,
+        .@"union" => |ms| blk: {
+            var widened: std.ArrayList(*const Type) = .empty;
+            for (ms) |m| {
+                try widened.append(arena, try widenFresh(arena, m));
+            }
+            break :blk unionOf(arena, widened.items);
+        },
+        else => t,
+    };
+}
+
 /// The union of `parts`, flattened and deduplicated. Literals are absorbed by their primitive,
-/// `never` disappears, and `any`/`unknown` swallow everything.
+/// `never` disappears, `any`/`unknown` swallow everything, and `true | false` is `boolean`.
+/// Members are kept in the order tsc prints them.
 pub fn unionOf(arena: std.mem.Allocator, parts: []const *const Type) error{OutOfMemory}!*const Type {
     var list: std.ArrayList(*const Type) = .empty;
     for (parts) |part| {
@@ -218,16 +219,43 @@ pub fn unionOf(arena: std.mem.Allocator, parts: []const *const Type) error{OutOf
             if (m.* == .never) {
                 continue;
             }
-            var duplicate = false;
-            for (list.items) |existing| {
+            const index = for (list.items, 0..) |existing, i| {
                 if (existing.eql(m)) {
-                    duplicate = true;
+                    break i;
                 }
-            }
-            if (!duplicate) {
+            } else null;
+            if (index) |i| {
+                // Like tsc, a regular literal wins over a fresh one.
+                if (m.* == .literal and !m.literal.fresh) {
+                    list.items[i] = m;
+                }
+            } else {
                 try list.append(arena, m);
             }
         }
+    }
+    // `true | false` is `boolean`.
+    var has_true = false;
+    var has_false = false;
+    for (list.items) |m| {
+        if (m.* == .literal and m.literal.value == .boolean) {
+            if (m.literal.value.boolean) {
+                has_true = true;
+            } else {
+                has_false = true;
+            }
+        }
+    }
+    if (has_true and has_false) {
+        var i: usize = 0;
+        while (i < list.items.len) {
+            if (list.items[i].* == .literal and list.items[i].literal.value == .boolean) {
+                _ = list.orderedRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+        try list.append(arena, boolean);
     }
     // Drop literals whose primitive is also present.
     var i: usize = 0;
@@ -253,7 +281,33 @@ pub fn unionOf(arena: std.mem.Allocator, parts: []const *const Type) error{OutOf
     if (list.items.len == 1) {
         return list.items[0];
     }
+    std.mem.sort(*const Type, list.items, {}, printsBefore);
     return asPtr(.{ .@"union" = list.items }, arena);
+}
+
+/// tsc orders a union's members by when each type was created: its built-in types first (in a
+/// fixed order), then literals in the order the program mentions them. It prints `null` and
+/// `undefined` last. The sort is stable, so literals keep their relative order.
+fn printsBefore(_: void, a: *const Type, b: *const Type) bool {
+    return printRank(a) < printRank(b);
+}
+
+fn printRank(t: *const Type) u8 {
+    return switch (t.*) {
+        .string => 0,
+        .number => 1,
+        .bigint => 2,
+        .boolean => 3,
+        .literal => |lit| switch (lit.value) {
+            .boolean => |b| if (b) 4 else 3,
+            else => 5,
+        },
+        .void => 6,
+        .object, .function => 7,
+        .null => 8,
+        .undefined => 9,
+        .any, .unknown, .never, .@"union" => 10,
+    };
 }
 
 fn asPtr(t: Type, arena: std.mem.Allocator) error{OutOfMemory}!*const Type {
@@ -262,11 +316,41 @@ fn asPtr(t: Type, arena: std.mem.Allocator) error{OutOfMemory}!*const Type {
     return p;
 }
 
-pub fn literal(arena: std.mem.Allocator, lit: Type.Literal) error{OutOfMemory}!*const Type {
-    if (lit == .boolean) {
-        return if (lit.boolean) @"true" else @"false";
+/// A regular (not fresh) literal type.
+pub fn literal(arena: std.mem.Allocator, value: Type.Literal.Value) error{OutOfMemory}!*const Type {
+    if (value == .boolean) {
+        return if (value.boolean) @"true" else @"false";
     }
-    return asPtr(.{ .literal = lit }, arena);
+    return asPtr(.{ .literal = .{ .value = value } }, arena);
+}
+
+/// The type of a literal in the source.
+pub fn freshLiteral(arena: std.mem.Allocator, value: Type.Literal.Value) error{OutOfMemory}!*const Type {
+    if (value == .boolean) {
+        return if (value.boolean) fresh_true else fresh_false;
+    }
+    return asPtr(.{ .literal = .{ .value = value, .fresh = true } }, arena);
+}
+
+/// Whether `t` is a union as far as narrowing is concerned, which `boolean` (`true | false`) is.
+pub fn isUnion(t: *const Type) bool {
+    return t.* == .@"union" or t.* == .boolean;
+}
+
+/// The members of `t` with `boolean` split into `true` and `false`, which is how narrowing and
+/// comparisons see it.
+pub fn expandedMembers(arena: std.mem.Allocator, t: *const Type) error{OutOfMemory}![]const *const Type {
+    var buffer: [1]*const Type = undefined;
+    const ms = t.members(&buffer);
+    var list: std.ArrayList(*const Type) = .empty;
+    for (ms) |m| {
+        if (m.* == .boolean) {
+            try list.appendSlice(arena, &.{ @"true", @"false" });
+        } else {
+            try list.append(arena, m);
+        }
+    }
+    return list.items;
 }
 
 /// `boolean` as the union `true | false`, which is how narrowing and comparisons see it.
@@ -299,11 +383,12 @@ fn overlaps(x: *const Type, y: *const Type) bool {
     if (isNullish(x) or isNullish(y)) {
         return true;
     }
+    // `never` is related to everything.
     if (x.* == .never or y.* == .never) {
-        return false;
+        return true;
     }
     if (x.* == .literal and y.* == .literal) {
-        return literalEql(x.literal, y.literal);
+        return literalEql(x.literal.value, y.literal.value);
     }
     if (x.* == .object and y.* == .object) {
         return x.object == y.object;
@@ -326,7 +411,7 @@ fn primitiveKind(t: *const Type) Kind {
         .string => .string,
         .boolean => .boolean,
         .bigint => .bigint,
-        .literal => |lit| switch (lit) {
+        .literal => |lit| switch (lit.value) {
             .number => .number,
             .string => .string,
             .boolean => .boolean,
@@ -356,6 +441,70 @@ fn allOfKind(t: *const Type, kind: Kind) bool {
         }
     }
     return true;
+}
+
+/// Whether a value of type `source` can be used where `target` is expected.
+pub fn assignable(source: *const Type, target: *const Type) bool {
+    if (source.eql(target)) {
+        return true;
+    }
+    if (target.* == .any or target.* == .unknown or source.* == .any or source.* == .never) {
+        return true;
+    }
+    if (source.* == .@"union") {
+        for (source.@"union") |m| {
+            if (!assignable(m, target)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (source.* == .boolean) {
+        return assignable(@"true", target) and assignable(@"false", target);
+    }
+    if (target.* == .@"union") {
+        for (target.@"union") |m| {
+            if (assignable(source, m)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return switch (target.*) {
+        .number => isNumberLike(source),
+        .string => isStringLike(source),
+        .boolean => source.* == .literal and source.literal.value == .boolean,
+        .void => source.* == .undefined,
+        else => false,
+    };
+}
+
+/// Whether `t` is or includes `undefined` (or `void`, `any` or `unknown`, which can all hold it).
+pub fn includesUndefined(t: *const Type) bool {
+    var buffer: [1]*const Type = undefined;
+    for (t.members(&buffer)) |m| {
+        switch (m.*) {
+            .undefined, .void, .any, .unknown => return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// tsc's `typeCouldHaveTopLevelSingletonTypes`: when it's false, a literal source type is shown
+/// widened in "not assignable" messages (`Type 'string'` rather than `Type '"a"'`).
+pub fn couldHaveSingletons(t: *const Type) bool {
+    // `boolean` alone doesn't count, but as part of a union its `true` and `false` do.
+    if (t.* != .@"union") {
+        return t.* == .literal or t.* == .null or t.* == .undefined;
+    }
+    for (t.@"union") |m| {
+        switch (m.*) {
+            .literal, .null, .undefined, .boolean => return true,
+            else => {},
+        }
+    }
+    return false;
 }
 
 const testing = std.testing;
@@ -392,6 +541,29 @@ test comparable {
     try testing.expect(!comparable(@"true", @"false"));
     try testing.expect(comparable(try unionOf(a, &.{ one, string }), string));
     try testing.expect(comparable(any, string));
+    try testing.expect(comparable(never, string));
+}
+
+test assignable {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const one = try freshLiteral(a, .{ .number = 1 });
+    try testing.expect(assignable(one, number));
+    try testing.expect(!assignable(number, one));
+    try testing.expect(assignable(boolean, try unionOf(a, &.{ @"true", @"false", string })));
+    try testing.expect(assignable(@"undefined", @"void"));
+    try testing.expect(!assignable(@"null", number));
+    try testing.expect(assignable(try unionOf(a, &.{ one, string }), try unionOf(a, &.{ number, string })));
+}
+
+test widenFresh {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fresh = try unionOf(a, &.{ try freshLiteral(a, .{ .number = 1 }), try literal(a, .{ .string = "x" }) });
+    try testing.expectFmt("number | \"x\"", "{f}", .{try widenFresh(a, fresh)});
+    try testing.expectFmt("boolean", "{f}", .{try widenFresh(a, fresh_true)});
 }
 
 test "format" {
@@ -399,5 +571,6 @@ test "format" {
     defer arena.deinit();
     const a = arena.allocator();
     const t = try unionOf(a, &.{ try literal(a, .{ .string = "x" }), try literal(a, .{ .number = 1.5 }), @"true", @"false" });
-    try testing.expectFmt("\"x\" | 1.5 | boolean", "{f}", .{t});
+    try testing.expectFmt("boolean | \"x\" | 1.5", "{f}", .{t});
+    try testing.expectFmt("string | number | null | undefined", "{f}", .{try unionOf(a, &.{ @"undefined", @"null", number, string })});
 }
