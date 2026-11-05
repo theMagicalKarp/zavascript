@@ -41,15 +41,23 @@ pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
     const out = &stdout_writer.interface;
-    if (builtin.mode == .debug) try out.writeAll("warning: this is a Debug build; use -Doptimize=fast\n\n");
+    if (builtin.mode == .debug) {
+        try out.writeAll("warning: this is a Debug build; use -Doptimize=fast\n\n");
+    }
 
     var dir = try std.Io.Dir.cwd().openDir(io, cases_path, .{ .iterate = true });
     defer dir.close(io);
     var names: std.ArrayList([]const u8) = .empty;
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
-        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".ts")) continue;
-        if (filter) |f| if (std.mem.indexOf(u8, entry.name, f) == null) continue;
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".ts")) {
+            continue;
+        }
+        if (filter) |f| {
+            if (std.mem.indexOf(u8, entry.name, f) == null) {
+                continue;
+            }
+        }
         try names.append(arena, try arena.dupe(u8, entry.name));
     }
     std.mem.sort([]const u8, names.items, {}, struct {
@@ -90,7 +98,9 @@ pub fn main(init: std.process.Init) !void {
     // Save the run so it can be compared against later or promoted to the baseline.
     var json: std.Io.Writer.Allocating = .init(arena);
     var cases_json: std.ArrayList(struct { name: []const u8, compile_ns: u64, run_ns: u64 }) = .empty;
-    for (results.items) |r| try cases_json.append(arena, .{ .name = r.name, .compile_ns = r.median[0], .run_ns = r.median[1] });
+    for (results.items) |r| {
+        try cases_json.append(arena, .{ .name = r.name, .compile_ns = r.median[0], .run_ns = r.median[1] });
+    }
     try std.json.Stringify.value(.{ .cases = cases_json.items }, .{ .whitespace = .indent_2 }, &json.writer);
     try results_dir.writeFile(io, .{ .sub_path = "latest.json", .data = json.written() });
     try out.print("\nwrote {s}/latest.json\n", .{results_path});
@@ -113,14 +123,18 @@ fn measure(io: std.Io, gpa: std.mem.Allocator, name: []const u8, source: []const
         const program = runtime.compile(name, source) catch |err| {
             if (err == error.CompileError) {
                 std.debug.print("{s} doesn't compile:\n", .{name});
-                for (runtime.diagnostics.items()) |d| std.debug.print("{f}\n", .{d});
+                for (runtime.diagnostics.items()) |d| {
+                    std.debug.print("{f}\n", .{d});
+                }
             }
             return err;
         };
         const compiled = std.Io.Timestamp.now(io, .awake);
         _ = try runtime.execute(program);
         const finished = std.Io.Timestamp.now(io, .awake);
-        if (n == 0) continue;
+        if (n == 0) {
+            continue;
+        }
         const compile_ns: u64 = @intCast(start.durationTo(compiled).nanoseconds);
         const run_ns: u64 = @intCast(compiled.durationTo(finished).nanoseconds);
         try samples[0].append(gpa, compile_ns);
@@ -144,10 +158,14 @@ fn loadBaseline(io: std.Io, arena: std.mem.Allocator, dir: std.Io.Dir) ?Saved {
 
 fn baselineFor(baseline: ?Saved, name: []const u8, phase: Phase) ?u64 {
     const saved = baseline orelse return null;
-    for (saved.cases) |c| if (std.mem.eql(u8, c.name, name)) return switch (phase) {
-        .compile => c.compile_ns,
-        .run => c.run_ns,
-    };
+    for (saved.cases) |c| {
+        if (std.mem.eql(u8, c.name, name)) {
+            return switch (phase) {
+                .compile => c.compile_ns,
+                .run => c.run_ns,
+            };
+        }
+    }
     return null;
 }
 

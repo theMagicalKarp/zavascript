@@ -20,7 +20,9 @@ pub fn init(gpa: std.mem.Allocator, path: []const u8, text: []const u8) !Source 
         switch (text[i]) {
             '\n' => try starts.append(gpa, @intCast(i + 1)),
             '\r' => {
-                if (i + 1 < text.len and text[i + 1] == '\n') i += 1;
+                if (i + 1 < text.len and text[i + 1] == '\n') {
+                    i += 1;
+                }
                 try starts.append(gpa, @intCast(i + 1));
             },
             // U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR.
@@ -52,7 +54,11 @@ pub fn location(this: Source, offset: u32) Location {
     var hi: usize = this.line_starts.len;
     while (hi - lo > 1) {
         const mid = lo + (hi - lo) / 2;
-        if (this.line_starts[mid] <= offset) lo = mid else hi = mid;
+        if (this.line_starts[mid] <= offset) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
     }
     const start = this.line_starts[lo];
     const end = @min(offset, this.text.len);
@@ -63,7 +69,9 @@ pub fn location(this: Source, offset: u32) Location {
 fn utf16Length(bytes: []const u8) usize {
     var n: usize = 0;
     for (bytes) |byte| {
-        if (byte & 0xC0 == 0x80) continue; // continuation byte
+        if (byte & 0xC0 == 0x80) {
+            continue;
+        } // continuation byte
         n += if (byte >= 0xF0) 2 else 1; // four-byte sequences are surrogate pairs
     }
     return n;

@@ -29,11 +29,15 @@ pub const Type = union(enum) {
     };
 
     pub fn eql(a: *const Type, b: *const Type) bool {
-        if (a == b) return true;
+        if (a == b) {
+            return true;
+        }
         return switch (a.*) {
             .literal => |x| b.* == .literal and literalEql(x, b.literal),
             .@"union" => |ms| b.* == .@"union" and ms.len == b.@"union".len and for (ms) |m| {
-                if (!b.contains(m)) break false;
+                if (!b.contains(m)) {
+                    break false;
+                }
             } else true,
             .object => |o| b.* == .object and b.object == o,
             .function => |f| b.* == .function and b.function == f,
@@ -43,7 +47,11 @@ pub const Type = union(enum) {
 
     fn contains(this: *const Type, member: *const Type) bool {
         var buffer: [1]*const Type = undefined;
-        for (this.members(&buffer)) |m| if (m.eql(member)) return true;
+        for (this.members(&buffer)) |m| {
+            if (m.eql(member)) {
+                return true;
+            }
+        }
         return false;
     }
 
@@ -69,17 +77,29 @@ pub const Type = union(enum) {
                 // tsc prints `boolean` for `true | false`.
                 var has_true = false;
                 var has_false = false;
-                for (ms) |m| if (m.* == .literal and m.literal == .boolean) {
-                    if (m.literal.boolean) has_true = true else has_false = true;
-                };
+                for (ms) |m| {
+                    if (m.* == .literal and m.literal == .boolean) {
+                        if (m.literal.boolean) {
+                            has_true = true;
+                        } else {
+                            has_false = true;
+                        }
+                    }
+                }
                 var first = true;
                 for (ms) |m| {
                     if (has_true and has_false and m.* == .literal and m.literal == .boolean) {
-                        if (!m.literal.boolean) continue;
-                        if (!first) try writer.writeAll(" | ");
+                        if (!m.literal.boolean) {
+                            continue;
+                        }
+                        if (!first) {
+                            try writer.writeAll(" | ");
+                        }
                         try writer.writeAll("boolean");
                     } else {
-                        if (!first) try writer.writeAll(" | ");
+                        if (!first) {
+                            try writer.writeAll(" | ");
+                        }
                         try writer.print("{f}", .{m});
                     }
                     first = false;
@@ -111,7 +131,11 @@ pub const Object = struct {
     properties: []const Property,
 
     pub fn property(this: *const Object, name: []const u8) ?*const Type {
-        for (this.properties) |p| if (std.mem.eql(u8, p.name, name)) return p.type;
+        for (this.properties) |p| {
+            if (std.mem.eql(u8, p.name, name)) {
+                return p.type;
+            }
+        }
         return null;
     }
 };
@@ -130,11 +154,15 @@ pub const Function = struct {
     pub fn format(this: *const Function, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.writeAll("(");
         for (this.parameters, 0..) |p, i| {
-            if (i > 0) try writer.writeAll(", ");
+            if (i > 0) {
+                try writer.writeAll(", ");
+            }
             try writer.print("{s}: {f}", .{ p.name, p.type });
         }
         if (this.rest) |r| {
-            if (this.parameters.len > 0) try writer.writeAll(", ");
+            if (this.parameters.len > 0) {
+                try writer.writeAll(", ");
+            }
             try writer.print("...{s}: {f}[]", .{ r.name, r.type });
         }
         try writer.print(") => {f}", .{this.returns});
@@ -165,7 +193,9 @@ pub fn widen(arena: std.mem.Allocator, t: *const Type) error{OutOfMemory}!*const
         },
         .@"union" => |ms| blk: {
             var widened: std.ArrayList(*const Type) = .empty;
-            for (ms) |m| try widened.append(arena, try widen(arena, m));
+            for (ms) |m| {
+                try widened.append(arena, try widen(arena, m));
+            }
             break :blk unionOf(arena, widened.items);
         },
         else => t,
@@ -177,16 +207,26 @@ pub fn widen(arena: std.mem.Allocator, t: *const Type) error{OutOfMemory}!*const
 pub fn unionOf(arena: std.mem.Allocator, parts: []const *const Type) error{OutOfMemory}!*const Type {
     var list: std.ArrayList(*const Type) = .empty;
     for (parts) |part| {
-        if (part.* == .any) return any;
-        if (part.* == .unknown) return unknown;
+        if (part.* == .any) {
+            return any;
+        }
+        if (part.* == .unknown) {
+            return unknown;
+        }
         var buffer: [1]*const Type = undefined;
         for (part.members(&buffer)) |m| {
-            if (m.* == .never) continue;
+            if (m.* == .never) {
+                continue;
+            }
             var duplicate = false;
-            for (list.items) |existing| if (existing.eql(m)) {
-                duplicate = true;
-            };
-            if (!duplicate) try list.append(arena, m);
+            for (list.items) |existing| {
+                if (existing.eql(m)) {
+                    duplicate = true;
+                }
+            }
+            if (!duplicate) {
+                try list.append(arena, m);
+            }
         }
     }
     // Drop literals whose primitive is also present.
@@ -196,7 +236,9 @@ pub fn unionOf(arena: std.mem.Allocator, parts: []const *const Type) error{OutOf
         if (m.* == .literal) {
             const base = try widen(arena, m);
             const has_base = for (list.items) |other| {
-                if (other.eql(base)) break true;
+                if (other.eql(base)) {
+                    break true;
+                }
             } else false;
             if (has_base) {
                 _ = list.orderedRemove(i);
@@ -205,8 +247,12 @@ pub fn unionOf(arena: std.mem.Allocator, parts: []const *const Type) error{OutOf
         }
         i += 1;
     }
-    if (list.items.len == 0) return never;
-    if (list.items.len == 1) return list.items[0];
+    if (list.items.len == 0) {
+        return never;
+    }
+    if (list.items.len == 1) {
+        return list.items[0];
+    }
     return asPtr(.{ .@"union" = list.items }, arena);
 }
 
@@ -217,7 +263,9 @@ fn asPtr(t: Type, arena: std.mem.Allocator) error{OutOfMemory}!*const Type {
 }
 
 pub fn literal(arena: std.mem.Allocator, lit: Type.Literal) error{OutOfMemory}!*const Type {
-    if (lit == .boolean) return if (lit.boolean) @"true" else @"false";
+    if (lit == .boolean) {
+        return if (lit.boolean) @"true" else @"false";
+    }
     return asPtr(.{ .literal = lit }, arena);
 }
 
@@ -231,20 +279,38 @@ fn expandBoolean(t: *const Type, buffer: *[1]*const Type) []const *const Type {
 /// This is tsc's "comparable" relation, which for the types we have so far means the two share
 /// at least one possible value.
 pub fn comparable(a: *const Type, b: *const Type) bool {
-    if (a.* == .any or b.* == .any or a.* == .unknown or b.* == .unknown) return true;
+    if (a.* == .any or b.* == .any or a.* == .unknown or b.* == .unknown) {
+        return true;
+    }
     var a_buffer: [1]*const Type = undefined;
     var b_buffer: [1]*const Type = undefined;
-    for (expandBoolean(a, &a_buffer)) |x| for (expandBoolean(b, &b_buffer)) |y| if (overlaps(x, y)) return true;
+    for (expandBoolean(a, &a_buffer)) |x| {
+        for (expandBoolean(b, &b_buffer)) |y| {
+            if (overlaps(x, y)) {
+                return true;
+            }
+        }
+    }
     return false;
 }
 
 fn overlaps(x: *const Type, y: *const Type) bool {
     // Under strict null checks, tsc still allows comparing anything with `null` or `undefined`.
-    if (isNullish(x) or isNullish(y)) return true;
-    if (x.* == .never or y.* == .never) return false;
-    if (x.* == .literal and y.* == .literal) return literalEql(x.literal, y.literal);
-    if (x.* == .object and y.* == .object) return x.object == y.object;
-    if (x.* == .function and y.* == .function) return true;
+    if (isNullish(x) or isNullish(y)) {
+        return true;
+    }
+    if (x.* == .never or y.* == .never) {
+        return false;
+    }
+    if (x.* == .literal and y.* == .literal) {
+        return literalEql(x.literal, y.literal);
+    }
+    if (x.* == .object and y.* == .object) {
+        return x.object == y.object;
+    }
+    if (x.* == .function and y.* == .function) {
+        return true;
+    }
     return primitiveKind(x) != .other and primitiveKind(x) == primitiveKind(y);
 }
 
@@ -284,7 +350,11 @@ pub fn isBigIntLike(t: *const Type) bool {
 
 fn allOfKind(t: *const Type, kind: Kind) bool {
     var buffer: [1]*const Type = undefined;
-    for (t.members(&buffer)) |m| if (primitiveKind(m) != kind) return false;
+    for (t.members(&buffer)) |m| {
+        if (primitiveKind(m) != kind) {
+            return false;
+        }
+    }
     return true;
 }
 

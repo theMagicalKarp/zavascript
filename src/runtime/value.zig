@@ -88,13 +88,23 @@ pub const Value = union(enum) {
     pub fn looseEquals(a: Value, b: Value) bool {
         const a_nullish = a == .undefined or a == .null;
         const b_nullish = b == .undefined or b == .null;
-        if (a_nullish or b_nullish) return a_nullish and b_nullish;
-        if (std.meta.activeTag(a) == std.meta.activeTag(b)) return strictEquals(a, b);
+        if (a_nullish or b_nullish) {
+            return a_nullish and b_nullish;
+        }
+        if (std.meta.activeTag(a) == std.meta.activeTag(b)) {
+            return strictEquals(a, b);
+        }
         const a_object = a == .object or a == .native_function;
         const b_object = b == .object or b == .native_function;
-        if (a_object and b_object) return false;
-        if (a_object) return looseEquals(toPrimitive(a), b);
-        if (b_object) return looseEquals(a, toPrimitive(b));
+        if (a_object and b_object) {
+            return false;
+        }
+        if (a_object) {
+            return looseEquals(toPrimitive(a), b);
+        }
+        if (b_object) {
+            return looseEquals(a, toPrimitive(b));
+        }
         // Different primitive types: compare as numbers.
         return a.toNumber() == b.toNumber();
     }
@@ -129,7 +139,9 @@ pub fn compareStrings(a: []const u8, b: []const u8) std.math.Order {
     while (true) {
         const x = nextUnit(a, &ai, &a_pending) orelse return if (nextUnit(b, &bi, &b_pending) == null) .eq else .lt;
         const y = nextUnit(b, &bi, &b_pending) orelse return .gt;
-        if (x != y) return std.math.order(x, y);
+        if (x != y) {
+            return std.math.order(x, y);
+        }
     }
 }
 
@@ -138,7 +150,9 @@ fn nextUnit(s: []const u8, i: *usize, pending: *?u16) ?u16 {
         pending.* = null;
         return low;
     }
-    if (i.* >= s.len) return null;
+    if (i.* >= s.len) {
+        return null;
+    }
     const len = std.unicode.utf8ByteSequenceLength(s[i.*]) catch {
         i.* += 1;
         return 0xFFFD;
@@ -146,7 +160,9 @@ fn nextUnit(s: []const u8, i: *usize, pending: *?u16) ?u16 {
     const end = @min(i.* + len, s.len);
     const code_point = std.unicode.wtf8Decode(s[i.*..end]) catch 0xFFFD;
     i.* = end;
-    if (code_point < 0x10000) return @intCast(code_point);
+    if (code_point < 0x10000) {
+        return @intCast(code_point);
+    }
     const offset = code_point - 0x10000;
     pending.* = @intCast(0xDC00 + (offset & 0x3FF));
     return @intCast(0xD800 + (offset >> 10));
@@ -159,7 +175,9 @@ pub fn toInt32(n: f64) i32 {
 
 /// ToUint32 (§7.1.7): truncate, then wrap modulo 2^32.
 pub fn toUint32(n: f64) u32 {
-    if (std.math.isNan(n) or std.math.isInf(n)) return 0;
+    if (std.math.isNan(n) or std.math.isInf(n)) {
+        return 0;
+    }
     const truncated = @trunc(n);
     const wrapped = @mod(truncated, 4294967296.0);
     return @intFromFloat(wrapped);
@@ -168,9 +186,15 @@ pub fn toUint32(n: f64) u32 {
 /// Number::exponentiate (§6.1.6.1.3), which differs from C's `pow` for a base of ±1 with an
 /// infinite or NaN exponent.
 pub fn exponentiate(base: f64, exponent: f64) f64 {
-    if (std.math.isNan(exponent)) return std.math.nan(f64);
-    if (exponent == 0) return 1;
-    if (@abs(base) == 1 and std.math.isInf(exponent)) return std.math.nan(f64);
+    if (std.math.isNan(exponent)) {
+        return std.math.nan(f64);
+    }
+    if (exponent == 0) {
+        return 1;
+    }
+    if (@abs(base) == 1 and std.math.isInf(exponent)) {
+        return std.math.nan(f64);
+    }
     return std.math.pow(f64, base, exponent);
 }
 
@@ -186,13 +210,19 @@ pub fn inspect(writer: *std.Io.Writer, value: Value) std.Io.Writer.Error!void {
         .string => |s| try quoteString(writer, s),
         .native_function => |f| try writer.print("[Function: {s}]", .{f.name}),
         .object => |o| {
-            if (o.tag) |tag| try writer.print("{s} ", .{tag});
-            if (o.properties.count() == 0) return writer.writeAll("{}");
+            if (o.tag) |tag| {
+                try writer.print("{s} ", .{tag});
+            }
+            if (o.properties.count() == 0) {
+                return writer.writeAll("{}");
+            }
             try writer.writeAll("{ ");
             var it = o.properties.iterator();
             var first = true;
             while (it.next()) |entry| {
-                if (!first) try writer.writeAll(", ");
+                if (!first) {
+                    try writer.writeAll(", ");
+                }
                 first = false;
                 try writer.print("{s}: ", .{entry.key_ptr.*});
                 try inspect(writer, entry.value_ptr.*);
@@ -210,21 +240,23 @@ fn quoteString(writer: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
     const has_backtick = std.mem.indexOfScalar(u8, s, '`') != null;
     const quote: u8 = if (!has_single) '\'' else if (!has_double) '"' else if (!has_backtick) '`' else '\'';
     try writer.writeByte(quote);
-    for (s) |c| switch (c) {
-        '\n' => try writer.writeAll("\\n"),
-        '\t' => try writer.writeAll("\\t"),
-        '\r' => try writer.writeAll("\\r"),
-        0x08 => try writer.writeAll("\\b"),
-        0x0C => try writer.writeAll("\\f"),
-        0x0B => try writer.writeAll("\\v"),
-        '\\' => try writer.writeAll("\\\\"),
-        else => if (c == quote) {
-            try writer.writeByte('\\');
-            try writer.writeByte(c);
-        } else if (c < 0x20 or c == 0x7F) {
-            try writer.print("\\x{X:0>2}", .{c});
-        } else try writer.writeByte(c),
-    };
+    for (s) |c| {
+        switch (c) {
+            '\n' => try writer.writeAll("\\n"),
+            '\t' => try writer.writeAll("\\t"),
+            '\r' => try writer.writeAll("\\r"),
+            0x08 => try writer.writeAll("\\b"),
+            0x0C => try writer.writeAll("\\f"),
+            0x0B => try writer.writeAll("\\v"),
+            '\\' => try writer.writeAll("\\\\"),
+            else => if (c == quote) {
+                try writer.writeByte('\\');
+                try writer.writeByte(c);
+            } else if (c < 0x20 or c == 0x7F) {
+                try writer.print("\\x{X:0>2}", .{c});
+            } else try writer.writeByte(c),
+        }
+    }
     try writer.writeByte(quote);
 }
 

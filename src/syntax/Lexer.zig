@@ -25,7 +25,9 @@ pub fn init(gpa: std.mem.Allocator, source: *const Source, diagnostics: *diagnos
     var lexer: Lexer = .{ .gpa = gpa, .source = source, .diagnostics = diagnostics };
     // A hashbang line is only allowed at the very start.
     if (std.mem.startsWith(u8, source.text, "#!")) {
-        while (lexer.index < source.text.len and !lexer.atLineTerminator()) lexer.index += 1;
+        while (lexer.index < source.text.len and !lexer.atLineTerminator()) {
+            lexer.index += 1;
+        }
     }
     return lexer;
 }
@@ -52,7 +54,9 @@ pub fn tokenize(gpa: std.mem.Allocator, source: *const Source, diagnostics: *dia
     while (true) {
         const tok = try lexer.next();
         try tokens.append(gpa, tok);
-        if (tok.tag == .eof) return tokens.toOwnedSlice(gpa);
+        if (tok.tag == .eof) {
+            return tokens.toOwnedSlice(gpa);
+        }
     }
 }
 
@@ -109,7 +113,9 @@ fn skipTrivia(this: *Lexer) Error!bool {
             continue;
         }
         if (this.peek(0) == '/' and this.peek(1) == '/') {
-            while (this.index < this.text().len and !this.atLineTerminator()) this.index += 1;
+            while (this.index < this.text().len and !this.atLineTerminator()) {
+                this.index += 1;
+            }
             continue;
         }
         if (this.peek(0) == '/' and this.peek(1) == '*') {
@@ -127,7 +133,9 @@ fn skipTrivia(this: *Lexer) Error!bool {
                 if (comment_lt != 0) {
                     newline = true;
                     this.index += comment_lt;
-                } else this.index += 1;
+                } else {
+                    this.index += 1;
+                }
             }
             continue;
         }
@@ -145,7 +153,9 @@ fn identifierCharLength(this: *const Lexer, first: bool) u32 {
         return @intFromBool(ok);
     }
     const len = std.unicode.utf8ByteSequenceLength(c) catch return 0;
-    if (this.index + len > this.text().len) return 0;
+    if (this.index + len > this.text().len) {
+        return 0;
+    }
     const code_point = std.unicode.utf8Decode(this.text()[this.index..][0..len]) catch return 0;
     return if (isIdentifierCodePoint(code_point)) len else 0;
 }
@@ -170,13 +180,17 @@ fn isIdentifierStartAt(this: *const Lexer) bool {
 fn skipIdentifierRest(this: *Lexer) void {
     while (true) {
         const len = this.identifierCharLength(false);
-        if (len == 0) return;
+        if (len == 0) {
+            return;
+        }
         this.index += len;
     }
 }
 
 fn scan(this: *Lexer) Error!Tag {
-    if (this.index >= this.text().len) return .eof;
+    if (this.index >= this.text().len) {
+        return .eof;
+    }
     const c = this.peek(0);
 
     if (this.isIdentifierStartAt()) {
@@ -184,7 +198,9 @@ fn scan(this: *Lexer) Error!Tag {
         this.skipIdentifierRest();
         return token.keywords.get(this.text()[start..this.index]) orelse .identifier;
     }
-    if (std.ascii.isDigit(c) or (c == '.' and std.ascii.isDigit(this.peek(1)))) return this.number();
+    if (std.ascii.isDigit(c) or (c == '.' and std.ascii.isDigit(this.peek(1)))) {
+        return this.number();
+    }
 
     switch (c) {
         '"', '\'' => return this.string(c),
@@ -201,7 +217,9 @@ fn scan(this: *Lexer) Error!Tag {
             this.index -= 1;
         },
         '{' => {
-            if (this.template_braces.items.len > 0) this.template_braces.items[this.template_braces.items.len - 1] += 1;
+            if (this.template_braces.items.len > 0) {
+                this.template_braces.items[this.template_braces.items.len - 1] += 1;
+            }
             this.index += 1;
             return .l_brace;
         },
@@ -225,7 +243,9 @@ fn scan(this: *Lexer) Error!Tag {
         else => {},
     }
 
-    if (this.punctuator()) |tag| return tag;
+    if (this.punctuator()) |tag| {
+        return tag;
+    }
 
     // Report one invalid character, consuming the whole UTF-8 sequence.
     try this.report(this.index, .ts(1127), "Invalid character.", .{});
@@ -296,10 +316,11 @@ fn digits(this: *Lexer, radix: Radix) Error!u32 {
         const c = this.peek(0);
         if (c == '_') {
             if (count == 0 or last_was_separator) {
-                if (last_was_separator)
-                    try this.report(this.index, .ts(6189), "Multiple consecutive numeric separators are not permitted.", .{})
-                else
+                if (last_was_separator) {
+                    try this.report(this.index, .ts(6189), "Multiple consecutive numeric separators are not permitted.", .{});
+                } else {
                     try this.report(this.index, .ts(6188), "Numeric separators are not allowed here.", .{});
+                }
             }
             last_was_separator = true;
             this.index += 1;
@@ -307,9 +328,13 @@ fn digits(this: *Lexer, radix: Radix) Error!u32 {
             last_was_separator = false;
             count += 1;
             this.index += 1;
-        } else break;
+        } else {
+            break;
+        }
     }
-    if (last_was_separator) try this.report(this.index - 1, .ts(6188), "Numeric separators are not allowed here.", .{});
+    if (last_was_separator) {
+        try this.report(this.index - 1, .ts(6188), "Numeric separators are not allowed here.", .{});
+    }
     return count;
 }
 
@@ -325,12 +350,14 @@ fn number(this: *Lexer) Error!Tag {
 
     if (prefixed) |radix| {
         this.index += 2;
-        if (try this.digits(radix) == 0) switch (radix) {
-            .hex => try this.report(this.index, .ts(1125), "Hexadecimal digit expected.", .{}),
-            .octal => try this.report(this.index, .ts(1178), "Octal digit expected.", .{}),
-            .binary => try this.report(this.index, .ts(1177), "Binary digit expected.", .{}),
-            .decimal => unreachable,
-        };
+        if (try this.digits(radix) == 0) {
+            switch (radix) {
+                .hex => try this.report(this.index, .ts(1125), "Hexadecimal digit expected.", .{}),
+                .octal => try this.report(this.index, .ts(1178), "Octal digit expected.", .{}),
+                .binary => try this.report(this.index, .ts(1177), "Binary digit expected.", .{}),
+                .decimal => unreachable,
+            }
+        }
         if (this.peek(0) == 'n') {
             this.index += 1;
             tag = .bigint;
@@ -338,7 +365,9 @@ fn number(this: *Lexer) Error!Tag {
     } else if (this.peek(0) == '0' and std.ascii.isDigit(this.peek(1))) {
         // Legacy octal (`017`) or a decimal with a leading zero (`019`); neither is allowed in
         // strict mode.
-        while (std.ascii.isDigit(this.peek(0))) this.index += 1;
+        while (std.ascii.isDigit(this.peek(0))) {
+            this.index += 1;
+        }
         const literal = this.text()[start..this.index];
         if (std.mem.indexOfAny(u8, literal, "89") == null) {
             try this.report(start, .ts(1121), "Octal literals are not allowed. Use the syntax '0o{s}'.", .{literal[1..]});
@@ -351,14 +380,20 @@ fn number(this: *Lexer) Error!Tag {
         if (this.peek(0) == '.') {
             integer = false;
             this.index += 1;
-            if (this.peek(0) == '_') try this.report(this.index, .ts(6188), "Numeric separators are not allowed here.", .{});
+            if (this.peek(0) == '_') {
+                try this.report(this.index, .ts(6188), "Numeric separators are not allowed here.", .{});
+            }
             _ = try this.digits(.decimal);
         }
         if (this.peek(0) == 'e' or this.peek(0) == 'E') {
             integer = false;
             this.index += 1;
-            if (this.peek(0) == '+' or this.peek(0) == '-') this.index += 1;
-            if (try this.digits(.decimal) == 0) try this.report(this.index, .ts(1124), "Digit expected.", .{});
+            if (this.peek(0) == '+' or this.peek(0) == '-') {
+                this.index += 1;
+            }
+            if (try this.digits(.decimal) == 0) {
+                try this.report(this.index, .ts(1124), "Digit expected.", .{});
+            }
         }
         if (integer and this.peek(0) == 'n') {
             this.index += 1;
@@ -386,7 +421,11 @@ fn string(this: *Lexer, quote: u8) Error!Tag {
             this.index += 1;
             return .string;
         }
-        if (c == '\\') try this.escape() else this.index += 1;
+        if (c == '\\') {
+            try this.escape();
+        } else {
+            this.index += 1;
+        }
     }
 }
 
@@ -409,7 +448,11 @@ fn templateRest(this: *Lexer, end_tag: Tag, substitution_tag: Tag) Error!Tag {
             try this.template_braces.append(this.gpa, 0);
             return substitution_tag;
         }
-        if (c == '\\') try this.escape() else this.index += 1;
+        if (c == '\\') {
+            try this.escape();
+        } else {
+            this.index += 1;
+        }
     }
 }
 
@@ -419,7 +462,9 @@ fn escape(this: *Lexer) Error!void {
     const start = this.index;
     this.index += 1;
     const c = this.peek(0);
-    if (this.index >= this.text().len) return;
+    if (this.index >= this.text().len) {
+        return;
+    }
     const lt = this.lineTerminatorLength();
     if (lt != 0) {
         this.index += lt; // line continuation
@@ -457,13 +502,19 @@ fn escape(this: *Lexer) Error!void {
                 this.index += 1;
             } else {
                 var n: u32 = 0;
-                while (n < 4 and std.ascii.isHex(this.peek(0))) : (n += 1) this.index += 1;
-                if (n < 4) try this.report(this.index, .ts(1125), "Hexadecimal digit expected.", .{});
+                while (n < 4 and std.ascii.isHex(this.peek(0))) : (n += 1) {
+                    this.index += 1;
+                }
+                if (n < 4) {
+                    try this.report(this.index, .ts(1125), "Hexadecimal digit expected.", .{});
+                }
             }
         },
         '0' => {
             this.index += 1;
-            if (std.ascii.isDigit(this.peek(0))) try this.octalEscape(start);
+            if (std.ascii.isDigit(this.peek(0))) {
+                try this.octalEscape(start);
+            }
         },
         '1'...'9' => {
             this.index += 1;
@@ -474,7 +525,9 @@ fn escape(this: *Lexer) Error!void {
 }
 
 fn octalEscape(this: *Lexer, start: u32) Error!void {
-    while (std.ascii.isDigit(this.peek(0))) this.index += 1;
+    while (std.ascii.isDigit(this.peek(0))) {
+        this.index += 1;
+    }
     const escape_text = this.text()[start + 1 .. this.index];
     if (std.mem.indexOfAny(u8, escape_text, "89") != null) {
         try this.report(start, .ts(1488), "Escape sequence '\\{s}' is not allowed.", .{escape_text});
@@ -495,7 +548,9 @@ pub fn cook(allocator: std.mem.Allocator, source: []const u8, tok: Token) Error!
         .template_head, .template_middle => raw[1 .. raw.len - 2],
         else => unreachable,
     };
-    if (std.mem.indexOfAny(u8, body, "\\\r") == null) return body;
+    if (std.mem.indexOfAny(u8, body, "\\\r") == null) {
+        return body;
+    }
 
     var out: std.ArrayList(u8) = .empty;
     var pending_high: ?u16 = null;
@@ -527,12 +582,16 @@ pub fn cook(allocator: std.mem.Allocator, source: []const u8, tok: Token) Error!
             'v' => 0x0B,
             '0' => 0,
             '\r' => {
-                if (i < body.len and body[i] == '\n') i += 1;
+                if (i < body.len and body[i] == '\n') {
+                    i += 1;
+                }
                 continue;
             },
             '\n' => continue,
             'x' => blk: {
-                if (i + 2 > body.len) continue;
+                if (i + 2 > body.len) {
+                    continue;
+                }
                 const v = std.fmt.parseInt(u8, body[i .. i + 2], 16) catch continue;
                 i += 2;
                 break :blk v;
@@ -544,7 +603,9 @@ pub fn cook(allocator: std.mem.Allocator, source: []const u8, tok: Token) Error!
                     i = close + 1;
                     break :blk v;
                 }
-                if (i + 4 > body.len) continue;
+                if (i + 4 > body.len) {
+                    continue;
+                }
                 const v = std.fmt.parseInt(u16, body[i .. i + 4], 16) catch continue;
                 i += 4;
                 break :blk v;
@@ -629,19 +690,25 @@ const Lexed = struct {
     fn expectTags(this: *Lexed, expected: []const Tag) !void {
         const actual = try testing.allocator.alloc(Tag, this.tokens.len);
         defer testing.allocator.free(actual);
-        for (this.tokens, actual) |tok, *tag| tag.* = tok.tag;
+        for (this.tokens, actual) |tok, *tag| {
+            tag.* = tok.tag;
+        }
         try testing.expectEqualSlices(Tag, expected, actual);
     }
 
     fn expectTexts(this: *Lexed, expected: []const []const u8) !void {
         try testing.expectEqual(expected.len + 1, this.tokens.len);
-        for (expected, this.tokens[0..expected.len]) |want, tok| try testing.expectEqualStrings(want, tok.text(this.source.text));
+        for (expected, this.tokens[0..expected.len]) |want, tok| {
+            try testing.expectEqualStrings(want, tok.text(this.source.text));
+        }
     }
 
     fn expectCodes(this: *Lexed, expected: []const u16) !void {
         const actual = try testing.allocator.alloc(u16, this.diagnostics.items().len);
         defer testing.allocator.free(actual);
-        for (this.diagnostics.items(), actual) |d, *code| code.* = d.code.number;
+        for (this.diagnostics.items(), actual) |d, *code| {
+            code.* = d.code.number;
+        }
         try testing.expectEqualSlices(u16, expected, actual);
     }
 };
@@ -708,7 +775,11 @@ test "numbers" {
     const lexed: *Lexed = try .init("0 42 3.14 .5 5. 1e10 1E-7 2e+3 0x1F 0XaB 0o17 0b1010 1_000_000 0x_ff 10n 0x1Fn");
     defer lexed.deinit();
     try lexed.expectTexts(&.{ "0", "42", "3.14", ".5", "5.", "1e10", "1E-7", "2e+3", "0x1F", "0XaB", "0o17", "0b1010", "1_000_000", "0x_ff", "10n", "0x1Fn" });
-    for (lexed.tokens[0..14]) |tok| if (!std.mem.eql(u8, tok.text(lexed.source.text), "0x_ff")) try testing.expectEqual(Tag.number, tok.tag);
+    for (lexed.tokens[0..14]) |tok| {
+        if (!std.mem.eql(u8, tok.text(lexed.source.text), "0x_ff")) {
+            try testing.expectEqual(Tag.number, tok.tag);
+        }
+    }
     try testing.expectEqual(Tag.bigint, lexed.tokens[14].tag);
     try testing.expectEqual(Tag.bigint, lexed.tokens[15].tag);
     // `0x_ff` puts a separator right after the prefix.
@@ -776,7 +847,9 @@ test "newline before" {
     const lexed: *Lexed = try .init("a\nb /* \n */ c /* */ d // x\ne");
     defer lexed.deinit();
     const expected = [_]bool{ false, true, true, false, true, false };
-    for (expected, lexed.tokens) |want, tok| try testing.expectEqual(want, tok.newline_before);
+    for (expected, lexed.tokens) |want, tok| {
+        try testing.expectEqual(want, tok.newline_before);
+    }
 }
 
 test "invalid characters" {

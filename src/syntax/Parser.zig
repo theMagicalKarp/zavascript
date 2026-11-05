@@ -41,9 +41,11 @@ fn program(this: *Parser) error{OutOfMemory}!ast.Program {
         const before = this.index;
         if (this.statement()) |stmt| {
             try statements.append(this.arena, stmt);
-        } else |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Syntax => this.synchronize(before),
+        } else |err| {
+            switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Syntax => this.synchronize(before),
+            }
         }
     }
     return .{ .statements = try statements.toOwnedSlice(this.arena) };
@@ -61,18 +63,24 @@ fn peekToken(this: *const Parser, ahead: usize) Token {
 
 fn advance(this: *Parser) Token {
     const tok = this.tokens[this.index];
-    if (tok.tag != .eof) this.index += 1;
+    if (tok.tag != .eof) {
+        this.index += 1;
+    }
     return tok;
 }
 
 fn eat(this: *Parser, tag: Tag) bool {
-    if (this.current().tag != tag) return false;
+    if (this.current().tag != tag) {
+        return false;
+    }
     _ = this.advance();
     return true;
 }
 
 fn expect(this: *Parser, tag: Tag) Error!Token {
-    if (this.current().tag == tag) return this.advance();
+    if (this.current().tag == tag) {
+        return this.advance();
+    }
     return this.fail(this.current().start, .ts(1005), "'{s}' expected.", .{tag.lexeme().?});
 }
 
@@ -104,9 +112,13 @@ fn report(this: *Parser, at: u32, code: diagnostic.Code, comptime fmt: []const u
 fn synchronize(this: *Parser, statement_start: usize) void {
     // Count the brackets the statement had already opened when the error happened.
     var depth: usize = 0;
-    for (this.tokens[statement_start..this.index]) |tok| depth = bracketDepth(tok.tag, depth) orelse 0;
+    for (this.tokens[statement_start..this.index]) |tok| {
+        depth = bracketDepth(tok.tag, depth) orelse 0;
+    }
     // Always make progress, even if the error was at the statement's first token.
-    if (this.index == statement_start) depth = this.skipOne(depth) orelse return;
+    if (this.index == statement_start) {
+        depth = this.skipOne(depth) orelse return;
+    }
     while (this.current().tag != .eof) {
         const tok = this.current();
         if (depth == 0) {
@@ -114,7 +126,9 @@ fn synchronize(this: *Parser, statement_start: usize) void {
                 _ = this.advance();
                 return;
             }
-            if (tok.newline_before or tok.tag == .r_brace) return;
+            if (tok.newline_before or tok.tag == .r_brace) {
+                return;
+            }
         }
         depth = this.skipOne(depth) orelse return;
     }
@@ -167,7 +181,9 @@ fn statement(this: *Parser) Error!*Stmt {
                     return this.unsupported(tok.start, "'{s}' declarations are", .{word});
                 }
             }
-            if (following.tag == .colon) return this.unsupported(tok.start, "Labeled statements are", .{});
+            if (following.tag == .colon) {
+                return this.unsupported(tok.start, "Labeled statements are", .{});
+            }
         },
         else => {},
     }
@@ -186,7 +202,9 @@ fn semicolon(this: *Parser) Error!void {
         _ = this.advance();
         return;
     }
-    if (tok.tag == .r_brace or tok.tag == .eof or tok.newline_before) return;
+    if (tok.tag == .r_brace or tok.tag == .eof or tok.newline_before) {
+        return;
+    }
     return this.fail(tok.start, .ts(1005), "';' expected.", .{});
 }
 
@@ -194,7 +212,9 @@ fn semicolon(this: *Parser) Error!void {
 
 fn expression(this: *Parser) Error!*Expr {
     const expr = try this.assignment();
-    if (this.current().tag == .comma) return this.unsupported(this.current().start, "The comma operator is", .{});
+    if (this.current().tag == .comma) {
+        return this.unsupported(this.current().start, "The comma operator is", .{});
+    }
     return expr;
 }
 
@@ -207,7 +227,9 @@ fn assignment(this: *Parser) Error!*Expr {
         .ampersand_ampersand_equal, .pipe_pipe_equal, .question_question_equal => {},
         .arrow => return this.unsupported(tok.start, "Arrow functions are", .{}),
         .greater => if (this.greaterOperator()) |op| {
-            if (op.assignment) return this.unsupported(tok.start, "Assignment is", .{});
+            if (op.assignment) {
+                return this.unsupported(tok.start, "Assignment is", .{});
+            }
             return expr;
         } else return expr,
         else => return expr,
@@ -217,7 +239,9 @@ fn assignment(this: *Parser) Error!*Expr {
 
 fn conditional(this: *Parser) Error!*Expr {
     const condition = try this.binary(0);
-    if (!this.eat(.question)) return condition;
+    if (!this.eat(.question)) {
+        return condition;
+    }
     const then = try this.assignment();
     _ = try this.expect(.colon);
     const otherwise = try this.assignment();
@@ -250,7 +274,9 @@ fn binaryInfo(this: *Parser) ?BinaryInfo {
         .less_less => .{ .op = .shift_left, .precedence = 9 },
         .greater => blk: {
             const op = this.greaterOperator() orelse unreachable;
-            if (op.assignment) break :blk null;
+            if (op.assignment) {
+                break :blk null;
+            }
             break :blk .{ .op = op.op, .precedence = if (op.op == .greater or op.op == .greater_equal) 8 else 9, .tokens = op.tokens };
         },
         .plus => .{ .op = .add, .precedence = 10 },
@@ -271,7 +297,9 @@ fn greaterOperator(this: *const Parser) ?GreaterOperator {
     var end = this.current().end;
     while (count < 3) {
         const next = this.peekToken(count);
-        if (next.tag != .greater or next.start != end) break;
+        if (next.tag != .greater or next.start != end) {
+            break;
+        }
         end = next.end;
         count += 1;
     }
@@ -279,7 +307,9 @@ fn greaterOperator(this: *const Parser) ?GreaterOperator {
     const assign = next.start == end and (next.tag == .equal or next.tag == .equal_equal or next.tag == .equal_equal_equal);
     if (assign) {
         // `>=` is a comparison; `>>=` and `>>>=` are assignments. `> ==` never touch.
-        if (count == 1) return if (next.tag == .equal) .{ .op = .greater_equal, .tokens = 2, .assignment = false } else null;
+        if (count == 1) {
+            return if (next.tag == .equal) .{ .op = .greater_equal, .tokens = 2, .assignment = false } else null;
+        }
         return if (next.tag == .equal) .{ .op = .shift_right, .tokens = count + 1, .assignment = true } else null;
     }
     return switch (count) {
@@ -293,13 +323,21 @@ fn binary(this: *Parser, min_precedence: u8) Error!*Expr {
     var left = try this.unary();
     while (true) {
         const tok = this.current();
-        if (tok.tag == .kw_in or tok.tag == .kw_instanceof) return this.unsupported(tok.start, "The '{s}' operator is", .{this.tokenText(tok)});
+        if (tok.tag == .kw_in or tok.tag == .kw_instanceof) {
+            return this.unsupported(tok.start, "The '{s}' operator is", .{this.tokenText(tok)});
+        }
         if (this.isContextual(tok, "as") or this.isContextual(tok, "satisfies")) {
-            if (!tok.newline_before) return this.unsupported(tok.start, "'{s}' expressions are", .{this.tokenText(tok)});
+            if (!tok.newline_before) {
+                return this.unsupported(tok.start, "'{s}' expressions are", .{this.tokenText(tok)});
+            }
         }
         const info = this.binaryInfo() orelse return left;
-        if (info.precedence <= min_precedence) return left;
-        for (0..info.tokens) |_| _ = this.advance();
+        if (info.precedence <= min_precedence) {
+            return left;
+        }
+        for (0..info.tokens) |_| {
+            _ = this.advance();
+        }
         // `**` is right-associative, so its right side binds at the same level.
         const right = try this.binary(if (info.op == .exponent) info.precedence - 1 else info.precedence);
         try this.checkNullishMixing(info.op, left, right);
@@ -315,7 +353,9 @@ fn checkNullishMixing(this: *Parser, op: ast.BinaryOp, left: *const Expr, right:
         }
     }.f;
     for ([_]*const Expr{ left, right }) |operand| {
-        if (operand.data != .binary) continue;
+        if (operand.data != .binary) {
+            continue;
+        }
         const inner = operand.data.binary.op;
         if ((op == .nullish and isLogical(inner)) or (isLogical(op) and inner == .nullish)) {
             const first = if (operand == left) inner else op;
@@ -356,8 +396,12 @@ fn postfix(this: *Parser) Error!*Expr {
             .dot => {
                 _ = this.advance();
                 const name = this.current();
-                if (name.tag == .private_name) return this.unsupported(name.start, "Private names are", .{});
-                if (name.tag != .identifier and !name.tag.isKeyword()) return this.fail(name.start, .ts(1003), "Identifier expected.", .{});
+                if (name.tag == .private_name) {
+                    return this.unsupported(name.start, "Private names are", .{});
+                }
+                if (name.tag != .identifier and !name.tag.isKeyword()) {
+                    return this.fail(name.start, .ts(1003), "Identifier expected.", .{});
+                }
                 _ = this.advance();
                 expr = try this.newExpr(expr.start, .{ .member = .{ .object = expr, .property = this.tokenText(name), .property_start = name.start } });
             },
@@ -380,9 +424,13 @@ fn postfix(this: *Parser) Error!*Expr {
 fn arguments(this: *Parser) Error![]const *Expr {
     var args: std.ArrayList(*Expr) = .empty;
     while (this.current().tag != .r_paren) {
-        if (this.current().tag == .ellipsis) return this.unsupported(this.current().start, "Spread arguments are", .{});
+        if (this.current().tag == .ellipsis) {
+            return this.unsupported(this.current().start, "Spread arguments are", .{});
+        }
         try args.append(this.arena, try this.assignment());
-        if (!this.eat(.comma)) break;
+        if (!this.eat(.comma)) {
+            break;
+        }
     }
     _ = try this.expect(.r_paren);
     return args.toOwnedSlice(this.arena);
@@ -410,16 +458,24 @@ fn primary(this: *Parser) Error!*Expr {
         },
         .identifier => {
             _ = this.advance();
-            if (this.current().tag == .arrow) return this.unsupported(this.current().start, "Arrow functions are", .{});
+            if (this.current().tag == .arrow) {
+                return this.unsupported(this.current().start, "Arrow functions are", .{});
+            }
             return this.newExpr(tok.start, .{ .identifier = this.tokenText(tok) });
         },
         .l_paren => {
             _ = this.advance();
-            if (this.current().tag == .r_paren) return this.unsupported(tok.start, "Arrow functions are", .{});
+            if (this.current().tag == .r_paren) {
+                return this.unsupported(tok.start, "Arrow functions are", .{});
+            }
             const inner = try this.expression();
-            if (this.current().tag == .colon) return this.unsupported(tok.start, "Arrow functions are", .{});
+            if (this.current().tag == .colon) {
+                return this.unsupported(tok.start, "Arrow functions are", .{});
+            }
             _ = try this.expect(.r_paren);
-            if (this.current().tag == .arrow) return this.unsupported(tok.start, "Arrow functions are", .{});
+            if (this.current().tag == .arrow) {
+                return this.unsupported(tok.start, "Arrow functions are", .{});
+            }
             return this.newExpr(tok.start, .{ .paren = inner });
         },
         .bigint => return this.unsupported(tok.start, "BigInt literals are", .{}),
@@ -451,7 +507,9 @@ fn template(this: *Parser) Error!*Expr {
             }
             _ = this.advance();
             try quasis.append(this.arena, try Lexer.cook(this.arena, this.source.text, part));
-            if (part.tag == .template_tail) break;
+            if (part.tag == .template_tail) {
+                break;
+            }
         }
     }
     return this.newExpr(first.start, .{ .template = .{
@@ -564,7 +622,9 @@ const Parsed = struct {
 
     fn codes(this: *Parsed) ![]const u16 {
         const result = try this.arena.allocator().alloc(u16, this.diagnostics.items().len);
-        for (this.diagnostics.items(), result) |d, *code| code.* = d.code.number;
+        for (this.diagnostics.items(), result) |d, *code| {
+            code.* = d.code.number;
+        }
         return result;
     }
 };

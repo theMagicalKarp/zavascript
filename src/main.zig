@@ -62,7 +62,9 @@ pub fn main(init: std.process.Init) !void {
 
     const stdin = std.Io.File.stdin();
     const exit_code: u8 = if (options.path) |path| blk: {
-        if (std.mem.eql(u8, path, "-")) break :blk try runStdin(io, gpa, &runtime, stdin, options, stdout, stderr);
+        if (std.mem.eql(u8, path, "-")) {
+            break :blk try runStdin(io, gpa, &runtime, stdin, options, stdout, stderr);
+        }
         break :blk try runFile(io, gpa, &runtime, path, options, stdout, stderr);
     } else if (try stdin.isTty(io))
         try repl(io, &runtime, stdin, stdout, stderr)
@@ -71,7 +73,9 @@ pub fn main(init: std.process.Init) !void {
 
     try stdout.flush();
     try stderr.flush();
-    if (exit_code != 0) std.process.exit(exit_code);
+    if (exit_code != 0) {
+        std.process.exit(exit_code);
+    }
 }
 
 fn runFile(io: std.Io, gpa: std.mem.Allocator, runtime: *zavascript.Runtime, path: []const u8, options: Options, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !u8 {
@@ -127,8 +131,12 @@ fn repl(io: std.Io, runtime: *zavascript.Runtime, stdin: std.Io.File, stdout: *s
             else => return err,
         } orelse break;
         const input = std.mem.trim(u8, line, " \t\r");
-        if (input.len == 0) continue;
-        if (std.mem.eql(u8, input, ".exit")) break;
+        if (input.len == 0) {
+            continue;
+        }
+        if (std.mem.eql(u8, input, ".exit")) {
+            break;
+        }
         if (std.mem.eql(u8, input, ".help")) {
             try stdout.writeAll(repl_help);
             continue;
@@ -136,13 +144,15 @@ fn repl(io: std.Io, runtime: *zavascript.Runtime, stdin: std.Io.File, stdout: *s
         if (runtime.run("repl", input)) |value| {
             try zavascript.Runtime.inspect(stdout, value);
             try stdout.writeByte('\n');
-        } else |err| switch (err) {
-            error.CompileError => {
-                try stdout.flush();
-                try runtime.diagnostics.render(stderr);
-                try stderr.flush();
-            },
-            else => return err,
+        } else |err| {
+            switch (err) {
+                error.CompileError => {
+                    try stdout.flush();
+                    try runtime.diagnostics.render(stderr);
+                    try stderr.flush();
+                },
+                else => return err,
+            }
         }
     }
     try stdout.writeByte('\n');

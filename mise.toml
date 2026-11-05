@@ -35,10 +35,14 @@ run = "cp .bench/latest.json .bench/baseline.json"
 description = "Check formatting without writing changes"
 run = "zig fmt --check --exclude zig-pkg ."
 
+[tasks.lint]
+description = "Check that if/else/while/for bodies are blocks"
+run = "zig build lint"
+
 [tasks.fix]
-description = "Auto format all source files"
-run = "zig fmt --exclude zig-pkg ."
+description = "Add missing braces, then auto format all source files"
+run = ["zig build lint-fix", "zig fmt --exclude zig-pkg ."]
 
 [tasks.check]
 description = "Run everything CI runs"
-depends = ["test", "fmt", "oracle"]
+depends = ["test", "fmt", "lint", "oracle"]

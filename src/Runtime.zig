@@ -91,9 +91,13 @@ pub fn compile(this: *Runtime, path: []const u8, text: []const u8) Error!Program
     source.* = try .init(arena, try arena.dupe(u8, path), try arena.dupe(u8, text));
     const program = try Parser.parse(this.gpa, arena, source, &this.diagnostics);
     // Like tsc, only type check a file that parsed cleanly, so syntax errors don't cascade.
-    if (this.diagnostics.items().len > 0) return error.CompileError;
+    if (this.diagnostics.items().len > 0) {
+        return error.CompileError;
+    }
     try Checker.check(arena, source, &this.diagnostics, program);
-    if (this.diagnostics.items().len > 0) return error.CompileError;
+    if (this.diagnostics.items().len > 0) {
+        return error.CompileError;
+    }
     return program;
 }
 

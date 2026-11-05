@@ -75,7 +75,9 @@ pub const Diagnostics = struct {
     pub fn addSyntax(this: *Diagnostics, source: *const Source, start: u32, code: Code, comptime fmt: []const u8, args: anytype) error{OutOfMemory}!void {
         if (this.list.items.len > 0) {
             const last = this.list.items[this.list.items.len - 1];
-            if (last.source == source and last.start == start) return;
+            if (last.source == source and last.start == start) {
+                return;
+            }
         }
         return this.add(source, start, code, fmt, args);
     }
@@ -86,7 +88,9 @@ pub const Diagnostics = struct {
 
     /// One diagnostic per line, in the order they were found.
     pub fn render(this: *const Diagnostics, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        for (this.list.items) |diagnostic| try writer.print("{f}\n", .{diagnostic});
+        for (this.list.items) |diagnostic| {
+            try writer.print("{f}\n", .{diagnostic});
+        }
     }
 };
 

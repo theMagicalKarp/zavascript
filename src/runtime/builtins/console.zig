@@ -33,7 +33,9 @@ fn writer(comptime to_stderr: bool) *const fn (*anyopaque, Value, []const Value)
 
 pub fn print(out: *std.Io.Writer, args: []const Value) std.Io.Writer.Error!void {
     for (args, 0..) |arg, i| {
-        if (i > 0) try out.writeByte(' ');
+        if (i > 0) {
+            try out.writeByte(' ');
+        }
         switch (arg) {
             .string => |s| try out.writeAll(s),
             else => try value.inspect(out, arg),

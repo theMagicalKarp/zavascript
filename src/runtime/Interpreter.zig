@@ -33,10 +33,12 @@ pub fn init(arena: std.mem.Allocator, stdout: *std.Io.Writer, stderr: *std.Io.Wr
 /// is what the REPL prints.
 pub fn run(this: *Interpreter, program: ast.Program) Error!Value {
     var completion: Value = .undefined;
-    for (program.statements) |stmt| switch (stmt.data) {
-        .expression => |e| completion = try this.evaluate(e),
-        .empty => {},
-    };
+    for (program.statements) |stmt| {
+        switch (stmt.data) {
+            .expression => |e| completion = try this.evaluate(e),
+            .empty => {},
+        }
+    }
     return completion;
 }
 
@@ -59,7 +61,9 @@ fn evaluate(this: *Interpreter, expr: *const Expr) Error!Value {
 }
 
 fn template(this: *Interpreter, t: ast.Template) Error!Value {
-    if (t.substitutions.len == 0) return .{ .string = t.quasis[0] };
+    if (t.substitutions.len == 0) {
+        return .{ .string = t.quasis[0] };
+    }
     var out: std.ArrayList(u8) = .empty;
     for (t.quasis, 0..) |quasi, i| {
         try out.appendSlice(this.arena, quasi);
@@ -139,9 +143,15 @@ fn shiftCount(v: Value) u5 {
 }
 
 fn remainder(n: f64, d: f64) f64 {
-    if (std.math.isNan(n) or std.math.isNan(d) or std.math.isInf(n) or d == 0) return std.math.nan(f64);
-    if (std.math.isInf(d)) return n;
-    if (n == 0) return n;
+    if (std.math.isNan(n) or std.math.isNan(d) or std.math.isInf(n) or d == 0) {
+        return std.math.nan(f64);
+    }
+    if (std.math.isInf(d)) {
+        return n;
+    }
+    if (n == 0) {
+        return n;
+    }
     return @rem(n, d);
 }
 
@@ -162,10 +172,14 @@ fn add(this: *Interpreter, left: Value, right: Value) Error!Value {
 fn lessThan(a: Value, b: Value) ?bool {
     const ap = a.toPrimitive();
     const bp = b.toPrimitive();
-    if (ap == .string and bp == .string) return value.compareStrings(ap.string, bp.string) == .lt;
+    if (ap == .string and bp == .string) {
+        return value.compareStrings(ap.string, bp.string) == .lt;
+    }
     const x = ap.toNumber();
     const y = bp.toNumber();
-    if (std.math.isNan(x) or std.math.isNan(y)) return null;
+    if (std.math.isNan(x) or std.math.isNan(y)) {
+        return null;
+    }
     return x < y;
 }
 
@@ -188,7 +202,9 @@ fn call(this: *Interpreter, c: ast.Call) Error!Value {
         else => try this.evaluate(c.callee),
     };
     const args = try this.arena.alloc(Value, c.arguments.len);
-    for (c.arguments, args) |arg, *slot| slot.* = try this.evaluate(arg);
+    for (c.arguments, args) |arg, *slot| {
+        slot.* = try this.evaluate(arg);
+    }
     return switch (callee) {
         .native_function => |f| f.call(this, receiver, args) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
