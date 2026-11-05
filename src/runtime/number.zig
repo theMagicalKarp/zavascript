@@ -5,9 +5,15 @@ const std = @import("std");
 /// Number::toString(x) with radix 10 (ECMA-262 §6.1.6.1.20): the shortest digits that round-trip,
 /// switching to exponent notation outside 1e-7 < |x| < 1e21.
 pub fn format(writer: *std.Io.Writer, x: f64) std.Io.Writer.Error!void {
-    if (std.math.isNan(x)) return writer.writeAll("NaN");
-    if (x == 0) return writer.writeAll("0");
-    if (std.math.isInf(x)) return writer.writeAll(if (x > 0) "Infinity" else "-Infinity");
+    if (std.math.isNan(x)) {
+        return writer.writeAll("NaN");
+    }
+    if (x == 0) {
+        return writer.writeAll("0");
+    }
+    if (std.math.isInf(x)) {
+        return writer.writeAll(if (x > 0) "Infinity" else "-Infinity");
+    }
     if (x < 0) {
         try writer.writeByte('-');
         return format(writer, -x);
@@ -20,7 +26,9 @@ pub fn format(writer: *std.Io.Writer, x: f64) std.Io.Writer.Error!void {
     var digit_buffer: [32]u8 = undefined;
     var k: usize = 0;
     for (scientific[0..e_index]) |c| {
-        if (c == '.') continue;
+        if (c == '.') {
+            continue;
+        }
         digit_buffer[k] = c;
         k += 1;
     }
@@ -62,8 +70,12 @@ pub fn parseLiteral(text: []const u8) f64 {
     var buffer: [128]u8 = undefined;
     var stripped: std.ArrayList(u8) = .initBuffer(&buffer);
     for (text) |c| {
-        if (c == '_') continue;
-        if (stripped.items.len == buffer.len) return parseLongLiteral(text);
+        if (c == '_') {
+            continue;
+        }
+        if (stripped.items.len == buffer.len) {
+            return parseLongLiteral(text);
+        }
         stripped.appendAssumeCapacity(c);
     }
     return parseStripped(stripped.items);
@@ -85,7 +97,9 @@ fn parseStripped(text: []const u8) f64 {
             'b', 'B' => 2,
             else => null,
         };
-        if (radix) |r| return parseRadix(text[2..], r);
+        if (radix) |r| {
+            return parseRadix(text[2..], r);
+        }
     }
     return std.fmt.parseFloat(f64, text) catch std.math.nan(f64);
 }
@@ -106,9 +120,13 @@ fn parseRadix(digits: []const u8, radix: u8) f64 {
             dropped_bits += bits_per_digit;
         }
     }
-    if (sticky) value |= 1;
+    if (sticky) {
+        value |= 1;
+    }
     const mantissa: f64 = @floatFromInt(value);
-    if (dropped_bits > 1100) return std.math.inf(f64);
+    if (dropped_bits > 1100) {
+        return std.math.inf(f64);
+    }
     return std.math.ldexp(mantissa, @intCast(dropped_bits));
 }
 
@@ -117,7 +135,9 @@ fn parseRadix(digits: []const u8, radix: u8) f64 {
 /// source literals, separators and a trailing `n` aren't allowed.
 pub fn parseString(s: []const u8) f64 {
     const trimmed = trimWhitespace(s);
-    if (trimmed.len == 0) return 0;
+    if (trimmed.len == 0) {
+        return 0;
+    }
     if (trimmed.len > 2 and trimmed[0] == '0') {
         const radix: ?u8 = switch (trimmed[1]) {
             'x', 'X' => 16,
@@ -126,18 +146,26 @@ pub fn parseString(s: []const u8) f64 {
             else => null,
         };
         if (radix) |r| {
-            for (trimmed[2..]) |c| _ = std.fmt.charToDigit(c, r) catch return std.math.nan(f64);
+            for (trimmed[2..]) |c| {
+                _ = std.fmt.charToDigit(c, r) catch return std.math.nan(f64);
+            }
             return parseRadix(trimmed[2..], r);
         }
     }
     var body = trimmed;
     var sign: f64 = 1;
     if (body[0] == '+' or body[0] == '-') {
-        if (body[0] == '-') sign = -1;
+        if (body[0] == '-') {
+            sign = -1;
+        }
         body = body[1..];
     }
-    if (std.mem.eql(u8, body, "Infinity")) return sign * std.math.inf(f64);
-    if (!isDecimalLiteral(body)) return std.math.nan(f64);
+    if (std.mem.eql(u8, body, "Infinity")) {
+        return sign * std.math.inf(f64);
+    }
+    if (!isDecimalLiteral(body)) {
+        return std.math.nan(f64);
+    }
     return sign * (std.fmt.parseFloat(f64, body) catch return std.math.nan(f64));
 }
 
@@ -146,18 +174,30 @@ pub fn parseString(s: []const u8) f64 {
 fn isDecimalLiteral(s: []const u8) bool {
     var i: usize = 0;
     var mantissa_digits: usize = 0;
-    while (i < s.len and std.ascii.isDigit(s[i])) : (i += 1) mantissa_digits += 1;
+    while (i < s.len and std.ascii.isDigit(s[i])) : (i += 1) {
+        mantissa_digits += 1;
+    }
     if (i < s.len and s[i] == '.') {
         i += 1;
-        while (i < s.len and std.ascii.isDigit(s[i])) : (i += 1) mantissa_digits += 1;
+        while (i < s.len and std.ascii.isDigit(s[i])) : (i += 1) {
+            mantissa_digits += 1;
+        }
     }
-    if (mantissa_digits == 0) return false;
+    if (mantissa_digits == 0) {
+        return false;
+    }
     if (i < s.len and (s[i] == 'e' or s[i] == 'E')) {
         i += 1;
-        if (i < s.len and (s[i] == '+' or s[i] == '-')) i += 1;
+        if (i < s.len and (s[i] == '+' or s[i] == '-')) {
+            i += 1;
+        }
         const exponent_start = i;
-        while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
-        if (i == exponent_start) return false;
+        while (i < s.len and std.ascii.isDigit(s[i])) {
+            i += 1;
+        }
+        if (i == exponent_start) {
+            return false;
+        }
     }
     return i == s.len;
 }
@@ -168,7 +208,9 @@ fn trimWhitespace(s: []const u8) []const u8 {
     var end: usize = s.len;
     while (start < end) {
         const len = whitespaceAt(s[start..end]);
-        if (len == 0) break;
+        if (len == 0) {
+            break;
+        }
         start += len;
     }
     outer: while (end > start) {
@@ -191,7 +233,9 @@ fn whitespaceAt(s: []const u8) usize {
         else => {},
     }
     const len = std.unicode.utf8ByteSequenceLength(s[0]) catch return 0;
-    if (len > s.len) return 0;
+    if (len > s.len) {
+        return 0;
+    }
     const cp = std.unicode.utf8Decode(s[0..len]) catch return 0;
     return switch (cp) {
         0xA0, 0x1680, 0x2000...0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000, 0xFEFF => len,

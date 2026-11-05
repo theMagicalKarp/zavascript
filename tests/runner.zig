@@ -29,12 +29,16 @@ fn parseExpectation(arena: std.mem.Allocator, source: []const u8) !Expectation {
         const line = std.mem.trimEnd(u8, raw_line, "\r");
         if (std.mem.indexOf(u8, line, "//>")) |i| {
             var text = line[i + 3 ..];
-            if (text.len > 0 and text[0] == ' ') text = text[1..];
+            if (text.len > 0 and text[0] == ' ') {
+                text = text[1..];
+            }
             try stdout.appendSlice(arena, text);
             try stdout.append(arena, '\n');
         } else if (std.mem.indexOf(u8, line, "//!")) |i| {
             var codes = std.mem.tokenizeAny(u8, line[i + 3 ..], " \t");
-            while (codes.next()) |code| try diagnostics.append(arena, try std.fmt.allocPrint(arena, "{d}:{s}", .{ line_number, code }));
+            while (codes.next()) |code| {
+                try diagnostics.append(arena, try std.fmt.allocPrint(arena, "{d}:{s}", .{ line_number, code }));
+            }
         }
     }
     std.mem.sort([]const u8, diagnostics.items, {}, lessThanString);
@@ -72,11 +76,17 @@ fn runCase(gpa: std.mem.Allocator, arena: std.mem.Allocator, path: []const u8, s
                 try actual.append(arena, try std.fmt.allocPrint(arena, "{d}:{f}", .{ loc.line, d.code }));
             }
             std.mem.sort([]const u8, actual.items, {}, lessThanString);
-            if (equalLists(expected.diagnostics, actual.items)) return .pass;
+            if (equalLists(expected.diagnostics, actual.items)) {
+                return .pass;
+            }
             try w.writeAll("diagnostics differ\n  expected:");
-            for (expected.diagnostics) |d| try w.print(" {s}", .{d});
+            for (expected.diagnostics) |d| {
+                try w.print(" {s}", .{d});
+            }
             try w.writeAll("\n  actual:  ");
-            for (actual.items) |d| try w.print(" {s}", .{d});
+            for (actual.items) |d| {
+                try w.print(" {s}", .{d});
+            }
             try w.writeAll("\n");
             try runtime.diagnostics.render(w);
             return .{ .fail = report.written() };
@@ -86,18 +96,28 @@ fn runCase(gpa: std.mem.Allocator, arena: std.mem.Allocator, path: []const u8, s
 
     if (expected.diagnostics.len > 0) {
         try w.writeAll("expected diagnostics, but it compiled and ran:");
-        for (expected.diagnostics) |d| try w.print(" {s}", .{d});
+        for (expected.diagnostics) |d| {
+            try w.print(" {s}", .{d});
+        }
         return .{ .fail = report.written() };
     }
-    if (std.mem.eql(u8, expected.stdout, stdout.written())) return .pass;
+    if (std.mem.eql(u8, expected.stdout, stdout.written())) {
+        return .pass;
+    }
     try w.writeAll("stdout differs\n");
     try diffLines(w, expected.stdout, stdout.written());
     return .{ .fail = report.written() };
 }
 
 fn equalLists(a: []const []const u8, b: []const []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    if (a.len != b.len) {
+        return false;
+    }
+    for (a, b) |x, y| {
+        if (!std.mem.eql(u8, x, y)) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -109,13 +129,19 @@ fn diffLines(w: *std.Io.Writer, expected: []const u8, actual: []const u8) !void 
     while (true) : (line += 1) {
         const x = e.next();
         const y = a.next();
-        if (x == null and y == null) break;
+        if (x == null and y == null) {
+            break;
+        }
         const same = x != null and y != null and std.mem.eql(u8, x.?, y.?);
         if (same) {
             try w.print("    {d: >3}   {s}\n", .{ line, x.? });
         } else {
-            if (x) |text| try w.print("  - {d: >3}   {s}\n", .{ line, text });
-            if (y) |text| try w.print("  + {d: >3}   {s}\n", .{ line, text });
+            if (x) |text| {
+                try w.print("  - {d: >3}   {s}\n", .{ line, text });
+            }
+            if (y) |text| {
+                try w.print("  + {d: >3}   {s}\n", .{ line, text });
+            }
         }
     }
 }
@@ -137,9 +163,17 @@ pub fn main(init: std.process.Init) !void {
     var walker = try dir.walk(arena);
     defer walker.deinit();
     while (try walker.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.path, ".ts") or std.mem.endsWith(u8, entry.path, ".d.ts")) continue;
-        if (filter) |f| if (std.mem.indexOf(u8, entry.path, f) == null) continue;
+        if (entry.kind != .file) {
+            continue;
+        }
+        if (!std.mem.endsWith(u8, entry.path, ".ts") or std.mem.endsWith(u8, entry.path, ".d.ts")) {
+            continue;
+        }
+        if (filter) |f| {
+            if (std.mem.indexOf(u8, entry.path, f) == null) {
+                continue;
+            }
+        }
         try paths.append(arena, try arena.dupe(u8, entry.path));
     }
     std.mem.sort([]const u8, paths.items, {}, lessThanString);
@@ -164,5 +198,7 @@ pub fn main(init: std.process.Init) !void {
     }
     try out.print("conformance: {d} passed, {d} failed\n", .{ passed, failed });
     try out.flush();
-    if (failed > 0) std.process.exit(1);
+    if (failed > 0) {
+        std.process.exit(1);
+    }
 }

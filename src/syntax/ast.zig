@@ -164,6 +164,8 @@ pub const Call = struct {
 /// The expression with any parentheses around it removed.
 pub fn skipParens(expr: *const Expr) *const Expr {
     var e = expr;
-    while (e.data == .paren) e = e.data.paren;
+    while (e.data == .paren) {
+        e = e.data.paren;
+    }
     return e;
 }

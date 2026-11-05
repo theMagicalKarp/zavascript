@@ -23,7 +23,9 @@ const Error = error{OutOfMemory};
 
 pub fn check(arena: std.mem.Allocator, source: *const Source, diagnostics: *diagnostic.Diagnostics, program: ast.Program) Error!void {
     var checker: Checker = .{ .arena = arena, .source = source, .diagnostics = diagnostics };
-    for (program.statements) |stmt| try checker.statement(stmt);
+    for (program.statements) |stmt| {
+        try checker.statement(stmt);
+    }
 }
 
 fn report(this: *Checker, at: u32, code: diagnostic.Code, comptime fmt: []const u8, args: anytype) Error!void {
@@ -75,9 +77,13 @@ fn expression(this: *Checker, expr: *const Expr) Error!*const Type {
         .number => |n| types.literal(this.arena, .{ .number = n }),
         .string => |s| types.literal(this.arena, .{ .string = s }),
         .template => |t| blk: {
-            for (t.substitutions) |sub| _ = try this.expression(sub);
+            for (t.substitutions) |sub| {
+                _ = try this.expression(sub);
+            }
             // A template without substitutions has a literal type, like a string literal.
-            if (t.substitutions.len == 0) break :blk types.literal(this.arena, .{ .string = t.quasis[0] });
+            if (t.substitutions.len == 0) {
+                break :blk types.literal(this.arena, .{ .string = t.quasis[0] });
+            }
             break :blk types.string;
         },
         .boolean => |b| if (b) types.true else types.false,
@@ -109,7 +115,9 @@ fn unary(this: *Checker, u: ast.Unary) Error!*const Type {
         .negate, .plus, .bitwise_not => {
             _ = try this.checkNonNull(u.operand, operand);
             // `-1` is the literal type `-1`, not `number`.
-            if (u.op == .negate and u.operand.data == .number) return types.literal(this.arena, .{ .number = -u.operand.data.number });
+            if (u.op == .negate and u.operand.data == .number) {
+                return types.literal(this.arena, .{ .number = -u.operand.data.number });
+            }
             return types.number;
         },
         .typeof => {
@@ -131,12 +139,16 @@ fn binary(this: *Checker, b: ast.Binary) Error!*const Type {
     switch (b.op) {
         .logical_and => {
             try this.checkTruthiness(b.left, left);
-            if (!try this.canBeTruthy(left)) return left;
+            if (!try this.canBeTruthy(left)) {
+                return left;
+            }
             return types.unionOf(this.arena, &.{ try this.definitelyFalsy(left), right });
         },
         .logical_or => {
             try this.checkTruthiness(b.left, left);
-            if (!try this.canBeFalsy(left)) return left;
+            if (!try this.canBeFalsy(left)) {
+                return left;
+            }
             return types.unionOf(this.arena, &.{ try this.removeDefinitelyFalsy(left), right });
         },
         .nullish => {
@@ -147,7 +159,9 @@ fn binary(this: *Checker, b: ast.Binary) Error!*const Type {
                 .sometimes => {},
             }
             const non_null = try this.removeNullish(left);
-            if (non_null.eql(left)) return left;
+            if (non_null.eql(left)) {
+                return left;
+            }
             return types.unionOf(this.arena, &.{ non_null, right });
         },
         .add => {
@@ -157,10 +171,18 @@ fn binary(this: *Checker, b: ast.Binary) Error!*const Type {
                 l = try this.checkNonNull(b.left, left);
                 r = try this.checkNonNull(b.right, right);
             }
-            if (isAny(l) and isAny(r)) return types.any;
-            if (types.isNumberLike(l) and types.isNumberLike(r)) return types.number;
-            if (types.isStringLike(l) or types.isStringLike(r)) return types.string;
-            if (isAny(l) or isAny(r)) return types.any;
+            if (isAny(l) and isAny(r)) {
+                return types.any;
+            }
+            if (types.isNumberLike(l) and types.isNumberLike(r)) {
+                return types.number;
+            }
+            if (types.isStringLike(l) or types.isStringLike(r)) {
+                return types.string;
+            }
+            if (isAny(l) or isAny(r)) {
+                return types.any;
+            }
             try this.operatorError(b, l, r);
             return types.any;
         },
@@ -170,7 +192,9 @@ fn binary(this: *Checker, b: ast.Binary) Error!*const Type {
             const ok = isAny(l) or isAny(r) or
                 (types.isNumberLike(l) and types.isNumberLike(r)) or
                 types.comparable(l, r);
-            if (!ok) try this.operatorError(b, l, r);
+            if (!ok) {
+                try this.operatorError(b, l, r);
+            }
             return types.boolean;
         },
         .equal, .not_equal, .strict_equal, .strict_not_equal => {
@@ -198,8 +222,12 @@ fn binary(this: *Checker, b: ast.Binary) Error!*const Type {
             std.debug.assert(b.op.isArithmetic());
             const l = try this.checkNonNull(b.left, left);
             const r = try this.checkNonNull(b.right, right);
-            if (!isNumeric(l)) try this.report(b.left.start, .ts(2362), "The left-hand side of an arithmetic operation " ++ arithmetic_operand, .{});
-            if (!isNumeric(r)) try this.report(b.right.start, .ts(2363), "The right-hand side of an arithmetic operation " ++ arithmetic_operand, .{});
+            if (!isNumeric(l)) {
+                try this.report(b.left.start, .ts(2362), "The left-hand side of an arithmetic operation " ++ arithmetic_operand, .{});
+            }
+            if (!isNumeric(r)) {
+                try this.report(b.right.start, .ts(2363), "The right-hand side of an arithmetic operation " ++ arithmetic_operand, .{});
+            }
             return types.number;
         },
     }
@@ -250,7 +278,9 @@ fn member(this: *Checker, m: ast.Member) Error!*const Type {
 fn call(this: *Checker, expr: *const Expr, c: ast.Call) Error!*const Type {
     const callee = try this.checkNonNull(c.callee, try this.expression(c.callee));
     var args: std.ArrayList(*const Type) = .empty;
-    for (c.arguments) |arg| try args.append(this.arena, try this.expression(arg));
+    for (c.arguments) |arg| {
+        try args.append(this.arena, try this.expression(arg));
+    }
 
     switch (callee.*) {
         .any => return types.any,
@@ -294,14 +324,26 @@ fn apparentName(this: *Checker, t: *const Type) Error![]const u8 {
 
 /// Whether a value of type `source` can be used where `target` is expected.
 fn assignable(source: *const Type, target: *const Type) bool {
-    if (source.eql(target)) return true;
-    if (target.* == .any or target.* == .unknown or source.* == .any or source.* == .never) return true;
+    if (source.eql(target)) {
+        return true;
+    }
+    if (target.* == .any or target.* == .unknown or source.* == .any or source.* == .never) {
+        return true;
+    }
     if (source.* == .@"union") {
-        for (source.@"union") |m| if (!assignable(m, target)) return false;
+        for (source.@"union") |m| {
+            if (!assignable(m, target)) {
+                return false;
+            }
+        }
         return true;
     }
     if (target.* == .@"union") {
-        for (target.@"union") |m| if (assignable(source, m)) return true;
+        for (target.@"union") |m| {
+            if (assignable(source, m)) {
+                return true;
+            }
+        }
         return false;
     }
     return switch (target.*) {
@@ -329,18 +371,22 @@ fn checkNonNull(this: *Checker, expr: *const Expr, t: *const Type) Error!*const 
     var has_null = false;
     var has_undefined = false;
     var buffer: [1]*const Type = undefined;
-    for (t.members(&buffer)) |m| switch (m.*) {
-        .null => has_null = true,
-        .undefined => has_undefined = true,
-        else => {},
-    };
+    for (t.members(&buffer)) |m| {
+        switch (m.*) {
+            .null => has_null = true,
+            .undefined => has_undefined = true,
+            else => {},
+        }
+    }
     if (has_null and has_undefined) {
         try this.report(expr.start, .ts(2533), "Object is possibly 'null' or 'undefined'.", .{});
     } else if (has_null) {
         try this.report(expr.start, .ts(2531), "Object is possibly 'null'.", .{});
     } else if (has_undefined) {
         try this.report(expr.start, .ts(2532), "Object is possibly 'undefined'.", .{});
-    } else return t;
+    } else {
+        return t;
+    }
     const rest = try this.removeNullish(t);
     return if (rest.* == .never) types.any else rest;
 }
@@ -348,7 +394,11 @@ fn checkNonNull(this: *Checker, expr: *const Expr, t: *const Type) Error!*const 
 fn removeNullish(this: *Checker, t: *const Type) Error!*const Type {
     var kept: std.ArrayList(*const Type) = .empty;
     var buffer: [1]*const Type = undefined;
-    for (t.members(&buffer)) |m| if (m.* != .null and m.* != .undefined) try kept.append(this.arena, m);
+    for (t.members(&buffer)) |m| {
+        if (m.* != .null and m.* != .undefined) {
+            try kept.append(this.arena, m);
+        }
+    }
     return types.unionOf(this.arena, kept.items);
 }
 
@@ -416,18 +466,24 @@ fn isFalsyLiteral(t: *const Type) bool {
 
 fn canBeFalsy(this: *Checker, t: *const Type) Error!bool {
     var buffer: [1]*const Type = undefined;
-    for (t.members(&buffer)) |m| switch (m.*) {
-        .literal => if (isFalsyLiteral(m)) return true,
-        .object, .function, .never => {},
-        else => return true,
-    };
+    for (t.members(&buffer)) |m| {
+        switch (m.*) {
+            .literal => if (isFalsyLiteral(m)) return true,
+            .object, .function, .never => {},
+            else => return true,
+        }
+    }
     _ = this;
     return false;
 }
 
 fn canBeTruthy(this: *Checker, t: *const Type) Error!bool {
     var buffer: [1]*const Type = undefined;
-    for (t.members(&buffer)) |m| if (!isFalsyLiteral(m) and m.* != .never) return true;
+    for (t.members(&buffer)) |m| {
+        if (!isFalsyLiteral(m) and m.* != .never) {
+            return true;
+        }
+    }
     _ = this;
     return false;
 }
@@ -444,7 +500,9 @@ fn definitelyFalsy(this: *Checker, t: *const Type) Error!*const Type {
             .any, .unknown => m,
             else => if (isFalsyLiteral(m)) m else null,
         };
-        if (part) |p| try falsy.append(this.arena, p);
+        if (part) |p| {
+            try falsy.append(this.arena, p);
+        }
     }
     return types.unionOf(this.arena, falsy.items);
 }
@@ -453,7 +511,9 @@ fn removeDefinitelyFalsy(this: *Checker, t: *const Type) Error!*const Type {
     var kept: std.ArrayList(*const Type) = .empty;
     var buffer: [1]*const Type = undefined;
     for (t.members(&buffer)) |m| {
-        if (isFalsyLiteral(m)) continue;
+        if (isFalsyLiteral(m)) {
+            continue;
+        }
         try kept.append(this.arena, if (m.* == .boolean) types.true else m);
     }
     return types.unionOf(this.arena, kept.items);

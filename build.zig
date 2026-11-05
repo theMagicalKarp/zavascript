@@ -72,4 +72,28 @@ pub fn build(b: *std.Build) void {
     run_bench.has_side_effects = true;
     const bench_step = b.step("bench", "Run the benchmarks (use -Doptimize=fast)");
     bench_step.dependOn(&run_bench.step);
+
+    const braces = b.addExecutable(.{
+        .name = "braces",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/braces.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = braces.root_module })).step);
+
+    const lint_step = b.step("lint", "Check that if/else/while/for bodies are blocks");
+    const lint_fix_step = b.step("lint-fix", "Wrap if/else/while/for bodies in blocks");
+    for ([_]struct { *std.Build.Step, bool }{ .{ lint_step, false }, .{ lint_fix_step, true } }) |entry| {
+        const step, const fix = entry;
+        const run_braces = b.addRunArtifact(braces);
+        run_braces.setCwd(b.path("."));
+        if (fix) {
+            run_braces.addArg("--fix");
+        }
+        run_braces.addArgs(&.{ "build.zig", "src", "tests", "bench", "tools" });
+        run_braces.has_side_effects = true;
+        step.dependOn(&run_braces.step);
+    }
 }
