@@ -16,7 +16,6 @@ const diagnostic = @import("diagnostic.zig");
 const Parser = @import("syntax/Parser.zig");
 const Checker = @import("check/Checker.zig");
 const Interpreter = @import("runtime/Interpreter.zig");
-const ast = @import("syntax/ast.zig");
 pub const Value = @import("runtime/value.zig").Value;
 
 const Runtime = @This();
@@ -27,6 +26,8 @@ gpa: std.mem.Allocator,
 arena: *std.heap.ArenaAllocator,
 /// Diagnostics from the most recent `check` or `run`.
 diagnostics: diagnostic.Diagnostics,
+/// Declarations from earlier programs, which later ones can use (the REPL's previous lines).
+session: Checker.Session = .{},
 interpreter: Interpreter,
 
 pub const Options = struct {
@@ -65,7 +66,7 @@ pub fn deinit(this: *Runtime) void {
 }
 
 /// A compiled program, ready to `execute`. Owned by the runtime.
-pub const Program = ast.Program;
+pub const Program = Interpreter.Program;
 
 /// Parses and type checks `text` without running it. `path` is only used in diagnostics.
 pub fn check(this: *Runtime, path: []const u8, text: []const u8) Error!void {
@@ -94,11 +95,11 @@ pub fn compile(this: *Runtime, path: []const u8, text: []const u8) Error!Program
     if (this.diagnostics.items().len > 0) {
         return error.CompileError;
     }
-    try Checker.check(arena, source, &this.diagnostics, program);
+    const resolved = try Checker.check(arena, source, &this.diagnostics, &this.session, program);
     if (this.diagnostics.items().len > 0) {
         return error.CompileError;
     }
-    return program;
+    return .{ .ast = program, .resolved = resolved };
 }
 
 /// Writes `value` the way node's REPL shows it.
@@ -142,4 +143,45 @@ test "keeps state between runs" {
     try testing.expectEqual(@as(f64, 3), (try runtime.run("repl", "1 + 2")).number);
     try testing.expectError(error.CompileError, runtime.run("repl", "nope"));
     try testing.expectEqualStrings("ok", (try runtime.run("repl", "'ok'")).string);
+}
+
+test "keeps declarations between runs" {
+    var stdout: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout.deinit();
+    var runtime: Runtime = try .init(testing.allocator, .{ .stdout = &stdout.writer, .stderr = &stdout.writer });
+    defer runtime.deinit();
+    try testing.expectEqual(.undefined, try runtime.run("repl", "let a = 1, b: number"));
+    try testing.expectEqual(@as(f64, 1), (try runtime.run("repl", "a")).number);
+    // `b` hasn't been assigned yet.
+    try testing.expectError(error.CompileError, runtime.run("repl", "b"));
+    try testing.expectEqual(2454, runtime.diagnostics.items()[0].code.number);
+    try testing.expectEqual(@as(f64, 5), (try runtime.run("repl", "b = a + 4")).number);
+    try testing.expectEqual(@as(f64, 6), (try runtime.run("repl", "a + b")).number);
+    // A line that doesn't compile declares nothing.
+    try testing.expectError(error.CompileError, runtime.run("repl", "let c = 1; c = 'x'"));
+    try testing.expectError(error.CompileError, runtime.run("repl", "c"));
+    try testing.expectEqual(2304, runtime.diagnostics.items()[0].code.number);
+    try testing.expectEqual(.undefined, try runtime.run("repl", "let c = 'x'"));
+    try testing.expectEqualStrings("x", (try runtime.run("repl", "c")).string);
+    // Redeclaring is an error, as in node's REPL.
+    try testing.expectError(error.CompileError, runtime.run("repl", "let a = 2"));
+    try testing.expectEqual(2451, runtime.diagnostics.items()[0].code.number);
+    // Narrowing carries over: `d` is `true` until something assigns `false`.
+    _ = try runtime.run("repl", "let d = true");
+    try testing.expectError(error.CompileError, runtime.run("repl", "d === false"));
+    _ = try runtime.run("repl", "d = 1 < 0");
+    try testing.expectEqual(true, (try runtime.run("repl", "d === false")).boolean);
+}
+
+test "completion values" {
+    var stdout: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout.deinit();
+    var runtime: Runtime = try .init(testing.allocator, .{ .stdout = &stdout.writer, .stderr = &stdout.writer });
+    defer runtime.deinit();
+    try testing.expectEqual(@as(f64, 1), (try runtime.run("repl", "1; let x = 2;")).number);
+    try testing.expectEqual(.undefined, try runtime.run("repl", "1; if (x) {}"));
+    try testing.expectEqual(@as(f64, 3), (try runtime.run("repl", "if (x) { 3 } else { 4 }")).number);
+    try testing.expectEqual(@as(f64, 9), (try runtime.run("repl", "let i = 0; while (i < 10) { if (i === 9) { i; break; } i++; }")).number);
+    try testing.expectEqual(@as(f64, 2), (try runtime.run("repl", "switch (x) { case 1: 1; case 2: 2; break; default: 3 }")).number);
+    try testing.expectEqual(@as(f64, 5), (try runtime.run("repl", "outer: { 5; break outer; }")).number);
 }

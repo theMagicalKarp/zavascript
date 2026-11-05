@@ -1,5 +1,4 @@
-// Straight-line expressions: mostly measures lexing, parsing and checking until the language has
-// loops. Replace with heavier cases as features land.
+// Straight-line expressions: mostly measures lexing, parsing and checking.
 console.log(1 + 2 * 3 - 4 / 5 % 6 ** 2, (1 + 2) * (3 - 4) / (5 + 6));
 console.log("a" + "b" + 1 + 2 + `c${3 + 4}d${"e" + "f"}g`, typeof 1 + typeof "s");
 console.log(0x7fffffff | 0, 1 << 30 >>> 1, ~123 & 0xff ^ 0x0f, -2147483648 >> 3);

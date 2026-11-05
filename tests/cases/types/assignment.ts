@@ -1,0 +1,11 @@
+let n = 1;
+let s = "a";
+let b = true;
+1 = 2; //! TS2364
+undefined = 1; //! TS2539
+nope = 1; //! TS2304
+n += "a"; //! TS2322
+s *= 2; //! TS2362
+b += 1; //! TS2365
+n ||= "x"; //! TS2322
+n -= s; //! TS2363
