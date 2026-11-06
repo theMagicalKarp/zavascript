@@ -21,6 +21,8 @@ pub const Type = union(enum) {
     @"union": []const *const Type,
     object: *const Object,
     function: *const Function,
+    /// `T[]`, with the element type.
+    array: *const Type,
 
     pub const Literal = struct {
         value: Value,
@@ -48,7 +50,8 @@ pub const Type = union(enum) {
                 }
             } else true,
             .object => |o| b.* == .object and b.object == o,
-            .function => |f| b.* == .function and b.function == f,
+            .function => |f| b.* == .function and (b.function == f or f.eql(b.function)),
+            .array => |e| b.* == .array and e.eql(b.array),
             else => std.meta.activeTag(a.*) == std.meta.activeTag(b.*),
         };
     }
@@ -85,11 +88,23 @@ pub const Type = union(enum) {
                 if (i > 0) {
                     try writer.writeAll(" | ");
                 }
-                try writer.print("{f}", .{m});
+                try m.formatParenthesized(writer, m.* == .function);
             },
             .object => |o| try writer.writeAll(o.name),
             .function => |f| try f.format(writer),
+            .array => |e| {
+                try e.formatParenthesized(writer, e.* == .function or e.* == .@"union");
+                try writer.writeAll("[]");
+            },
             else => try writer.writeAll(@tagName(this.*)),
+        }
+    }
+
+    fn formatParenthesized(this: *const Type, writer: *std.Io.Writer, parenthesize: bool) std.Io.Writer.Error!void {
+        if (parenthesize) {
+            try writer.print("({f})", .{this});
+        } else {
+            try writer.print("{f}", .{this});
         }
     }
 };
@@ -124,14 +139,57 @@ pub const Object = struct {
 
 pub const Parameter = struct {
     name: []const u8,
+    /// For a `b?: T` parameter this is `T | undefined`; for one with a default value, just `T`.
     type: *const Type,
+    /// It has a `?` or a default value, so an argument for it can be left out.
+    optional: bool = false,
 };
 
 pub const Function = struct {
     parameters: []const Parameter,
-    /// The element type of a `...rest` parameter.
+    /// A `...rest` parameter, whose type is an array type.
     rest: ?Parameter = null,
     returns: *const Type,
+    /// The return type is still being inferred from the body, and is `any` until it is. A call
+    /// in the meantime is a circular reference (TS7023).
+    pending: bool = false,
+
+    /// How many arguments a call must pass.
+    pub fn minArguments(this: *const Function) usize {
+        var count: usize = 0;
+        for (this.parameters, 0..) |p, i| {
+            if (!p.optional) {
+                count = i + 1;
+            }
+        }
+        return count;
+    }
+
+    /// The type an argument at `index` must have, or null if there's no parameter for it.
+    pub fn parameterType(this: *const Function, index: usize) ?*const Type {
+        if (index < this.parameters.len) {
+            return this.parameters[index].type;
+        }
+        const rest = this.rest orelse return null;
+        return rest.type.array;
+    }
+
+    pub fn eql(a: *const Function, b: *const Function) bool {
+        if (a.parameters.len != b.parameters.len or (a.rest == null) != (b.rest == null) or a.pending or b.pending) {
+            return false;
+        }
+        for (a.parameters, b.parameters) |x, y| {
+            if (x.optional != y.optional or !std.mem.eql(u8, x.name, y.name) or !x.type.eql(y.type)) {
+                return false;
+            }
+        }
+        if (a.rest) |r| {
+            if (!std.mem.eql(u8, r.name, b.rest.?.name) or !r.type.eql(b.rest.?.type)) {
+                return false;
+            }
+        }
+        return a.returns.eql(b.returns);
+    }
 
     pub fn format(this: *const Function, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.writeAll("(");
@@ -139,13 +197,13 @@ pub const Function = struct {
             if (i > 0) {
                 try writer.writeAll(", ");
             }
-            try writer.print("{s}: {f}", .{ p.name, p.type });
+            try writer.print("{s}{s}: {f}", .{ p.name, if (p.optional) "?" else "", p.type });
         }
         if (this.rest) |r| {
             if (this.parameters.len > 0) {
                 try writer.writeAll(", ");
             }
-            try writer.print("...{s}: {f}[]", .{ r.name, r.type });
+            try writer.print("...{s}: {f}", .{ r.name, r.type });
         }
         try writer.print(") => {f}", .{this.returns});
     }
@@ -163,6 +221,7 @@ pub const number: *const Type = &.number;
 pub const string: *const Type = &.string;
 pub const @"true": *const Type = &.{ .literal = .{ .value = .{ .boolean = true } } };
 pub const @"false": *const Type = &.{ .literal = .{ .value = .{ .boolean = false } } };
+pub const any_array: *const Type = &.{ .array = any };
 const fresh_true: *const Type = &.{ .literal = .{ .value = .{ .boolean = true }, .fresh = true } };
 const fresh_false: *const Type = &.{ .literal = .{ .value = .{ .boolean = false }, .fresh = true } };
 
@@ -303,7 +362,7 @@ fn printRank(t: *const Type) u8 {
             else => 5,
         },
         .void => 6,
-        .object, .function => 7,
+        .object, .function, .array => 7,
         .null => 8,
         .undefined => 9,
         .any, .unknown, .never, .@"union" => 10,
@@ -396,6 +455,9 @@ fn overlaps(x: *const Type, y: *const Type) bool {
     if (x.* == .function and y.* == .function) {
         return true;
     }
+    if (x.* == .array and y.* == .array) {
+        return comparable(x.array, y.array);
+    }
     return primitiveKind(x) != .other and primitiveKind(x) == primitiveKind(y);
 }
 
@@ -475,8 +537,44 @@ pub fn assignable(source: *const Type, target: *const Type) bool {
         .string => isStringLike(source),
         .boolean => source.* == .literal and source.literal.value == .boolean,
         .void => source.* == .undefined,
+        .array => |element| source.* == .array and assignable(source.array, element),
+        .function => |f| source.* == .function and functionAssignable(source.function, f),
         else => false,
     };
+}
+
+/// Whether a function of type `source` can be called the way `target` says it will be: with at
+/// least as many arguments as `source` needs, of types its parameters accept (compared
+/// contravariantly, as `strictFunctionTypes` does), and returning what `target` returns.
+pub fn functionAssignable(source: *const Function, target: *const Function) bool {
+    return functionMismatch(source, target) == null;
+}
+
+/// Why `source` isn't assignable to `target`, for tsc's elaborations, or null if it is.
+pub const FunctionMismatch = union(enum) {
+    /// `target` passes fewer arguments than `source` requires.
+    arity: usize,
+    /// The parameters at this index don't match.
+    parameter: usize,
+    returns,
+};
+
+pub fn functionMismatch(source: *const Function, target: *const Function) ?FunctionMismatch {
+    if (target.rest == null and source.minArguments() > target.parameters.len) {
+        return .{ .arity = source.minArguments() };
+    }
+    const count = @max(source.parameters.len, target.parameters.len) + @intFromBool(source.rest != null and target.rest != null);
+    for (0..count) |i| {
+        const s = source.parameterType(i) orelse continue;
+        const t = target.parameterType(i) orelse continue;
+        if (!assignable(t, s)) {
+            return .{ .parameter = i };
+        }
+    }
+    if (target.returns.* != .void and !assignable(source.returns, target.returns)) {
+        return .returns;
+    }
+    return null;
 }
 
 /// Whether `t` is or includes `undefined` (or `void`, `any` or `unknown`, which can all hold it).
@@ -564,6 +662,34 @@ test widenFresh {
     const fresh = try unionOf(a, &.{ try freshLiteral(a, .{ .number = 1 }), try literal(a, .{ .string = "x" }) });
     try testing.expectFmt("number | \"x\"", "{f}", .{try widenFresh(a, fresh)});
     try testing.expectFmt("boolean", "{f}", .{try widenFresh(a, fresh_true)});
+}
+
+test "function types" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const number_array = try asPtr(.{ .array = number }, a);
+    const f: Type = .{ .function = &.{
+        .parameters = &.{ .{ .name = "a", .type = number }, .{ .name = "b", .type = try unionOf(a, &.{ string, @"undefined" }), .optional = true } },
+        .rest = .{ .name = "c", .type = number_array },
+        .returns = @"void",
+    } };
+    try testing.expectFmt("(a: number, b?: string | undefined, ...c: number[]) => void", "{f}", .{&f});
+    const g: Type = .{ .function = &.{ .parameters = &.{.{ .name = "x", .type = number }}, .returns = number } };
+    try testing.expectFmt("((x: number) => number)[] | undefined", "{f}", .{try unionOf(a, &.{ try asPtr(.{ .array = &g }, a), @"undefined" })});
+    // Fewer parameters is fine; more required ones isn't.
+    const none: Type = .{ .function = &.{ .parameters = &.{}, .returns = number } };
+    try testing.expect(assignable(&none, &g));
+    try testing.expect(!assignable(&g, &none));
+    // Parameters are compared contravariantly.
+    const takes_one: Type = .{ .function = &.{ .parameters = &.{.{ .name = "x", .type = try literal(a, .{ .number = 1 }) }}, .returns = number } };
+    try testing.expect(assignable(&g, &takes_one));
+    try testing.expect(!assignable(&takes_one, &g));
+    // Anything can be returned where `void` is expected.
+    const returns_void: Type = .{ .function = &.{ .parameters = &.{}, .returns = @"void" } };
+    try testing.expect(assignable(&g, &returns_void) == false);
+    try testing.expect(assignable(&none, &returns_void));
+    try testing.expect(!assignable(&returns_void, &none));
 }
 
 test "format" {

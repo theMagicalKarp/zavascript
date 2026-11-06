@@ -6,7 +6,7 @@ const value = @import("../value.zig");
 const Interpreter = @import("../Interpreter.zig");
 const Value = value.Value;
 
-pub fn install(interpreter: *Interpreter) Interpreter.Error!void {
+pub fn install(interpreter: *Interpreter) error{OutOfMemory}!void {
     const console = try interpreter.arena.create(value.Object);
     console.* = .{ .tag = "Object [console]" };
     inline for (.{ .{ "log", false }, .{ "info", false }, .{ "debug", false }, .{ "error", true }, .{ "warn", true } }) |entry| {
@@ -25,20 +25,23 @@ fn writer(comptime to_stderr: bool) *const fn (*anyopaque, Value, []const Value)
         fn call(context: *anyopaque, _: Value, args: []const Value) anyerror!Value {
             const interpreter = Interpreter.fromContext(context);
             const out = if (to_stderr) interpreter.stderr else interpreter.stdout;
-            try print(out, args);
+            print(interpreter.arena, out, args) catch |err| switch (err) {
+                error.Unsupported => return interpreter.throw(.Unsupported, "Printing an array of arrays or objects, or of very long strings, is not supported yet.", .{}),
+                else => |e| return e,
+            };
             return .undefined;
         }
     }.call;
 }
 
-pub fn print(out: *std.Io.Writer, args: []const Value) std.Io.Writer.Error!void {
+pub fn print(allocator: std.mem.Allocator, out: *std.Io.Writer, args: []const Value) value.InspectError!void {
     for (args, 0..) |arg, i| {
         if (i > 0) {
             try out.writeByte(' ');
         }
         switch (arg) {
             .string => |s| try out.writeAll(s),
-            else => try value.inspect(out, arg),
+            else => try value.inspect(allocator, out, arg),
         }
     }
     try out.writeByte('\n');

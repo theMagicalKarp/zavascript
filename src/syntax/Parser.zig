@@ -25,6 +25,9 @@ index: usize = 0,
 /// Counters for the dense indices in `ast.Program`.
 reference_count: u32 = 0,
 binding_count: u32 = 0,
+scope_count: u32 = 0,
+function_count: u32 = 0,
+type_spans: std.ArrayList(ast.Span) = .empty,
 /// Set while parsing a `for` head, where `in` starts a `for...in` instead of being an operator.
 no_in: bool = false,
 
@@ -54,6 +57,9 @@ fn program(this: *Parser) error{OutOfMemory}!ast.Program {
         .statements = try statements.toOwnedSlice(this.arena),
         .reference_count = this.reference_count,
         .binding_count = this.binding_count,
+        .scope_count = this.scope_count,
+        .function_count = this.function_count,
+        .type_spans = try this.type_spans.toOwnedSlice(this.arena),
     };
 }
 
@@ -183,6 +189,57 @@ const Brackets = struct {
     }
 };
 
+/// Everything a failed speculative parse has to undo.
+const Mark = struct {
+    index: usize,
+    reference_count: u32,
+    binding_count: u32,
+    scope_count: u32,
+    function_count: u32,
+    type_spans: usize,
+    diagnostics: usize,
+};
+
+fn mark(this: *const Parser) Mark {
+    return .{
+        .index = this.index,
+        .reference_count = this.reference_count,
+        .binding_count = this.binding_count,
+        .scope_count = this.scope_count,
+        .function_count = this.function_count,
+        .type_spans = this.type_spans.items.len,
+        .diagnostics = this.diagnostics.items().len,
+    };
+}
+
+fn reset(this: *Parser, m: Mark) void {
+    this.index = m.index;
+    this.reference_count = m.reference_count;
+    this.binding_count = m.binding_count;
+    this.scope_count = m.scope_count;
+    this.function_count = m.function_count;
+    this.type_spans.shrinkRetainingCapacity(m.type_spans);
+    this.diagnostics.truncate(m.diagnostics);
+}
+
+fn newBinding(this: *Parser) u32 {
+    const binding = this.binding_count;
+    this.binding_count += 1;
+    return binding;
+}
+
+fn newFunction(this: *Parser) u32 {
+    const id = this.function_count;
+    this.function_count += 1;
+    return id;
+}
+
+fn newScope(this: *Parser) u32 {
+    const scope = this.scope_count;
+    this.scope_count += 1;
+    return scope;
+}
+
 fn newExpr(this: *Parser, start: u32, data: Expr.Data) error{OutOfMemory}!*Expr {
     const expr = try this.arena.create(Expr);
     expr.* = .{ .start = start, .data = data };
@@ -193,7 +250,7 @@ fn newExpr(this: *Parser, start: u32, data: Expr.Data) error{OutOfMemory}!*Expr 
 
 fn newStmt(this: *Parser, start: u32, data: Stmt.Data) error{OutOfMemory}!*Stmt {
     const stmt = try this.arena.create(Stmt);
-    stmt.* = .{ .start = start, .data = data };
+    stmt.* = .{ .start = start, .end = this.previousEnd(), .data = data };
     return stmt;
 }
 
@@ -223,12 +280,7 @@ fn statement(this: *Parser) Error!*Stmt {
             return this.newStmt(tok.start, .empty);
         },
         .r_brace => return this.fail(tok.start, .ts(1128), "Declaration or statement expected.", .{}),
-        .l_brace => {
-            _ = this.advance();
-            const statements = try this.statementList(.r_brace);
-            _ = try this.expect(.r_brace);
-            return this.newStmt(tok.start, .{ .block = statements });
-        },
+        .l_brace => return this.newStmt(tok.start, .{ .block = try this.block() }),
         .kw_let, .kw_const => {
             if (tok.tag == .kw_const and this.peekToken(1).tag == .kw_enum) {
                 return this.unsupported(tok.start, "'const enum' declarations are", .{});
@@ -268,10 +320,24 @@ fn statement(this: *Parser) Error!*Stmt {
             return this.newStmt(tok.start, if (tok.tag == .kw_break) .{ .@"break" = jump } else .{ .@"continue" = jump });
         },
         .kw_switch => return this.switchStatement(),
-        .kw_return, .kw_throw, .kw_try, .kw_with, .kw_debugger => {
+        .kw_return => {
+            _ = this.advance();
+            const next = this.current();
+            const value = switch (next.tag) {
+                .semicolon, .r_brace, .eof => null,
+                else => if (next.newline_before) null else try this.expression(),
+            };
+            try this.semicolon();
+            return this.newStmt(tok.start, .{ .@"return" = value });
+        },
+        .kw_function => {
+            _ = this.advance();
+            return this.newStmt(tok.start, .{ .function = try this.function(.declaration, tok.start) });
+        },
+        .kw_throw, .kw_try, .kw_with, .kw_debugger => {
             return this.unsupported(tok.start, "'{s}' statements are", .{this.tokenText(tok)});
         },
-        .kw_function, .kw_class, .kw_enum, .kw_interface, .kw_import, .kw_export => {
+        .kw_class, .kw_enum, .kw_interface, .kw_import, .kw_export => {
             return this.unsupported(tok.start, "'{s}' declarations are", .{this.tokenText(tok)});
         },
         .identifier => {
@@ -295,6 +361,24 @@ fn statement(this: *Parser) Error!*Stmt {
     const expr = try this.expression();
     try this.semicolon();
     return this.newStmt(tok.start, .{ .expression = expr });
+}
+
+/// `{ statements }`
+fn block(this: *Parser) Error!ast.Block {
+    _ = try this.expect(.l_brace);
+    const scope = this.newScope();
+    const statements = try this.statementList(.r_brace);
+    _ = try this.expect(.r_brace);
+    const declares_functions = for (statements) |stmt| {
+        var st = stmt;
+        while (st.data == .labeled) {
+            st = st.data.labeled.body;
+        }
+        if (st.data == .function) {
+            break true;
+        }
+    } else false;
+    return .{ .statements = statements, .scope = scope, .declares_functions = declares_functions };
 }
 
 /// `( expression )`, as in `if` and `while`.
@@ -333,17 +417,19 @@ fn variableStatement(this: *Parser) Error!*Stmt {
         if (this.current().tag == .bang) {
             return this.unsupported(this.current().start, "Definite assignment assertions are", .{});
         }
-        const annotation = if (this.eat(.colon)) try this.typeAnnotation() else null;
+        const annotation = if (this.current().tag == .colon) try this.typeAnnotation(this.advance().start) else null;
         const init = if (this.eat(.equal)) try this.assignment() else null;
+        if (init) |e| {
+            nameFunction(e, this.tokenText(name));
+        }
         try declarators.append(this.arena, .{
             .name = this.tokenText(name),
             .start = name.start,
             .end = this.previousEnd(),
-            .binding = this.binding_count,
+            .binding = this.newBinding(),
             .type = annotation,
             .init = init,
         });
-        this.binding_count += 1;
         if (!this.eat(.comma)) {
             break;
         }
@@ -365,6 +451,7 @@ fn forStatement(this: *Parser) Error!*Stmt {
         return this.unsupported(this.current().start, "'for await' statements are", .{});
     }
     _ = try this.expect(.l_paren);
+    const scope = this.newScope();
     var init: ?*Stmt = null;
     const first = this.current();
     switch (first.tag) {
@@ -388,13 +475,14 @@ fn forStatement(this: *Parser) Error!*Stmt {
     const update = if (this.current().tag != .r_paren) try this.expression() else null;
     _ = try this.expect(.r_paren);
     const body = try this.statement();
-    return this.newStmt(start, .{ .@"for" = .{ .init = init, .condition = condition, .update = update, .body = body } });
+    return this.newStmt(start, .{ .@"for" = .{ .scope = scope, .init = init, .condition = condition, .update = update, .body = body } });
 }
 
 fn switchStatement(this: *Parser) Error!*Stmt {
     const start = this.advance().start;
     const discriminant = try this.parenthesized();
     _ = try this.expect(.l_brace);
+    const scope = this.newScope();
     var clauses: std.ArrayList(ast.Clause) = .empty;
     while (this.current().tag != .r_brace) {
         const tok = this.current();
@@ -418,7 +506,7 @@ fn switchStatement(this: *Parser) Error!*Stmt {
         try clauses.append(this.arena, .{ .start = tok.start, .case = case, .statements = try statements.toOwnedSlice(this.arena) });
     }
     _ = this.advance();
-    return this.newStmt(start, .{ .@"switch" = .{ .discriminant = discriminant, .clauses = try clauses.toOwnedSlice(this.arena) } });
+    return this.newStmt(start, .{ .@"switch" = .{ .scope = scope, .discriminant = discriminant, .clauses = try clauses.toOwnedSlice(this.arena) } });
 }
 
 /// Consumes a `;`, or accepts its absence where automatic semicolon insertion applies.
@@ -436,41 +524,390 @@ fn semicolon(this: *Parser) Error!void {
 
 // Types
 
-/// The type after a `:`. Only primitive keywords and plain names parse; the rest of the type
+/// The type after an annotation's `:`, which has been consumed. `span_start` is where the
+/// annotation starts (the `:`, or a parameter's `?`), for `Program.type_spans`.
+fn typeAnnotation(this: *Parser, span_start: u32) Error!*const ast.TypeNode {
+    const node = try this.typeNode();
+    try this.type_spans.append(this.arena, .{ .start = span_start, .end = this.previousEnd() });
+    return node;
+}
+
+fn newType(this: *Parser, start: u32, data: ast.TypeNode.Data) error{OutOfMemory}!*const ast.TypeNode {
+    const node = try this.arena.create(ast.TypeNode);
+    node.* = .{ .start = start, .data = data };
+    return node;
+}
+
+/// A type. The primitive keywords, names, arrays and function types parse; the rest of the type
 /// syntax is reported as unsupported.
-fn typeAnnotation(this: *Parser) Error!*const ast.TypeNode {
+fn typeNode(this: *Parser) Error!*const ast.TypeNode {
     const tok = this.current();
-    const data: ast.TypeNode.Data = switch (tok.tag) {
+    var node: *const ast.TypeNode = switch (tok.tag) {
         .identifier => blk: {
+            _ = this.advance();
             const text = this.tokenText(tok);
-            break :blk if (std.meta.stringToEnum(ast.TypeNode.Keyword, text)) |keyword|
+            const next = this.current();
+            switch (next.tag) {
+                .less => return this.unsupported(next.start, "Generic types are", .{}),
+                .dot => return this.unsupported(next.start, "Qualified type names are", .{}),
+                else => {},
+            }
+            break :blk try this.newType(tok.start, if (std.meta.stringToEnum(ast.TypeNode.Keyword, text)) |keyword|
                 .{ .keyword = keyword }
             else
-                .{ .reference = text };
+                .{ .reference = text });
         },
-        .kw_void => .{ .keyword = .void },
-        .kw_null => .{ .keyword = .null },
+        .kw_void, .kw_null => blk: {
+            _ = this.advance();
+            break :blk try this.newType(tok.start, .{ .keyword = if (tok.tag == .kw_void) .void else .null });
+        },
+        .l_paren => if (this.startsFunctionType())
+            try this.functionType()
+        else blk: {
+            _ = this.advance();
+            const inner = try this.typeNode();
+            _ = try this.expect(.r_paren);
+            break :blk inner;
+        },
         .string, .number, .kw_true, .kw_false, .minus, .template_full => return this.unsupported(tok.start, "Literal types are", .{}),
         .pipe, .ampersand => return this.unsupported(tok.start, "Union and intersection types are", .{}),
-        .l_paren, .kw_new, .less => return this.unsupported(tok.start, "Function types are", .{}),
+        .kw_new => return this.unsupported(tok.start, "Constructor types are", .{}),
+        .less => return this.unsupported(tok.start, "Generic function types are", .{}),
         .l_brace => return this.unsupported(tok.start, "Object types are", .{}),
         .l_bracket => return this.unsupported(tok.start, "Tuple types are", .{}),
         .kw_typeof => return this.unsupported(tok.start, "'typeof' types are", .{}),
         .kw_this => return this.unsupported(tok.start, "'this' types are", .{}),
         else => return this.fail(tok.start, .ts(1110), "Type expected.", .{}),
     };
-    _ = this.advance();
-    const next = this.current();
-    switch (next.tag) {
-        .pipe, .ampersand => return this.unsupported(next.start, "Union and intersection types are", .{}),
-        .l_bracket => if (!next.newline_before) return this.unsupported(next.start, "Array types are", .{}),
-        .less => return this.unsupported(next.start, "Generic types are", .{}),
-        .dot => return this.unsupported(next.start, "Qualified type names are", .{}),
-        else => {},
+    while (true) {
+        const next = this.current();
+        switch (next.tag) {
+            .l_bracket => {
+                if (next.newline_before) {
+                    break;
+                }
+                if (this.peekToken(1).tag != .r_bracket) {
+                    return this.unsupported(next.start, "Indexed access types are", .{});
+                }
+                _ = this.advance();
+                _ = this.advance();
+                node = try this.newType(node.start, .{ .array = node });
+            },
+            .pipe, .ampersand => return this.unsupported(next.start, "Union and intersection types are", .{}),
+            else => break,
+        }
     }
-    const node = try this.arena.create(ast.TypeNode);
-    node.* = .{ .start = tok.start, .data = data };
     return node;
+}
+
+/// Whether the `(` at the current token starts a function type rather than a parenthesized
+/// type (tsc's `isStartOfFunctionTypeOrConstructorType`).
+fn startsFunctionType(this: *const Parser) bool {
+    const next = this.peekToken(1);
+    switch (next.tag) {
+        .r_paren, .ellipsis => return true,
+        .identifier, .kw_this => {},
+        else => return next.tag.isKeyword(),
+    }
+    return switch (this.peekToken(2).tag) {
+        .colon, .comma, .question, .equal => true,
+        .r_paren => this.peekToken(3).tag == .arrow,
+        else => false,
+    };
+}
+
+fn functionType(this: *Parser) Error!*const ast.TypeNode {
+    const start = this.advance().start;
+    var parameters: std.ArrayList(ast.TypeParameter) = .empty;
+    while (this.current().tag != .r_paren) {
+        const rest = this.eat(.ellipsis);
+        const name = this.current();
+        switch (name.tag) {
+            .identifier => {},
+            .kw_this => return this.unsupported(name.start, "'this' parameters are", .{}),
+            .l_bracket, .l_brace => return this.unsupported(name.start, "Destructuring is", .{}),
+            else => return this.fail(name.start, .ts(1003), "Identifier expected.", .{}),
+        }
+        _ = this.advance();
+        const optional = this.eat(.question);
+        const annotation = if (this.eat(.colon)) try this.typeNode() else null;
+        try parameters.append(this.arena, .{
+            .name = this.tokenText(name),
+            .start = name.start,
+            .type = annotation,
+            .optional = optional,
+            .rest = rest,
+        });
+        if (!this.eat(.comma)) {
+            break;
+        }
+    }
+    _ = try this.expect(.r_paren);
+    _ = try this.expect(.arrow);
+    const returns = try this.typeNode();
+    return this.newType(start, .{ .function = .{ .parameters = try parameters.toOwnedSlice(this.arena), .returns = returns } });
+}
+
+// Functions
+
+/// A function declaration or expression, after the `function` keyword (at `start`).
+fn function(this: *Parser, kind: ast.Function.Kind, start: u32) Error!*ast.Function {
+    if (this.current().tag == .star) {
+        return this.unsupported(this.current().start, "Generators are", .{});
+    }
+    var name: ?ast.Function.Name = null;
+    const tok = this.current();
+    if (tok.tag == .identifier) {
+        _ = this.advance();
+        name = .{ .text = this.tokenText(tok), .start = tok.start, .binding = this.newBinding() };
+    } else if (kind == .declaration) {
+        if (tok.tag.isKeyword() and tok.tag != .kw_this) {
+            return this.fail(tok.start, .ts(1389), "'{s}' is not allowed as a function declaration name.", .{this.tokenText(tok)});
+        }
+        return this.fail(tok.start, .ts(1003), "Identifier expected.", .{});
+    }
+    const function_id = this.newFunction();
+    const scope = this.newScope();
+    const parameters = try this.parameterList();
+    var returns: ?*const ast.TypeNode = null;
+    var returns_start: u32 = 0;
+    if (this.current().tag == .colon) {
+        const colon = this.advance();
+        returns_start = this.current().start;
+        returns = try this.typeAnnotation(colon.start);
+    }
+    if (this.current().tag != .l_brace and kind == .declaration) {
+        return this.unsupported(start, "Function overloads are", .{});
+    }
+    const body = try this.block();
+    const node = try this.arena.create(ast.Function);
+    node.* = .{
+        .kind = kind,
+        .id = function_id,
+        .start = start,
+        .end = this.previousEnd(),
+        .name = name,
+        .inferred_name = if (name) |n| n.text else "",
+        .parameters = parameters,
+        .scope = scope,
+        .returns = returns,
+        .returns_start = returns_start,
+        .body = .{ .block = body },
+    };
+    return node;
+}
+
+/// `( parameters )`
+fn parameterList(this: *Parser) Error![]const ast.Parameter {
+    _ = try this.expect(.l_paren);
+    var parameters: std.ArrayList(ast.Parameter) = .empty;
+    while (this.current().tag != .r_paren) {
+        const first = this.current();
+        const rest = this.eat(.ellipsis);
+        const name = this.current();
+        switch (name.tag) {
+            .identifier => {},
+            .kw_this => return this.unsupported(name.start, "'this' parameters are", .{}),
+            .l_bracket, .l_brace => return this.unsupported(name.start, "Destructuring is", .{}),
+            else => if (name.tag.isKeyword()) {
+                return this.fail(name.start, .ts(1390), "'{s}' is not allowed as a parameter name.", .{this.tokenText(name)});
+            } else {
+                return this.fail(name.start, .ts(1138), "Parameter declaration expected.", .{});
+            },
+        }
+        _ = this.advance();
+        var span_start: ?u32 = null;
+        const question = this.current();
+        const optional = this.eat(.question);
+        if (optional) {
+            span_start = question.start;
+        }
+        var annotation: ?*const ast.TypeNode = null;
+        if (this.current().tag == .colon) {
+            const colon = this.advance();
+            annotation = try this.typeAnnotation(span_start orelse colon.start);
+        } else if (span_start) |at| {
+            try this.type_spans.append(this.arena, .{ .start = at, .end = this.previousEnd() });
+        }
+        var init: ?*Expr = null;
+        if (this.current().tag == .equal) {
+            const equal = this.advance();
+            if (rest) {
+                try this.report(equal.start, .ts(1048), "A rest parameter cannot have an initializer.", .{});
+            } else if (optional) {
+                try this.report(name.start, .ts(1015), "Parameter cannot have question mark and initializer.", .{});
+            }
+            init = try this.assignment();
+            nameFunction(init.?, this.tokenText(name));
+        }
+        if (rest and optional) {
+            try this.report(question.start, .ts(1047), "A rest parameter cannot be optional.", .{});
+        }
+        try parameters.append(this.arena, .{
+            .name = this.tokenText(name),
+            .start = name.start,
+            .node_start = first.start,
+            .end = this.previousEnd(),
+            .binding = this.newBinding(),
+            .type = annotation,
+            .init = init,
+            .optional = optional,
+            .rest = rest,
+        });
+        if (!this.eat(.comma)) {
+            break;
+        }
+        if (rest) {
+            if (this.current().tag == .r_paren) {
+                try this.report(first.start, .ts(1013), "A rest parameter or binding pattern may not have a trailing comma.", .{});
+            } else {
+                try this.report(first.start, .ts(1014), "A rest parameter must be last in a parameter list.", .{});
+            }
+        }
+    }
+    _ = try this.expect(.r_paren);
+    return parameters.toOwnedSlice(this.arena);
+}
+
+/// An arrow function at the current token, or null (having consumed nothing) if there isn't one.
+fn arrowFunction(this: *Parser) Error!?*Expr {
+    const tok = this.current();
+    switch (tok.tag) {
+        .identifier => {
+            const next = this.peekToken(1);
+            if (this.isContextual(tok, "async") and !next.newline_before) {
+                switch (next.tag) {
+                    .kw_function, .identifier => return this.unsupported(tok.start, "Async functions are", .{}),
+                    .l_paren => {
+                        // `async (x) => ...` rather than a call to something named `async`.
+                        const m = this.mark();
+                        _ = this.advance();
+                        const is_arrow = if (this.skipParens()) this.current().tag == .arrow or this.current().tag == .colon else false;
+                        this.reset(m);
+                        if (is_arrow) {
+                            return this.unsupported(tok.start, "Async functions are", .{});
+                        }
+                    },
+                    else => {},
+                }
+            }
+            if (next.tag != .arrow) {
+                return null;
+            }
+            _ = this.advance();
+            const parameters = try this.arena.alloc(ast.Parameter, 1);
+            parameters[0] = .{
+                .name = this.tokenText(tok),
+                .start = tok.start,
+                .node_start = tok.start,
+                .end = tok.end,
+                .binding = this.newBinding(),
+                .type = null,
+                .init = null,
+                .optional = false,
+                .rest = false,
+            };
+            const function_id = this.newFunction();
+            return try this.arrowBody(tok.start, function_id, this.newScope(), parameters, .{ .parameters = parameters, .returns = null, .returns_start = 0 });
+        },
+        .l_paren => {
+            // Parse the head speculatively: `(a, b)` is only a parameter list if `=>` follows.
+            const m = this.mark();
+            const function_id = this.newFunction();
+            const scope = this.newScope();
+            const head = this.arrowHead() catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Syntax => {
+                    this.reset(m);
+                    return null;
+                },
+            } orelse {
+                this.reset(m);
+                return null;
+            };
+            return try this.arrowBody(tok.start, function_id, scope, head.parameters, head);
+        },
+        else => return null,
+    }
+}
+
+const ArrowHead = struct {
+    parameters: []const ast.Parameter,
+    returns: ?*const ast.TypeNode,
+    returns_start: u32,
+};
+
+/// `(parameters): type` followed by `=>`, or null if what's there isn't that.
+fn arrowHead(this: *Parser) Error!?ArrowHead {
+    const parameters = try this.parameterList();
+    var returns: ?*const ast.TypeNode = null;
+    var returns_start: u32 = 0;
+    if (this.current().tag == .colon) {
+        const colon = this.advance();
+        returns_start = this.current().start;
+        returns = try this.typeAnnotation(colon.start);
+    }
+    if (this.current().tag != .arrow) {
+        return null;
+    }
+    return .{ .parameters = parameters, .returns = returns, .returns_start = returns_start };
+}
+
+/// Skips a balanced `( ... )` starting at the current token. False if it isn't closed.
+fn skipParens(this: *Parser) bool {
+    var depth: usize = 0;
+    while (true) {
+        const tok = this.advance();
+        switch (tok.tag) {
+            .l_paren => depth += 1,
+            .r_paren => {
+                depth -= 1;
+                if (depth == 0) {
+                    return true;
+                }
+            },
+            .eof => return false,
+            else => {},
+        }
+    }
+}
+
+/// An arrow function from its `=>` on.
+fn arrowBody(this: *Parser, start: u32, function_id: u32, scope: u32, parameters: []const ast.Parameter, head: ArrowHead) Error!*Expr {
+    const arrow = this.advance();
+    if (arrow.newline_before) {
+        try this.report(arrow.start, .ts(1200), "Line terminator not permitted before arrow.", .{});
+    }
+    const body: ast.Function.Body = if (this.current().tag == .l_brace)
+        .{ .block = try this.block() }
+    else
+        .{ .expression = try this.assignment() };
+    const node = try this.arena.create(ast.Function);
+    node.* = .{
+        .kind = .arrow,
+        .id = function_id,
+        .start = start,
+        .end = this.previousEnd(),
+        .name = null,
+        .parameters = parameters,
+        .scope = scope,
+        .returns = head.returns,
+        .returns_start = head.returns_start,
+        .body = body,
+    };
+    return this.newExpr(start, .{ .function = node });
+}
+
+/// NamedEvaluation (ECMA-262 §8.4.5): an anonymous function assigned straight to a name takes
+/// that name.
+fn nameFunction(value: *Expr, name: []const u8) void {
+    var e = value;
+    while (e.data == .paren) {
+        e = e.data.paren;
+    }
+    if (e.data == .function and e.data.function.inferred_name.len == 0) {
+        e.data.function.inferred_name = name;
+    }
 }
 
 // Expressions
@@ -486,6 +923,9 @@ fn expression(this: *Parser) Error!*Expr {
 }
 
 fn assignment(this: *Parser) Error!*Expr {
+    if (try this.arrowFunction()) |arrow| {
+        return arrow;
+    }
     const target = try this.conditional();
     // Only a left-hand-side expression can be assigned to; after anything else, like `a + 1`,
     // the `=` is left for the statement to report. (`1 = 2` parses, and the checker rejects it.)
@@ -510,7 +950,7 @@ fn assignment(this: *Parser) Error!*Expr {
         .ampersand_ampersand_equal => .logical_and,
         .pipe_pipe_equal => .logical_or,
         .question_question_equal => .nullish,
-        .arrow => return this.unsupported(tok.start, "Arrow functions are", .{}),
+        .arrow => return this.fail(tok.start, .ts(1005), "';' expected.", .{}),
         .greater => blk: {
             const greater = this.greaterOperator() orelse return target;
             if (!greater.assignment) {
@@ -526,6 +966,10 @@ fn assignment(this: *Parser) Error!*Expr {
     }
     // Assignment is right-associative: `a = b = c` is `a = (b = c)`.
     const value = try this.assignment();
+    const plain = target.data == .identifier and (op == null or op.?.isLogical());
+    if (plain) {
+        nameFunction(value, target.data.identifier.name);
+    }
     return this.newExpr(target.start, .{ .assign = .{ .op = op, .target = target, .value = value, .op_start = tok.start } });
 }
 
@@ -769,32 +1213,23 @@ fn primary(this: *Parser) Error!*Expr {
         },
         .identifier => {
             _ = this.advance();
-            if (this.current().tag == .arrow) {
-                return this.unsupported(this.current().start, "Arrow functions are", .{});
-            }
             const ref = this.reference_count;
             this.reference_count += 1;
             return this.newExpr(tok.start, .{ .identifier = .{ .name = this.tokenText(tok), .ref = ref } });
         },
         .l_paren => {
             _ = this.advance();
-            if (this.current().tag == .r_paren) {
-                return this.unsupported(tok.start, "Arrow functions are", .{});
-            }
             const inner = try this.expression();
-            if (this.current().tag == .colon) {
-                return this.unsupported(tok.start, "Arrow functions are", .{});
-            }
             _ = try this.expect(.r_paren);
-            if (this.current().tag == .arrow) {
-                return this.unsupported(tok.start, "Arrow functions are", .{});
-            }
             return this.newExpr(tok.start, .{ .paren = inner });
         },
         .bigint => return this.unsupported(tok.start, "BigInt literals are", .{}),
         .l_bracket => return this.unsupported(tok.start, "Array literals are", .{}),
         .l_brace => return this.unsupported(tok.start, "Object literals are", .{}),
-        .kw_function => return this.unsupported(tok.start, "Function expressions are", .{}),
+        .kw_function => {
+            _ = this.advance();
+            return this.newExpr(tok.start, .{ .function = try this.function(.expression, tok.start) });
+        },
         .kw_class => return this.unsupported(tok.start, "Class expressions are", .{}),
         .kw_new => return this.unsupported(tok.start, "'new' expressions are", .{}),
         .kw_this => return this.unsupported(tok.start, "'this' is", .{}),
@@ -915,6 +1350,70 @@ fn sexpr(writer: *std.Io.Writer, expr: *const Expr) std.Io.Writer.Error!void {
             try sexpr(writer, inner);
             try writer.writeAll("]");
         },
+        .function => |f| try renderFunction(writer, f),
+    }
+}
+
+/// `(fn name#id (a#0: number b#1 = 1 ...c#2) : number body)`
+fn renderFunction(writer: *std.Io.Writer, f: *const ast.Function) std.Io.Writer.Error!void {
+    try writer.print("({s}", .{switch (f.kind) {
+        .declaration, .expression => "fn",
+        .arrow => "=>",
+    }});
+    if (f.name) |n| {
+        try writer.print(" {s}#{d}", .{ n.text, n.binding });
+    }
+    try writer.writeAll(" (");
+    for (f.parameters, 0..) |p, i| {
+        if (i > 0) {
+            try writer.writeAll(" ");
+        }
+        try writer.print("{s}{s}#{d}{s}", .{ if (p.rest) "..." else "", p.name, p.binding, if (p.optional) "?" else "" });
+        if (p.type) |t| {
+            try writer.writeAll(": ");
+            try renderType(writer, t);
+        }
+        if (p.init) |init| {
+            try writer.writeAll(" = ");
+            try sexpr(writer, init);
+        }
+    }
+    try writer.writeAll(")");
+    if (f.returns) |t| {
+        try writer.writeAll(": ");
+        try renderType(writer, t);
+    }
+    try writer.writeAll(" ");
+    switch (f.body) {
+        .block => |b| try renderStmt(writer, &.{ .start = 0, .end = 0, .data = .{ .block = b } }),
+        .expression => |e| try sexpr(writer, e),
+    }
+    try writer.writeAll(")");
+}
+
+fn renderType(writer: *std.Io.Writer, t: *const ast.TypeNode) std.Io.Writer.Error!void {
+    switch (t.data) {
+        .keyword => |k| try writer.print("{t}", .{k}),
+        .reference => |name| try writer.writeAll(name),
+        .array => |element| {
+            try renderType(writer, element);
+            try writer.writeAll("[]");
+        },
+        .function => |f| {
+            try writer.writeAll("(");
+            for (f.parameters, 0..) |p, i| {
+                if (i > 0) {
+                    try writer.writeAll(", ");
+                }
+                try writer.print("{s}{s}{s}", .{ if (p.rest) "..." else "", p.name, if (p.optional) "?" else "" });
+                if (p.type) |pt| {
+                    try writer.writeAll(": ");
+                    try renderType(writer, pt);
+                }
+            }
+            try writer.writeAll(") => ");
+            try renderType(writer, f.returns);
+        },
     }
 }
 
@@ -928,10 +1427,8 @@ fn renderStmt(writer: *std.Io.Writer, stmt: *const Stmt) std.Io.Writer.Error!voi
             for (v.declarators) |d| {
                 try writer.print(" {s}#{d}", .{ d.name, d.binding });
                 if (d.type) |t| {
-                    switch (t.data) {
-                        .keyword => |k| try writer.print(": {t}", .{k}),
-                        .reference => |name| try writer.print(": {s}", .{name}),
-                    }
+                    try writer.writeAll(": ");
+                    try renderType(writer, t);
                 }
                 if (d.init) |init| {
                     try writer.writeAll(" = ");
@@ -939,9 +1436,17 @@ fn renderStmt(writer: *std.Io.Writer, stmt: *const Stmt) std.Io.Writer.Error!voi
                 }
             }
         },
-        .block => |statements| {
+        .function => |f| try renderFunction(writer, f),
+        .@"return" => |value| {
+            try writer.writeAll("return");
+            if (value) |v| {
+                try writer.writeAll(" ");
+                try sexpr(writer, v);
+            }
+        },
+        .block => |b| {
             try writer.writeAll("{");
-            for (statements) |s| {
+            for (b.statements) |s| {
                 try writer.writeAll(" ");
                 try renderStmt(writer, s);
             }
@@ -1177,18 +1682,62 @@ test "unsupported syntax is reported and skipped" {
     try expectErrors("var x = 1", &.{9001});
     try expectErrors("let [a] = b", &.{9001});
     try expectErrors("let a: number | string", &.{9001});
-    try expectErrors("let a: number[]", &.{9001});
     try expectErrors("let a: 1", &.{9001});
     try expectErrors("for (const x of y) {}", &.{9001});
     try expectErrors("for (x in y) {}", &.{9001});
     try expectErrors("type T = number", &.{9001});
-    try expectErrors("x => x", &.{9001});
     try expectErrors("[1, 2]", &.{9001});
     // A multi-line declaration is skipped as one unit.
-    const parsed: *Parsed = try .init("function f() {\n  return 1;\n}\nconsole.log(2)");
+    const parsed: *Parsed = try .init("class A {\n  x = 1;\n}\nconsole.log(2)");
     defer parsed.deinit();
     try testing.expectEqualSlices(u16, &.{9001}, try parsed.codes());
     try testing.expectEqualStrings("(call (. console log) 2)\n", try parsed.render());
     // `type` and friends are still ordinary names.
     try expectParse("type\ndeclare", "type\ndeclare\n");
+}
+
+test "functions" {
+    try expectParse("function f(a: number, b = 1, ...c: number[]): void { return; }", "(fn f#0 (a#1: number b#2 = 1 ...c#3: number[]): void { return })\n");
+    try expectParse("const g = function h() { return 1 }", "const g#1 = (fn h#0 () { return 1 })\n");
+    try expectParse("x => x + 1", "(=> (x#0) (+ x 1))\n");
+    try expectParse("(a, b?: string) => { a }", "(=> (a#0 b#1?: string) { a })\n");
+    try expectParse("(): number => 1", "(=> (): number 1)\n");
+    try expectParse("a => b => a", "(=> (a#0) (=> (b#1) a))\n");
+    try expectParse("(a)", "[a]\n");
+    try expectParse("(a, b)", "[(, a b)]\n");
+    try expectParse("f((x) => x, 1)", "(call f (=> (x#0) x) 1)\n");
+    try expectParse("c ? (a) : b", "(? c [a] b)\n");
+    try expectParse("return\nx", "return\nx\n");
+    try expectParse("let f: (a: number, b?: string, ...c: number[]) => void", "let f#0: (a: number, b?: string, ...c: number[]) => void\n");
+    try expectParse("let f: (() => number)[]", "let f#0: () => number[]\n");
+    try expectParse("let f: (number)", "let f#0: number\n");
+}
+
+test "function names" {
+    const parsed: *Parsed = try .init("const a = () => 1; let b; b = (function () {}); function c(d = () => 1) {}");
+    defer parsed.deinit();
+    const statements = parsed.program.statements;
+    try testing.expectEqualStrings("a", statements[0].data.variable.declarators[0].init.?.data.function.inferred_name);
+    try testing.expectEqualStrings("b", statements[2].data.expression.data.assign.value.data.paren.data.function.inferred_name);
+    const c = statements[3].data.function;
+    try testing.expectEqualStrings("c", c.inferred_name);
+    try testing.expectEqualStrings("d", c.parameters[0].init.?.data.function.inferred_name);
+}
+
+test "function errors" {
+    try expectErrors("function () {}", &.{1003});
+    try expectErrors("function f(...a, b) {}", &.{1014});
+    try expectErrors("function f(...a = 1) {}", &.{1048});
+    try expectErrors("function f(a?, b) {}", &.{});
+    try expectErrors("function f(a?: number = 1) {}", &.{1015});
+    try expectErrors("function* f() {}", &.{9001});
+    try expectErrors("function f(): void;", &.{9001});
+    try expectErrors("async function f() {}", &.{9001});
+    try expectErrors("const f = async () => 1", &.{9001});
+    try expectErrors("const f = async x => 1", &.{9001});
+    try expectParse("async(1)", "(call async 1)\n");
+    try expectErrors("let f: new () => void", &.{9001});
+    try expectErrors("let f: <T>() => T", &.{9001});
+    try expectErrors("let a: number[1]", &.{9001});
+    try expectErrors("(a, b)\n=> a", &.{1200});
 }

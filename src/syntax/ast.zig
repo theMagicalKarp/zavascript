@@ -8,13 +8,28 @@ pub const Program = struct {
     /// How many `Identifier` references the program has. Each has a dense `ref` index below this,
     /// so the checker can record what each one resolves to in a flat side table.
     reference_count: u32,
-    /// How many variables the program declares. Each `Declarator` has a dense `binding` index
-    /// below this.
+    /// How many names the program declares: variables, parameters and functions. Each has a dense
+    /// `binding` index below this.
     binding_count: u32,
+    /// How many block scopes the program has (blocks, `for` heads, `switch` bodies and function
+    /// parameter lists). Each has a dense `scope` index below this.
+    scope_count: u32,
+    /// How many functions the program has. Each `Function` has a dense `id` below this.
+    function_count: u32,
+    /// Where each type annotation is, from its `:` (or a parameter's `?`) to the end of the type,
+    /// in source order. Node prints a function's source with these blanked out, since it strips
+    /// types by replacing them with spaces.
+    type_spans: []const Span,
+};
+
+pub const Span = struct {
+    start: u32,
+    end: u32,
 };
 
 pub const Stmt = struct {
     start: u32,
+    end: u32,
     data: Data,
 
     pub const Data = union(enum) {
@@ -22,7 +37,9 @@ pub const Stmt = struct {
         /// A lone `;`.
         empty,
         variable: Variable,
-        block: []const *Stmt,
+        function: *const Function,
+        @"return": ?*Expr,
+        block: Block,
         @"if": If,
         @"while": Loop,
         do_while: Loop,
@@ -32,6 +49,14 @@ pub const Stmt = struct {
         labeled: Labeled,
         @"switch": Switch,
     };
+};
+
+/// `{ ... }`, which is a scope of its own.
+pub const Block = struct {
+    statements: []const *Stmt,
+    scope: u32,
+    /// It declares functions, which are created when it's entered.
+    declares_functions: bool,
 };
 
 pub const VariableKind = enum {
@@ -71,6 +96,8 @@ pub const Loop = struct {
 };
 
 pub const For = struct {
+    /// The scope of the variables the head declares.
+    scope: u32,
     /// A `variable` or `expression` statement.
     init: ?*Stmt,
     condition: ?*Expr,
@@ -89,6 +116,8 @@ pub const Labeled = struct {
 };
 
 pub const Switch = struct {
+    /// The clauses share one scope.
+    scope: u32,
     discriminant: *Expr,
     clauses: []const Clause,
 };
@@ -100,8 +129,8 @@ pub const Clause = struct {
     statements: []const *Stmt,
 };
 
-/// A type annotation. Only the primitive keywords are supported so far; anything else that parses
-/// is a `reference` the checker rejects.
+/// A type annotation: a primitive keyword, an array or function type, or a name the checker
+/// rejects for now.
 pub const TypeNode = struct {
     start: u32,
     data: Data,
@@ -109,9 +138,92 @@ pub const TypeNode = struct {
     pub const Data = union(enum) {
         keyword: Keyword,
         reference: []const u8,
+        /// `T[]`
+        array: *const TypeNode,
+        /// `(a: T, b?: U, ...c: V[]) => R`
+        function: FunctionType,
     };
 
     pub const Keyword = enum { any, unknown, never, void, undefined, null, boolean, number, string };
+};
+
+pub const FunctionType = struct {
+    parameters: []const TypeParameter,
+    returns: *const TypeNode,
+};
+
+/// A parameter of a function type, which only has a name and a type.
+pub const TypeParameter = struct {
+    name: []const u8,
+    start: u32,
+    type: ?*const TypeNode,
+    optional: bool,
+    rest: bool,
+};
+
+/// A function declaration, function expression or arrow function.
+pub const Function = struct {
+    kind: Kind,
+    /// Dense index among the program's functions; see `Program.function_count`.
+    id: u32,
+    /// Where the function starts and ends, for its source text.
+    start: u32,
+    end: u32,
+    /// The declared name, if any. A declaration's name is bound in the enclosing scope; a function
+    /// expression's only inside the function itself.
+    name: ?Name,
+    /// The name the function gets at runtime (its `.name`): its own, or the variable or parameter
+    /// it's assigned to (ECMA-262 NamedEvaluation). Empty when there's none.
+    inferred_name: []const u8 = "",
+    parameters: []const Parameter,
+    /// The scope the parameters (and a function expression's own name) are declared in.
+    scope: u32,
+    returns: ?*const TypeNode,
+    /// Where the return type annotation starts, for TS2355 and TS2366.
+    returns_start: u32,
+    body: Body,
+
+    pub const Kind = enum { declaration, expression, arrow };
+
+    pub const Name = struct {
+        text: []const u8,
+        start: u32,
+        binding: u32,
+    };
+
+    pub const Body = union(enum) {
+        block: Block,
+        /// An arrow function's `=> expression`.
+        expression: *Expr,
+    };
+
+    /// The value of `.length`: how many parameters come before the first default or rest one.
+    pub fn length(this: *const Function) u32 {
+        for (this.parameters, 0..) |p, i| {
+            if (p.init != null or p.rest) {
+                return @intCast(i);
+            }
+        }
+        return @intCast(this.parameters.len);
+    }
+};
+
+pub const Parameter = struct {
+    name: []const u8,
+    /// Where the name is.
+    start: u32,
+    /// Where the parameter starts, which is its `...` for a rest parameter.
+    node_start: u32,
+    /// Where the parameter (including its default value) ends. A default value that refers to a
+    /// parameter which ends after it is an error (TS2373).
+    end: u32,
+    binding: u32,
+    type: ?*const TypeNode,
+    init: ?*Expr,
+    /// `a?: T`
+    optional: bool,
+    /// `...a: T[]`
+    rest: bool,
 };
 
 pub const Expr = struct {
@@ -133,6 +245,7 @@ pub const Expr = struct {
         conditional: Conditional,
         member: Member,
         call: Call,
+        function: *Function,
         /// Kept so that `(a ?? b) || c` can be told apart from `a ?? b || c`, which is an error, and
         /// so syntactic checks see through parentheses the way tsc does.
         paren: *Expr,

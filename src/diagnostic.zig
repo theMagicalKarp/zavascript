@@ -88,6 +88,15 @@ pub const Diagnostics = struct {
         this.list.shrinkRetainingCapacity(len);
     }
 
+    /// Puts the diagnostics in source order, keeping the order of ones at the same place.
+    pub fn sort(this: *Diagnostics) void {
+        std.sort.insertion(Diagnostic, this.list.items, {}, struct {
+            fn lessThan(_: void, a: Diagnostic, b: Diagnostic) bool {
+                return a.source == b.source and a.start < b.start;
+            }
+        }.lessThan);
+    }
+
     pub fn items(this: *const Diagnostics) []const Diagnostic {
         return this.list.items;
     }

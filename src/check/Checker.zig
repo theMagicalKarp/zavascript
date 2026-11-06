@@ -10,8 +10,16 @@
 //! (`let b = true` is `true` until something assigns `false`). A loop is checked repeatedly until
 //! the state at its head stops changing; only the last pass's diagnostics are kept.
 //!
-//! It also resolves every identifier to a variable slot or a global, which the interpreter reads
-//! from `Resolved.refs` instead of looking names up again.
+//! Functions are checked where they appear. A function declaration that's used before that (it's
+//! hoisted) has its return type inferred early, without reporting anything, and its body is still
+//! checked for real where it's declared. Inside a function, a variable of an enclosing one is
+//! narrowed the way tsc 5.4 does it: by what was known where the closure was created, if nothing
+//! assigns the variable after that.
+//!
+//! It also resolves every identifier, and lays out where each variable lives at runtime: a slot
+//! that outlives the program for top-level variables, the call's frame for a function's own
+//! variables, or an environment for variables a closure captures. The interpreter reads this from
+//! `Resolved` instead of looking names up again.
 
 const std = @import("std");
 const Source = @import("../Source.zig");
@@ -42,6 +50,25 @@ labels: std.ArrayList([]const u8) = .empty,
 added: std.ArrayList([]const u8) = .empty,
 /// Uncalled-function checks (TS2774) waiting until the code they look at has been checked.
 pending: std.ArrayList(Pending) = .empty,
+/// The scope of each `scope` index in the program, created when it's first entered.
+scopes: []?*Scope,
+/// The scope each identifier reference was resolved from, for counting environments.
+ref_scopes: []?*Scope,
+/// Which of the program's bindings a closure captures, so they need an environment.
+captured: []bool,
+/// What's known about each of the program's functions.
+functions: []FunctionInfo,
+/// The function being checked, or null at the top level.
+context: ?*Context = null,
+/// Functions whose return types are being inferred, innermost last, for TS7023.
+inferring: std.ArrayList(u32) = .empty,
+/// The variable whose initializer is being checked, so a function expression there can be
+/// referred to by it before its return type is known.
+initializer: ?Initializer = null,
+/// The parameter whose default value is being checked, for TS2373.
+parameter: ?[]const u8 = null,
+/// Statements in the program, for finding a variable's last assignment.
+program: []const *const Stmt,
 /// While above zero, diagnostics are dropped; for checking an expression a second time.
 muted: u32 = 0,
 /// Variables whose types are being worked out early, for a use before their declaration; each
@@ -52,18 +79,31 @@ indirect_call: ?*const Expr = null,
 
 const Error = error{OutOfMemory};
 
-/// What an identifier refers to.
+/// What an identifier refers to, and where a declaration stores its value.
 pub const Ref = union(enum) {
     /// A builtin, looked up by name. Also used for names that didn't resolve, since such a program
     /// never runs.
     global: []const u8,
-    /// A variable's index in the interpreter's slots.
+    /// A top-level variable's index in the interpreter's slots, which outlive the program. While
+    /// checking, every variable is referred to this way, by its index in `Session.variables`.
     slot: u32,
+    /// A variable of the running function that no closure captures: its index in the call's frame.
+    local: u32,
+    /// A variable that a closure captures, which lives in the environment of its scope.
+    env: Env,
+
+    pub const Env = struct {
+        /// How many environments up the chain from the current one.
+        hops: u32,
+        index: u32,
+    };
 
     fn eql(a: Ref, b: Ref) bool {
         return switch (a) {
             .global => |name| b == .global and std.mem.eql(u8, name, b.global),
             .slot => |slot| b == .slot and slot == b.slot,
+            .local => |i| b == .local and i == b.local,
+            .env => |e| b == .env and e.hops == b.env.hops and e.index == b.env.index,
         };
     }
 };
@@ -72,8 +112,16 @@ pub const Ref = union(enum) {
 pub const Resolved = struct {
     /// Indexed by `Identifier.ref`.
     refs: []const Ref,
+    /// Where each binding's declaration stores its value, indexed by `binding`. An `env` here is
+    /// always in the scope's own environment (`hops` is 0).
+    bindings: []const Ref,
+    /// How many variables each scope's environment holds, indexed by `scope`. A scope with none
+    /// doesn't get an environment.
+    environments: []const u32,
+    /// How many local variables each function's frame holds, indexed by function `id`.
+    frames: []const u32,
     slot_base: u32,
-    /// `slot_base` plus the program's variables.
+    /// `slot_base` plus the program's bindings.
     slot_count: u32,
 };
 
@@ -89,7 +137,7 @@ pub const Session = struct {
 
 const Variable = struct {
     name: []const u8,
-    kind: ast.VariableKind,
+    kind: Kind,
     /// Where the name is.
     start: u32,
     /// Where the declarator ends; see `ast.Declarator.end`.
@@ -102,13 +150,72 @@ const Variable = struct {
     /// Its initializer is being checked, so a reference now is circular (TS7022).
     resolving: bool = false,
     circular: bool = false,
-    /// TS2451 has been reported at this declaration.
+    /// A duplicate declaration has been reported here.
     redeclared: bool = false,
+    /// The function whose body or parameters declare it; null at the top level.
+    owner: ?u32 = null,
+    /// The scope it's declared in; null for the program's top level.
+    scope: ?*Scope = null,
+    /// For a function's name, the function.
+    function: ?*const ast.Function = null,
+    /// Where the last assignment to it is (see `lastAssignment`), once worked out.
+    last_assignment: ?LastAssignment = null,
+
+    const Kind = enum {
+        let,
+        @"const",
+        /// A function declaration, or a function expression's own name.
+        function,
+        parameter,
+    };
+};
+
+const LastAssignment = union(enum) {
+    never,
+    at: u32,
+    /// Assigned inside a nested function, which could run at any time.
+    anywhere,
 };
 
 const Scope = struct {
     parent: ?*Scope,
     names: std.StringHashMapUnmanaged(u32) = .empty,
+    kind: enum { block, parameters },
+    /// The function this scope is part of; null at the top level.
+    function: ?u32,
+    /// After checking: how many captured variables live in this scope's environment.
+    environment: u32 = 0,
+};
+
+/// A function being checked.
+const Context = struct {
+    function: *const ast.Function,
+    parent: ?*Context,
+    signature: *types.Function,
+    /// For a function expression, the flow where it's created; what's narrowed there can still be
+    /// narrowed inside.
+    creation: ?Flow,
+    /// The return type annotation's type.
+    declared_return: ?*const Type,
+    /// The return type the function's context expects, when it doesn't declare one.
+    contextual_return: ?*const Type,
+    /// The types of its `return` statements' values.
+    returns: std.ArrayList(*const Type) = .empty,
+    /// It has a `return;` without a value.
+    empty_return: bool = false,
+};
+
+const FunctionInfo = struct {
+    /// The function's type: in progress (`pending`) while its body is being checked, then final.
+    /// A declaration keeps the first one it gets.
+    type: ?*const Type = null,
+    /// A call needed its return type while that was being inferred (TS7023).
+    circular: bool = false,
+};
+
+const Initializer = struct {
+    slot: u32,
+    expr: *const Expr,
 };
 
 /// What flow analysis knows about one variable at one point in the program.
@@ -189,19 +296,35 @@ const Branches = struct {
 pub fn check(arena: std.mem.Allocator, source: *const Source, diagnostics: *diagnostic.Diagnostics, session: *Session, program: ast.Program) Error!Resolved {
     const slot_base: u32 = @intCast(session.variables.items.len);
     const slot_count = slot_base + program.binding_count;
-    try session.variables.resize(arena, slot_count);
+    try session.variables.appendNTimes(arena, .{ .name = "", .kind = .let, .start = 0, .end = 0, .source = source, .annotation = null, .init = null }, program.binding_count);
     const vars = try arena.alloc(VarFlow, slot_count);
     @memcpy(vars[0..session.flow.len], session.flow);
     @memset(vars[session.flow.len..], .{});
+
+    const refs = try arena.alloc(Ref, program.reference_count);
+    @memset(refs, .{ .global = "" });
+    const ref_scopes = try arena.alloc(?*Scope, program.reference_count);
+    @memset(ref_scopes, null);
+    const scopes = try arena.alloc(?*Scope, program.scope_count);
+    @memset(scopes, null);
+    const captured = try arena.alloc(bool, program.binding_count);
+    @memset(captured, false);
+    const functions = try arena.alloc(FunctionInfo, program.function_count);
+    @memset(functions, .{});
 
     var checker: Checker = .{
         .arena = arena,
         .source = source,
         .diagnostics = diagnostics,
         .session = session,
-        .refs = try arena.alloc(Ref, program.reference_count),
+        .refs = refs,
         .slot_base = slot_base,
         .flow = .{ .reachable = true, .vars = vars },
+        .scopes = scopes,
+        .ref_scopes = ref_scopes,
+        .captured = captured,
+        .functions = functions,
+        .program = program.statements,
     };
     const errors_before = diagnostics.items().len;
     try checker.prescan(program.statements);
@@ -221,7 +344,60 @@ pub fn check(arena: std.mem.Allocator, source: *const Source, diagnostics: *diag
         @memset(vars[session.flow.len..], .{ .initialized = true });
         session.flow = vars;
     }
-    return .{ .refs = checker.refs, .slot_base = slot_base, .slot_count = slot_count };
+    if (diagnostics.items().len > errors_before) {
+        // It won't run.
+        return .{ .refs = refs, .bindings = &.{}, .environments = &.{}, .frames = &.{}, .slot_base = slot_base, .slot_count = slot_count };
+    }
+    return checker.layout(program);
+}
+
+/// Decides where each variable lives at runtime, and how each reference reaches it.
+fn layout(this: *Checker, program: ast.Program) Error!Resolved {
+    const bindings = try this.arena.alloc(Ref, program.binding_count);
+    const frames = try this.arena.alloc(u32, program.function_count);
+    @memset(frames, 0);
+    for (bindings, 0..) |*binding, i| {
+        const slot = this.slot_base + @as(u32, @intCast(i));
+        const v = this.variable(slot);
+        binding.* = if (v.scope == null)
+            .{ .slot = slot }
+        else if (this.captured[i]) blk: {
+            v.scope.?.environment += 1;
+            break :blk .{ .env = .{ .hops = 0, .index = v.scope.?.environment - 1 } };
+        } else if (v.owner) |owner| blk: {
+            frames[owner] += 1;
+            break :blk .{ .local = frames[owner] - 1 };
+        } else .{ .slot = slot };
+    }
+    const environments = try this.arena.alloc(u32, program.scope_count);
+    for (environments, this.scopes) |*size, scope| {
+        size.* = if (scope) |s| s.environment else 0;
+    }
+    for (this.refs, this.ref_scopes) |*ref, from| {
+        if (ref.* != .slot or ref.slot < this.slot_base) {
+            continue;
+        }
+        const target = this.variable(ref.slot).scope;
+        ref.* = bindings[ref.slot - this.slot_base];
+        if (ref.* == .env) {
+            var hops: u32 = 0;
+            var s = from;
+            while (s != target) : (s = s.?.parent) {
+                if (s.?.environment > 0) {
+                    hops += 1;
+                }
+            }
+            ref.env.hops = hops;
+        }
+    }
+    return .{
+        .refs = this.refs,
+        .bindings = bindings,
+        .environments = environments,
+        .frames = frames,
+        .slot_base = this.slot_base,
+        .slot_count = @intCast(this.session.variables.items.len),
+    };
 }
 
 fn report(this: *Checker, at: u32, code: diagnostic.Code, comptime fmt: []const u8, args: anytype) Error!void {
@@ -271,9 +447,25 @@ fn setVariable(this: *Checker, slot: u32, t: *const Type) void {
 
 // Scopes and declarations
 
-fn pushScope(this: *Checker) Error!void {
-    const scope = try this.arena.create(Scope);
-    scope.* = .{ .parent = this.scope };
+/// Enters the scope with index `id` (or an unnumbered one, for code that won't run), whose
+/// parent is the current scope.
+fn pushScope(this: *Checker, id: ?u32, kind: @FieldType(Scope, "kind")) Error!void {
+    var names: std.StringHashMapUnmanaged(u32) = .empty;
+    const scope = blk: {
+        if (id) |i| {
+            if (this.scopes[i]) |existing| {
+                // A scope is entered again on each pass over a loop, and each time a function is
+                // checked; its names start over.
+                names = existing.names;
+                names.clearRetainingCapacity();
+                break :blk existing;
+            }
+            this.scopes[i] = try this.arena.create(Scope);
+            break :blk this.scopes[i].?;
+        }
+        break :blk try this.arena.create(Scope);
+    };
+    scope.* = .{ .parent = this.scope, .names = names, .kind = kind, .function = this.currentFunction() };
     this.scope = scope;
 }
 
@@ -281,51 +473,99 @@ fn popScope(this: *Checker) void {
     this.scope = this.scope.?.parent;
 }
 
-/// Declares a statement list's `let` and `const` variables up front, so a use before the
-/// declaration finds it and reports TS2448 rather than an unknown name.
+/// Declares a statement list's `let`, `const` and function declarations up front, so a use
+/// before a variable's declaration finds it and reports TS2448 rather than an unknown name, and
+/// a function can be called before its declaration.
 fn prescan(this: *Checker, statements: []const *const Stmt) Error!void {
     for (statements) |stmt| {
         var s = stmt;
         while (s.data == .labeled) {
             s = s.data.labeled.body;
         }
-        if (s.data == .variable) {
-            try this.declare(s.data.variable);
+        switch (s.data) {
+            .variable => |v| for (v.declarators) |d| {
+                try this.declare(this.slot_base + d.binding, .{
+                    .name = d.name,
+                    .kind = if (v.kind == .let) .let else .@"const",
+                    .start = d.start,
+                    .end = d.end,
+                    .source = this.source,
+                    .annotation = d.type,
+                    .init = d.init,
+                });
+            },
+            .function => |f| {
+                const name = f.name.?;
+                try this.declare(this.slot_base + name.binding, .{
+                    .name = name.text,
+                    .kind = .function,
+                    .start = name.start,
+                    .end = name.start,
+                    .source = this.source,
+                    .annotation = null,
+                    .init = null,
+                    .function = f,
+                });
+            },
+            else => {},
         }
     }
 }
 
-fn declare(this: *Checker, v: ast.Variable) Error!void {
-    for (v.declarators) |d| {
-        const slot = this.slot_base + d.binding;
-        this.session.variables.items[slot] = .{
-            .name = d.name,
-            .kind = v.kind,
-            .start = d.start,
-            .end = d.end,
-            .source = this.source,
-            .annotation = d.type,
-            .init = d.init,
-        };
-        if (this.flow.reachable) {
-            this.flow.vars[slot] = .{};
-        }
-        const names = if (this.scope) |scope| &scope.names else &this.session.top_level;
-        const entry = try names.getOrPut(this.arena, d.name);
-        if (!entry.found_existing) {
-            entry.value_ptr.* = slot;
-            if (this.scope == null) {
-                try this.added.append(this.arena, d.name);
+/// Adds a name to the current scope, reporting it if the scope already has it.
+fn declare(this: *Checker, slot: u32, v: Variable) Error!void {
+    var declared = v;
+    declared.owner = this.currentFunction();
+    declared.scope = this.scope;
+    this.session.variables.items[slot] = declared;
+    if (this.flow.reachable) {
+        // A function declaration can be used anywhere in its scope.
+        this.flow.vars[slot] = .{ .initialized = v.kind == .function };
+    }
+    const names = if (this.scope) |scope| &scope.names else &this.session.top_level;
+    // A function body's top level can't redeclare a parameter either.
+    var existing = names.get(v.name);
+    if (existing == null) {
+        if (this.scope) |scope| {
+            if (scope.kind == .block and scope.parent != null and scope.parent.?.kind == .parameters) {
+                existing = scope.parent.?.names.get(v.name);
             }
+        }
+    }
+    const first_slot = existing orelse {
+        try names.put(this.arena, v.name, slot);
+        if (this.scope == null) {
+            try this.added.append(this.arena, v.name);
+        }
+        return;
+    };
+    const first = this.variable(first_slot);
+    const Conflict = enum { block_scoped, functions, other };
+    const conflict: Conflict = if (isBlockScoped(first.kind) and isBlockScoped(v.kind))
+        .block_scoped
+    else if (first.kind == .function and v.kind == .function)
+        .functions
+    else
+        .other;
+    const sites = [_]struct { *Variable, bool }{
+        .{ first, first.source == this.source and !first.redeclared },
+        .{ this.variable(slot), true },
+    };
+    for (sites) |site| {
+        if (!site[1]) {
             continue;
         }
-        const first = &this.session.variables.items[entry.value_ptr.*];
-        if (first.source == this.source and !first.redeclared) {
-            try this.report(first.start, .ts(2451), "Cannot redeclare block-scoped variable '{s}'.", .{d.name});
-            first.redeclared = true;
+        site[0].redeclared = true;
+        switch (conflict) {
+            .block_scoped => try this.report(site[0].start, .ts(2451), "Cannot redeclare block-scoped variable '{s}'.", .{v.name}),
+            .functions => try this.report(site[0].start, .ts(2393), "Duplicate function implementation.", .{}),
+            .other => try this.report(site[0].start, .ts(2300), "Duplicate identifier '{s}'.", .{v.name}),
         }
-        try this.report(d.start, .ts(2451), "Cannot redeclare block-scoped variable '{s}'.", .{d.name});
     }
+}
+
+fn isBlockScoped(kind: Variable.Kind) bool {
+    return kind == .let or kind == .@"const";
 }
 
 fn lookup(this: *Checker, name: []const u8) ?u32 {
@@ -348,6 +588,11 @@ fn declaredType(this: *Checker, slot: u32) Error!*const Type {
     const v = this.variable(slot);
     if (v.declared) |t| {
         return t;
+    }
+    if (v.kind == .function) {
+        // A function declaration used before it's checked: work out its type now.
+        const f = v.function.?;
+        return this.functions[f.id].type orelse this.checkFunction(f, null, .infer);
     }
     if (v.resolving) {
         // Every variable on the way back here is part of the cycle.
@@ -372,7 +617,7 @@ fn declaredType(this: *Checker, slot: u32) Error!*const Type {
     try this.lazy.append(this.arena, slot);
     defer _ = this.lazy.pop();
     const t = try this.expression(init);
-    return if (v.kind == .let) types.widenFresh(this.arena, t) else t;
+    return if (v.kind == .@"const") t else types.widenFresh(this.arena, t);
 }
 
 /// Reports a variable whose type depends on itself (TS7022), even while muted, since the
@@ -403,6 +648,42 @@ fn resolveType(this: *Checker, node: *const ast.TypeNode) Error!*const Type {
             try this.unsupported(node.start, "The type '{s}' is not supported yet.", .{name});
             break :blk types.any;
         },
+        .array => |element| blk: {
+            const t = try this.arena.create(Type);
+            t.* = .{ .array = try this.resolveType(element) };
+            break :blk t;
+        },
+        .function => |f| blk: {
+            var parameters: std.ArrayList(types.Parameter) = .empty;
+            var rest: ?types.Parameter = null;
+            for (f.parameters) |p| {
+                var t = types.any;
+                if (p.type) |annotation| {
+                    t = try this.resolveType(annotation);
+                    if (p.rest and t.* != .array and t.* != .any) {
+                        try this.report(annotation.start, .ts(2370), "A rest parameter must be of an array type.", .{});
+                    }
+                } else {
+                    try this.report(p.start, .ts(7006), "Parameter '{s}' implicitly has an 'any' type.", .{p.name});
+                    if (p.rest) {
+                        t = types.any_array;
+                    }
+                }
+                if (p.rest) {
+                    rest = .{ .name = p.name, .type = t };
+                } else {
+                    if (p.optional) {
+                        t = try types.unionOf(this.arena, &.{ t, types.undefined });
+                    }
+                    try parameters.append(this.arena, .{ .name = p.name, .type = t, .optional = p.optional });
+                }
+            }
+            const function = try this.arena.create(types.Function);
+            function.* = .{ .parameters = parameters.items, .rest = rest, .returns = try this.resolveType(f.returns) };
+            const t = try this.arena.create(Type);
+            t.* = .{ .function = function };
+            break :blk t;
+        },
     };
 }
 
@@ -431,11 +712,15 @@ fn assignmentReduced(this: *Checker, declared: *const Type, assigned: *const Typ
 
 /// Narrows a variable's type to the members that can pass (or fail) a truthiness or nullishness
 /// test, for the branch of a logical assignment that doesn't assign.
-fn narrowVariable(this: *Checker, slot: u32, comptime keep: enum { truthy, falsy, non_nullish }) Error!void {
+fn narrowVariable(this: *Checker, slot: u32, at: u32, comptime keep: enum { truthy, falsy, non_nullish }) Error!void {
     if (!this.flow.reachable or !types.isUnion(try this.declaredType(slot))) {
         return;
     }
-    const current = this.flow.vars[slot].type orelse return;
+    const current = this.flow.vars[slot].type orelse if (this.isOuter(slot)) blk: {
+        this.muted += 1;
+        defer this.muted -= 1;
+        break :blk try this.outerType(slot, at, try this.declaredType(slot));
+    } else return;
     var kept: std.ArrayList(*const Type) = .empty;
     for (try types.expandedMembers(this.arena, current)) |m| {
         const ok = switch (keep) {
@@ -471,11 +756,13 @@ fn labeledStatement(this: *Checker, stmt: *const Stmt, labels: []const []const u
         .expression => |e| _ = try this.expression(e),
         .empty => {},
         .variable => |v| try this.variableStatement(v),
-        .block => |statements| {
-            try this.pushScope();
+        .function => |f| _ = try this.checkFunction(f, null, .check),
+        .@"return" => |value| try this.returnStatement(stmt, value),
+        .block => |b| {
+            try this.pushScope(b.scope, .block);
             defer this.popScope();
-            try this.prescan(statements);
-            for (statements) |s| {
+            try this.prescan(b.statements);
+            for (b.statements) |s| {
                 try this.statement(s);
             }
         },
@@ -492,11 +779,15 @@ fn labeledStatement(this: *Checker, stmt: *const Stmt, labels: []const []const u
 
 /// The body of an `if`, a loop or a label, where a declaration needs a block around it.
 fn body(this: *Checker, stmt: *const Stmt) Error!void {
+    if (stmt.data == .function) {
+        // tsc allows this, but in strict mode it's a syntax error.
+        return this.unsupported(stmt.start, "A function declaration as the body of a statement is not supported yet.", .{});
+    }
     if (stmt.data != .variable) {
         return this.statement(stmt);
     }
     try this.report(stmt.start, .ts(1156), "'{t}' declarations can only be declared inside a block.", .{stmt.data.variable.kind});
-    try this.pushScope();
+    try this.pushScope(null, .block);
     defer this.popScope();
     try this.prescan(&.{stmt});
     try this.statement(stmt);
@@ -509,13 +800,16 @@ fn variableStatement(this: *Checker, v: ast.Variable) Error!void {
         var declared: *const Type = types.any;
         var assigned: ?*const Type = null;
         if (d.init) |init| {
+            const annotated = if (d.type) |annotation| try this.resolveType(annotation) else null;
             variable_.resolving = d.type == null;
-            const init_type = try this.expression(init);
+            this.initializer = .{ .slot = slot, .expr = init };
+            const init_type = try this.contextual(init, annotated);
+            this.initializer = null;
             variable_.resolving = false;
-            if (d.type) |annotation| {
-                declared = try this.resolveType(annotation);
+            if (annotated) |t| {
+                declared = t;
                 if (!types.assignable(init_type, declared)) {
-                    try this.notAssignable(d.start, init_type, declared);
+                    try this.reportNotAssignable(init, init_type, declared, d.start, .assignment);
                 }
             } else if (variable_.circular) {
                 declared = types.any;
@@ -572,7 +866,7 @@ fn loop(this: *Checker, stmt: *const Stmt, labels: []const []const u8) Error!voi
     var scoped = false;
     if (stmt.data == .@"for") {
         if (stmt.data.@"for".init) |init| {
-            try this.pushScope();
+            try this.pushScope(stmt.data.@"for".scope, .block);
             scoped = true;
             try this.prescan(&.{init});
             try this.statement(init);
@@ -656,6 +950,11 @@ fn jump(this: *Checker, stmt: *const Stmt, j: ast.Jump, comptime kind: enum { @"
         break :blk null;
     };
     const target = if (index) |i| &this.targets.items[i] else {
+        if (this.context != null) {
+            try this.report(stmt.start, .ts(1107), "Jump target cannot cross function boundary.", .{});
+            this.flow = .unreachable_flow;
+            return;
+        }
         switch (kind) {
             .@"break" => if (j.label != null)
                 try this.report(stmt.start, .ts(1116), "A 'break' statement can only jump to a label of an enclosing statement.", .{})
@@ -683,9 +982,9 @@ fn labeled(this: *Checker, stmt: *const Stmt, l: ast.Labeled, labels: []const []
     try this.labels.append(this.arena, l.label);
     defer _ = this.labels.pop();
     const all = try std.mem.concat(this.arena, []const u8, &.{ labels, &.{l.label} });
-    if (l.body.data == .variable) {
+    if (l.body.data == .variable or l.body.data == .function) {
         try this.report(stmt.start, .ts(1344), "'A label is not allowed here.", .{});
-        try this.pushScope();
+        try this.pushScope(null, .block);
         defer this.popScope();
         try this.prescan(&.{l.body});
         return this.labeledStatement(l.body, all);
@@ -695,7 +994,7 @@ fn labeled(this: *Checker, stmt: *const Stmt, l: ast.Labeled, labels: []const []
 
 fn switchStatement(this: *Checker, sw: ast.Switch, labels: []const []const u8) Error!void {
     const discriminant = try this.expression(sw.discriminant);
-    try this.pushScope();
+    try this.pushScope(sw.scope, .block);
     defer this.popScope();
     for (sw.clauses) |clause| {
         try this.prescan(clause.statements);
@@ -794,7 +1093,7 @@ fn includesNullish(t: *const Type) bool {
 
 const log_function: Type = .{ .function = &.{
     .parameters = &.{},
-    .rest = .{ .name = "data", .type = types.any },
+    .rest = .{ .name = "data", .type = types.any_array },
     .returns = types.void,
 } };
 
@@ -833,14 +1132,31 @@ const Resolution = struct {
 fn resolve(this: *Checker, expr: *const Expr, id: ast.Identifier) Error!Resolution {
     if (this.lookup(id.name)) |slot| {
         this.refs[id.ref] = .{ .slot = slot };
+        this.ref_scopes[id.ref] = this.scope;
         const v = this.variable(slot);
-        const early = v.source == this.source and expr.start < v.end;
+        const here = this.currentFunction();
+        const outer = !sameOwner(v.owner, here);
+        if (outer and slot >= this.slot_base) {
+            this.captured[slot - this.slot_base] = true;
+        }
+        // A use inside a function that runs later isn't early.
+        const early = v.source == this.source and expr.start < v.end and !outer and v.kind != .function;
         if (early) {
-            try this.report(expr.start, .ts(2448), "Block-scoped variable '{s}' used before its declaration.", .{id.name});
+            if (v.kind != .parameter) {
+                try this.report(expr.start, .ts(2448), "Block-scoped variable '{s}' used before its declaration.", .{id.name});
+            } else if (expr.start > v.start) {
+                try this.report(expr.start, .ts(2372), "Parameter '{s}' cannot reference itself.", .{id.name});
+            } else {
+                try this.report(expr.start, .ts(2373), "Parameter '{s}' cannot reference identifier '{s}' declared after it.", .{ this.parameter orelse "", id.name });
+            }
         }
         return .{ .slot = slot, .early = early };
     }
     this.refs[id.ref] = .{ .global = id.name };
+    if (std.mem.eql(u8, id.name, "arguments") and this.inNonArrowFunction()) {
+        try this.unsupported(expr.start, "'arguments' is not supported yet.", .{});
+        return .{ .slot = null };
+    }
     if (global(id.name) == null) {
         try this.report(expr.start, .ts(2304), "Cannot find name '{s}'.", .{id.name});
     }
@@ -863,12 +1179,19 @@ fn read(this: *Checker, expr: *const Expr, id: ast.Identifier) Error!*const Type
 fn readResolved(this: *Checker, expr: *const Expr, id: ast.Identifier, r: Resolution) Error!*const Type {
     const slot = r.slot orelse return global(id.name) orelse types.any;
     const declared = try this.declaredType(slot);
-    if (!this.flow.reachable) {
+    if (this.variable(slot).kind == .function or !this.flow.reachable) {
         return declared;
     }
     const state = this.flow.vars[slot];
     if (state.type) |t| {
         return t;
+    }
+    if (this.isOuter(slot)) {
+        return this.outerType(slot, expr.start, declared);
+    }
+    if (this.variable(slot).kind == .parameter) {
+        // Only possible from an earlier parameter's default value, already an error (TS2373).
+        return declared;
     }
     if (!types.includesUndefined(declared)) {
         try this.report(expr.start, .ts(2454), "Variable '{s}' is used before being assigned.", .{id.name});
@@ -889,14 +1212,256 @@ fn writeTarget(this: *Checker, expr: *const Expr, id: ast.Identifier, r: Resolut
         }
         return null;
     };
-    if (this.variable(slot).kind == .@"const") {
-        try this.report(expr.start, .ts(2588), "Cannot assign to '{s}' because it is a constant.", .{id.name});
-        return null;
-    } else if (this.flow.reachable and !this.flow.vars[slot].initialized and !r.early) {
+    switch (this.variable(slot).kind) {
+        .@"const" => {
+            try this.report(expr.start, .ts(2588), "Cannot assign to '{s}' because it is a constant.", .{id.name});
+            return null;
+        },
+        .function => {
+            try this.report(expr.start, .ts(2630), "Cannot assign to '{s}' because it is a function.", .{id.name});
+            return null;
+        },
+        .let, .parameter => {},
+    }
+    if (this.flow.reachable and !this.flow.vars[slot].initialized and !r.early and !this.isOuter(slot)) {
         try this.unsupported(expr.start, "Assigning to '{s}' before its declaration has run is not supported yet.", .{id.name});
     }
     return slot;
 }
+
+/// Whether a variable belongs to a function enclosing the one being checked.
+fn isOuter(this: *const Checker, slot: u32) bool {
+    return !sameOwner(this.session.variables.items[slot].owner, this.currentFunction());
+}
+
+fn sameOwner(a: ?u32, b: ?u32) bool {
+    if (a == null or b == null) {
+        return a == null and b == null;
+    }
+    return a.? == b.?;
+}
+
+fn currentFunction(this: *const Checker) ?u32 {
+    return if (this.context) |c| c.function.id else null;
+}
+
+fn inNonArrowFunction(this: *const Checker) bool {
+    var c = this.context;
+    while (c) |ctx| : (c = ctx.parent) {
+        if (ctx.function.kind != .arrow) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The type of an enclosing function's variable, read in a closure before the closure assigns it.
+/// Like tsc, what's known where a function expression is created still holds inside it if the
+/// variable is a `const`, or nothing assigns it after the reference (`isPastLastAssignment`).
+/// Otherwise it's the declared type, and assumed to be assigned unless nothing ever assigns it.
+fn outerType(this: *Checker, slot: u32, at: u32, declared: *const Type) Error!*const Type {
+    const v = this.variable(slot);
+    var c = this.context.?;
+    while (c.function.kind != .declaration) {
+        const extends = switch (v.kind) {
+            .@"const" => true,
+            .let, .parameter => try this.pastLastAssignment(slot, at),
+            .function => unreachable,
+        };
+        if (!extends) {
+            break;
+        }
+        const parent: ?u32 = if (c.parent) |p| p.function.id else null;
+        if (!sameOwner(parent, v.owner)) {
+            c = c.parent.?;
+            continue;
+        }
+        // The closure is created in the variable's own function. One created before the variable
+        // is declared (or in its initializer) sees it once it is.
+        const creation = c.creation.?;
+        if ((v.source == this.source and c.function.start < v.end) or !creation.reachable) {
+            return declared;
+        }
+        if (creation.vars[slot].type) |t| {
+            return t;
+        }
+        if (!types.includesUndefined(declared)) {
+            try this.report(at, .ts(2454), "Variable '{s}' is used before being assigned.", .{v.name});
+        }
+        return declared;
+    }
+    const never_initialized = v.kind == .let and v.init == null and (try this.lastAssignment(slot)) == .never;
+    if (never_initialized and !types.includesUndefined(declared)) {
+        try this.report(at, .ts(2454), "Variable '{s}' is used before being assigned.", .{v.name});
+    }
+    return declared;
+}
+
+fn pastLastAssignment(this: *Checker, slot: u32, at: u32) Error!bool {
+    return switch (try this.lastAssignment(slot)) {
+        .never => true,
+        .at => |position| position < at,
+        .anywhere => false,
+    };
+}
+
+/// tsc's `lastAssignmentPos`: where the last assignment to a variable is in its function, moved to
+/// the end of the outermost statement around it that comes after the declaration (so one in a
+/// loop counts as at the loop's end). Names are matched without regard to shadowing.
+fn lastAssignment(this: *Checker, slot: u32) Error!LastAssignment {
+    const v = this.variable(slot);
+    if (v.last_assignment) |last| {
+        return last;
+    }
+    var scan: AssignmentScan = .{ .name = v.name, .after = if (v.source == this.source) v.start else 0 };
+    if (v.owner) |owner| {
+        var c = this.context;
+        while (c) |ctx| : (c = ctx.parent) {
+            if (ctx.function.id == owner) {
+                scan.function(ctx.function, false);
+                break;
+            }
+        }
+    } else {
+        scan.statements(this.program, null, false);
+    }
+    v.last_assignment = scan.result;
+    return scan.result;
+}
+
+const AssignmentScan = struct {
+    name: []const u8,
+    /// Where the declaration is.
+    after: u32,
+    result: LastAssignment = .never,
+
+    fn found(this: *AssignmentScan, at: u32, nested: bool) void {
+        if (nested) {
+            this.result = .anywhere;
+        } else {
+            switch (this.result) {
+                .never => this.result = .{ .at = at },
+                .at => |p| this.result = .{ .at = @max(p, at) },
+                .anywhere => {},
+            }
+        }
+    }
+
+    fn function(this: *AssignmentScan, f: *const ast.Function, nested: bool) void {
+        for (f.parameters) |p| {
+            if (p.init) |init| {
+                this.expr(init, null, nested);
+            }
+        }
+        switch (f.body) {
+            .block => |b| this.statements(b.statements, null, nested),
+            .expression => |e| this.expr(e, null, nested),
+        }
+    }
+
+    fn statements(this: *AssignmentScan, list: []const *const Stmt, outer: ?u32, nested: bool) void {
+        for (list) |s| {
+            this.statement(s, outer, nested);
+        }
+    }
+
+    fn statement(this: *AssignmentScan, s: *const Stmt, outer_end: ?u32, nested: bool) void {
+        const counts = switch (s.data) {
+            .variable, .expression, .@"if", .do_while, .@"while", .@"for", .@"switch" => true,
+            else => false,
+        };
+        const outer = outer_end orelse if (counts and s.start > this.after) s.end else null;
+        switch (s.data) {
+            .expression => |e| this.expr(e, outer, nested),
+            .empty, .@"break", .@"continue" => {},
+            .variable => |v| for (v.declarators) |d| {
+                if (d.init) |init| {
+                    this.expr(init, outer, nested);
+                }
+            },
+            .function => |f| this.function(f, true),
+            .@"return" => |value| if (value) |e| this.expr(e, outer, nested),
+            .block => |b| this.statements(b.statements, outer, nested),
+            .@"if" => |i| {
+                this.expr(i.condition, outer, nested);
+                this.statement(i.then, outer, nested);
+                if (i.otherwise) |o| {
+                    this.statement(o, outer, nested);
+                }
+            },
+            .@"while", .do_while => |l| {
+                this.expr(l.condition, outer, nested);
+                this.statement(l.body, outer, nested);
+            },
+            .@"for" => |f| {
+                if (f.init) |init| {
+                    this.statement(init, outer, nested);
+                }
+                if (f.condition) |e| {
+                    this.expr(e, outer, nested);
+                }
+                if (f.update) |e| {
+                    this.expr(e, outer, nested);
+                }
+                this.statement(f.body, outer, nested);
+            },
+            .labeled => |l| this.statement(l.body, outer, nested),
+            .@"switch" => |sw| {
+                this.expr(sw.discriminant, outer, nested);
+                for (sw.clauses) |clause| {
+                    if (clause.case) |e| {
+                        this.expr(e, outer, nested);
+                    }
+                    this.statements(clause.statements, outer, nested);
+                }
+            },
+        }
+    }
+
+    fn target(this: *AssignmentScan, e: *const Expr, outer: ?u32, nested: bool) void {
+        const t = ast.skipParens(e);
+        if (t.data == .identifier and std.mem.eql(u8, t.data.identifier.name, this.name)) {
+            this.found(outer orelse t.start, nested);
+        }
+    }
+
+    fn expr(this: *AssignmentScan, e: *const Expr, outer: ?u32, nested: bool) void {
+        switch (e.data) {
+            .number, .string, .boolean, .null, .identifier => {},
+            .template => |t| for (t.substitutions) |sub| {
+                this.expr(sub, outer, nested);
+            },
+            .paren => |inner| this.expr(inner, outer, nested),
+            .unary => |u| this.expr(u.operand, outer, nested),
+            .update => |u| {
+                this.target(u.operand, outer, nested);
+                this.expr(u.operand, outer, nested);
+            },
+            .assign => |a| {
+                this.target(a.target, outer, nested);
+                this.expr(a.target, outer, nested);
+                this.expr(a.value, outer, nested);
+            },
+            .binary => |b| {
+                this.expr(b.left, outer, nested);
+                this.expr(b.right, outer, nested);
+            },
+            .conditional => |c| {
+                this.expr(c.condition, outer, nested);
+                this.expr(c.then, outer, nested);
+                this.expr(c.otherwise, outer, nested);
+            },
+            .member => |m| this.expr(m.object, outer, nested),
+            .call => |c| {
+                this.expr(c.callee, outer, nested);
+                for (c.arguments) |arg| {
+                    this.expr(arg, outer, nested);
+                }
+            },
+            .function => |f| this.function(f, true),
+        }
+    }
+};
 
 // Expressions
 
@@ -927,9 +1492,22 @@ fn expression(this: *Checker, expr: *const Expr) Error!*const Type {
             try this.mergeInto(&this.flow, branches.when_false);
             break :blk branches.type;
         } else this.binary(expr, b),
-        .conditional => |c| this.conditional(c),
+        .conditional => |c| this.conditional(c, null),
         .member => |m| this.member(m),
         .call => |c| this.call(expr, c),
+        .function => |f| this.checkFunction(f, null, .check),
+    };
+}
+
+/// An expression checked against the type its surroundings expect, which gives an arrow
+/// function's parameters their types.
+fn contextual(this: *Checker, expr: *const Expr, context: ?*const Type) Error!*const Type {
+    const ctx = context orelse return this.expression(expr);
+    return switch (expr.data) {
+        .paren => |inner| this.contextual(inner, ctx),
+        .function => |f| this.checkFunction(f, ctx, .check),
+        .conditional => |c| this.conditional(c, ctx),
+        else => this.expression(expr),
     };
 }
 
@@ -965,10 +1543,10 @@ fn condition(this: *Checker, expr: *const Expr, if_body: ?*const Stmt, chain: ?*
         if (this.refs[expr.data.identifier.ref] == .slot) {
             const slot = this.refs[expr.data.identifier.ref].slot;
             this.flow = branches.when_true;
-            try this.narrowVariable(slot, .truthy);
+            try this.narrowVariable(slot, expr.start, .truthy);
             branches.when_true = this.flow;
             this.flow = branches.when_false;
-            try this.narrowVariable(slot, .falsy);
+            try this.narrowVariable(slot, expr.start, .falsy);
             branches.when_false = this.flow;
         }
     }
@@ -1045,15 +1623,15 @@ fn logical(this: *Checker, b: ast.Binary, if_body: ?*const Stmt, chain: ?*const 
     return result;
 }
 
-fn conditional(this: *Checker, c: ast.Conditional) Error!*const Type {
+fn conditional(this: *Checker, c: ast.Conditional, context: ?*const Type) Error!*const Type {
     const branches = try this.condition(c.condition, null, null);
     try this.checkTruthiness(c.condition);
     this.flow = branches.when_true;
-    const then = try this.expression(c.then);
+    const then = try this.contextual(c.then, context);
     const after_then = this.flow;
     try this.checkUncalledFunction(c.condition, branches.type, .{ .expr = c.then }, null);
     this.flow = branches.when_false;
-    const otherwise = try this.expression(c.otherwise);
+    const otherwise = try this.contextual(c.otherwise, context);
     try this.mergeInto(&this.flow, after_then);
     return types.unionOf(this.arena, &.{ then, otherwise });
 }
@@ -1141,10 +1719,10 @@ fn assign(this: *Checker, a: ast.Assign) Error!*const Type {
     };
 
     const op = a.op orelse {
-        const value = try this.expression(a.value);
         const declared = try this.declaredType(slot);
+        const value = try this.contextual(a.value, declared);
         if (!types.assignable(value, declared)) {
-            try this.notAssignable(a.target.start, value, declared);
+            try this.reportNotAssignable(a.value, value, declared, a.target.start, .assignment);
         }
         this.setVariable(slot, try this.assignmentReduced(declared, value));
         return value;
@@ -1159,9 +1737,9 @@ fn assign(this: *Checker, a: ast.Assign) Error!*const Type {
         var skipped = try this.copyFlow(this.flow);
         std.mem.swap(Flow, &this.flow, &skipped);
         switch (op) {
-            .logical_and => try this.narrowVariable(slot, .falsy),
-            .logical_or => try this.narrowVariable(slot, .truthy),
-            else => try this.narrowVariable(slot, .non_nullish),
+            .logical_and => try this.narrowVariable(slot, target.start, .falsy),
+            .logical_or => try this.narrowVariable(slot, target.start, .truthy),
+            else => try this.narrowVariable(slot, target.start, .non_nullish),
         }
         std.mem.swap(Flow, &this.flow, &skipped);
         const value = try this.expression(a.value);
@@ -1291,7 +1869,7 @@ fn operatorError(this: *Checker, op: ast.BinaryOp, compound: bool, left_expr: *c
 fn isSideEffectFree(expr: *const Expr) bool {
     const e = ast.skipParens(expr);
     return switch (e.data) {
-        .identifier, .string, .template, .number, .boolean, .null => true,
+        .identifier, .string, .template, .number, .boolean, .null, .function => true,
         .unary => |u| u.op != .void,
         .conditional => |c| isSideEffectFree(c.then) and isSideEffectFree(c.otherwise),
         .binary => |b| isSideEffectFree(b.left) and isSideEffectFree(b.right),
@@ -1316,14 +1894,24 @@ fn member(this: *Checker, m: ast.Member) Error!*const Type {
             return types.any;
         },
         .function => {
-            for ([_][]const u8{ "apply", "bind", "call", "length", "name", "toString" }) |known| {
-                if (std.mem.eql(u8, known, m.property)) {
-                    try this.unsupported(m.property_start, "Properties of functions are not supported yet.", .{});
-                    return types.any;
-                }
+            if (std.mem.eql(u8, m.property, "name")) {
+                return types.string;
             }
-            try this.report(m.property_start, .ts(2339), "Property '{s}' does not exist on type '{f}'.", .{ m.property, object });
-            return types.any;
+            if (std.mem.eql(u8, m.property, "length")) {
+                return types.number;
+            }
+            return this.unsupportedProperty(m, object, &.{ "apply", "bind", "call", "toString", "prototype", "arguments", "caller" });
+        },
+        .array => {
+            if (std.mem.eql(u8, m.property, "length")) {
+                return types.number;
+            }
+            return this.unsupportedProperty(m, object, &.{
+                "toString",   "toLocaleString", "pop",    "push",    "concat",      "join",        "reverse",   "shift",
+                "slice",      "sort",           "splice", "unshift", "indexOf",     "lastIndexOf", "every",     "some",
+                "forEach",    "map",            "filter", "reduce",  "reduceRight", "find",        "findIndex", "fill",
+                "copyWithin", "entries",        "keys",   "values",  "includes",    "flatMap",     "flat",      "at",
+            });
         },
         .never => return types.never,
         else => {
@@ -1331,6 +1919,18 @@ fn member(this: *Checker, m: ast.Member) Error!*const Type {
             return types.any;
         },
     }
+}
+
+/// A property that exists but isn't implemented yet (one of `known`), or TS2339.
+fn unsupportedProperty(this: *Checker, m: ast.Member, object: *const Type, known: []const []const u8) Error!*const Type {
+    for (known) |name| {
+        if (std.mem.eql(u8, name, m.property)) {
+            try this.unsupported(m.property_start, "The '{s}' property of '{f}' is not supported yet.", .{ m.property, object });
+            return types.any;
+        }
+    }
+    try this.report(m.property_start, .ts(2339), "Property '{s}' does not exist on type '{f}'.", .{ m.property, object });
+    return types.any;
 }
 
 fn call(this: *Checker, expr: *const Expr, c: ast.Call) Error!*const Type {
@@ -1345,37 +1945,500 @@ fn call(this: *Checker, expr: *const Expr, c: ast.Call) Error!*const Type {
         }
     }
     const callee = try this.checkNonNull(c.callee, try this.expression(c.callee));
-    var args: std.ArrayList(*const Type) = .empty;
-    for (c.arguments) |arg| {
-        try args.append(this.arena, try this.expression(arg));
+    if (callee.* == .function) {
+        return this.callFunction(expr, c, callee.function);
     }
-
+    for (c.arguments) |arg| {
+        _ = try this.expression(arg);
+    }
     switch (callee.*) {
         .any => return types.any,
-        .function => |f| {
-            const required = f.parameters.len;
-            if (args.items.len < required or (f.rest == null and args.items.len > required)) {
-                if (f.rest != null) {
-                    try this.report(expr.start, .ts(2555), "Expected at least {d} arguments, but got {d}.", .{ required, args.items.len });
-                } else {
-                    try this.report(expr.start, .ts(2554), "Expected {d} arguments, but got {d}.", .{ required, args.items.len });
-                }
-                return f.returns;
-            }
-            for (args.items, c.arguments, 0..) |arg_type, arg, i| {
-                const param = if (i < f.parameters.len) f.parameters[i].type else f.rest.?.type;
-                if (!types.assignable(arg_type, param)) {
-                    try this.report(arg.start, .ts(2345), "Argument of type '{f}' is not assignable to parameter of type '{f}'.", .{ arg_type, param });
-                }
-            }
-            return f.returns;
-        },
         .never => return types.never,
         else => {
             try this.report(c.callee.start, .ts(2349), "This expression is not callable.\n  Type '{s}' has no call signatures.", .{try this.apparentName(callee)});
             return types.any;
         },
     }
+}
+
+fn callFunction(this: *Checker, expr: *const Expr, c: ast.Call, f: *const types.Function) Error!*const Type {
+    var args: std.ArrayList(*const Type) = .empty;
+    for (c.arguments, 0..) |arg, i| {
+        try args.append(this.arena, try this.contextual(arg, f.parameterType(i)));
+    }
+    if (f.pending) {
+        // Its return type is what's being worked out.
+        this.markCircular(f);
+        return types.any;
+    }
+    const min = f.minArguments();
+    const max = f.parameters.len;
+    const count = args.items.len;
+    if (count < min or (f.rest == null and count > max)) {
+        const at = if (count > max) c.arguments[max].start else expr.start;
+        if (f.rest != null) {
+            try this.report(at, .ts(2555), "Expected at least {d} arguments, but got {d}.", .{ min, count });
+        } else if (min == max) {
+            try this.report(at, .ts(2554), "Expected {d} arguments, but got {d}.", .{ min, count });
+        } else {
+            try this.report(at, .ts(2554), "Expected {d}-{d} arguments, but got {d}.", .{ min, max, count });
+        }
+        return f.returns;
+    }
+    for (args.items, c.arguments, 0..) |arg_type, arg, i| {
+        var param = f.parameterType(i).?;
+        // `undefined` can be passed for any optional parameter.
+        if (i < f.parameters.len and f.parameters[i].optional) {
+            param = try types.unionOf(this.arena, &.{ param, types.undefined });
+        }
+        if (!types.assignable(arg_type, param)) {
+            try this.reportNotAssignable(arg, arg_type, f.parameterType(i).?, arg.start, .argument);
+        }
+    }
+    return f.returns;
+}
+
+/// A function's return type was needed while it was being inferred: it and every function whose
+/// inference led back to it get `any` (TS7023).
+fn markCircular(this: *Checker, f: *const types.Function) void {
+    for (this.inferring.items, 0..) |id, i| {
+        const t = this.functions[id].type orelse continue;
+        if (t.function == f) {
+            for (this.inferring.items[i..]) |later| {
+                this.functions[later].circular = true;
+            }
+            return;
+        }
+    }
+}
+
+// Functions
+
+const Mode = enum {
+    /// Check it where it is, reporting what's wrong.
+    check,
+    /// Only work out its type, for a function declaration used before it's checked.
+    infer,
+};
+
+/// Checks a function and returns its type. `context_type` is the type its surroundings expect,
+/// which gives unannotated parameters their types.
+fn checkFunction(this: *Checker, f: *const ast.Function, context_type: ?*const Type, mode: Mode) Error!*const Type {
+    const info = &this.functions[f.id];
+    // A declaration whose type was worked out earlier keeps that type.
+    const keep = f.kind == .declaration and info.type != null;
+    const parent_scope = if (f.kind == .declaration) this.variable(this.slot_base + f.name.?.binding).scope else this.scope;
+
+    const saved_flow = this.flow;
+    const saved_scope = this.scope;
+    const saved_targets = this.targets;
+    const saved_labels = this.labels;
+    const saved_context = this.context;
+    const saved_initializer = this.initializer;
+    const saved_indirect = this.indirect_call;
+    const saved_parameter = this.parameter;
+    const saved_lazy = this.lazy;
+    defer {
+        this.flow = saved_flow;
+        this.scope = saved_scope;
+        this.targets = saved_targets;
+        this.labels = saved_labels;
+        this.context = saved_context;
+        this.initializer = saved_initializer;
+        this.indirect_call = saved_indirect;
+        this.parameter = saved_parameter;
+        this.lazy = saved_lazy;
+    }
+    if (mode == .infer) {
+        this.muted += 1;
+    }
+    defer if (mode == .infer) {
+        this.muted -= 1;
+    };
+
+    var context = contextualSignature(context_type);
+    if (context) |ctx| {
+        // tsc's `isAritySmaller`: a function that needs more arguments than its context passes
+        // isn't typed by it.
+        if (ctx.rest == null and requiredParameters(f) > ctx.parameters.len) {
+            context = null;
+        }
+    }
+
+    const signature = try this.arena.create(types.Function);
+    signature.* = .{ .parameters = &.{}, .returns = types.any, .pending = !keep };
+    const self_type = try this.arena.create(Type);
+    self_type.* = .{ .function = signature };
+    if (!keep) {
+        info.* = .{ .type = self_type };
+        try this.inferring.append(this.arena, f.id);
+    }
+    defer if (!keep) {
+        _ = this.inferring.pop();
+    };
+
+    // The name TS7023 is reported at.
+    var name: ?ast.Function.Name = f.name;
+    if (f.kind == .declaration) {
+        if (!keep) {
+            this.variable(this.slot_base + f.name.?.binding).declared = self_type;
+        }
+    } else if (this.initializer) |init| {
+        const e = ast.skipParens(init.expr);
+        if (e.data == .function and e.data.function == f) {
+            // `const f = () => f()`: the variable has the function's type while it's checked.
+            const v = this.variable(init.slot);
+            v.declared = self_type;
+            if (name == null) {
+                name = .{ .text = v.name, .start = v.start, .binding = 0 };
+            }
+        }
+    }
+
+    const ctx = try this.arena.create(Context);
+    ctx.* = .{
+        .function = f,
+        .parent = saved_context,
+        .signature = signature,
+        .creation = if (f.kind == .declaration) null else saved_flow,
+        .declared_return = null,
+        .contextual_return = if (context) |c| c.returns else null,
+    };
+    this.context = ctx;
+    this.targets = .empty;
+    this.labels = .empty;
+    this.lazy = .empty;
+    this.initializer = null;
+    this.indirect_call = null;
+    const vars = try this.arena.alloc(VarFlow, this.session.variables.items.len);
+    @memset(vars, .{});
+    this.flow = .{ .reachable = true, .vars = vars };
+    this.scope = parent_scope;
+    try this.pushScope(f.scope, .parameters);
+
+    if (f.kind == .expression) {
+        if (f.name) |n| {
+            const slot = this.slot_base + n.binding;
+            try this.declare(slot, .{ .name = n.text, .kind = .function, .start = n.start, .end = n.start, .source = this.source, .annotation = null, .init = null, .function = f });
+            this.variable(slot).declared = self_type;
+        }
+    }
+
+    const parameters = try this.arena.alloc(types.Parameter, f.parameters.len - @intFromBool(f.parameters.len > 0 and f.parameters[f.parameters.len - 1].rest));
+    var seen_optional = false;
+    // All of them first, so a default value that uses a later one finds it (TS2373).
+    for (f.parameters) |*p| {
+        try this.declare(this.slot_base + p.binding, .{ .name = p.name, .kind = .parameter, .start = p.start, .end = p.end, .source = this.source, .annotation = p.type, .init = p.init });
+    }
+    for (f.parameters, 0..) |*p, i| {
+        const slot = this.slot_base + p.binding;
+        const v = this.variable(slot);
+        var from_context: ?*const Type = null;
+        if (context) |c| {
+            if (!p.rest) {
+                from_context = c.parameterType(i);
+            } else if (c.rest != null and i >= c.parameters.len) {
+                from_context = c.rest.?.type;
+            } else if (p.type == null) {
+                try this.unsupported(p.node_start, "A rest parameter typed by its context is not supported yet.", .{});
+                from_context = types.any_array;
+            }
+        }
+        var t: *const Type = types.any;
+        if (p.type) |annotation| {
+            t = try this.resolveType(annotation);
+            if (p.rest and t.* != .array and t.* != .any) {
+                try this.report(annotation.start, .ts(2370), "A rest parameter must be of an array type.", .{});
+                t = types.any_array;
+            }
+        } else if (from_context) |c| {
+            t = c;
+        } else if (p.init == null) {
+            if (p.rest) {
+                try this.report(p.node_start, .ts(7019), "Rest parameter '{s}' implicitly has an 'any[]' type.", .{p.name});
+                t = types.any_array;
+            } else {
+                try this.report(p.start, .ts(7006), "Parameter '{s}' implicitly has an 'any' type.", .{p.name});
+            }
+        }
+        if (p.init) |init| {
+            const typed = p.type != null or from_context != null;
+            this.parameter = p.name;
+            v.resolving = !typed;
+            const init_type = try this.contextual(init, if (typed) t else null);
+            v.resolving = false;
+            this.parameter = null;
+            if (!typed) {
+                t = if (v.circular) types.any else try types.widenFresh(this.arena, init_type);
+            } else if (!types.assignable(init_type, t)) {
+                try this.reportNotAssignable(init, init_type, t, p.start, .assignment);
+            }
+        }
+        if (!p.optional and p.init == null and !p.rest and seen_optional) {
+            try this.report(p.start, .ts(1016), "A required parameter cannot follow an optional parameter.", .{});
+        }
+        seen_optional = seen_optional or p.optional;
+        if (p.optional) {
+            t = try types.unionOf(this.arena, &.{ t, types.undefined });
+        }
+        v.declared = t;
+        this.flow.vars[slot] = .{ .initialized = true, .type = t };
+        if (p.rest) {
+            signature.rest = .{ .name = p.name, .type = t };
+        } else {
+            parameters[i] = .{ .name = p.name, .type = t, .optional = p.optional or p.init != null };
+        }
+    }
+    // A parameter with a default value before a required one isn't optional: `undefined` has to
+    // be passed for it.
+    var i = parameters.len;
+    var required = false;
+    while (i > 0) {
+        i -= 1;
+        const p = &parameters[i];
+        if (!p.optional) {
+            required = true;
+        } else if (required and !f.parameters[i].optional) {
+            p.optional = false;
+            p.type = try types.unionOf(this.arena, &.{ p.type, types.undefined });
+        }
+    }
+    signature.parameters = parameters;
+
+    const declared_return = if (f.returns) |r| try this.resolveType(r) else null;
+    ctx.declared_return = declared_return;
+    if (declared_return) |r| {
+        // Nothing needs the body to know what it returns.
+        signature.returns = r;
+        signature.pending = false;
+    }
+    switch (f.body) {
+        .block => |b| {
+            try this.pushScope(b.scope, .block);
+            try this.prescan(b.statements);
+            for (b.statements) |s| {
+                try this.statement(s);
+            }
+            this.popScope();
+        },
+        .expression => |e| {
+            const t = try this.contextual(e, declared_return orelse ctx.contextual_return);
+            if (declared_return) |r| {
+                if (!types.assignable(t, r)) {
+                    try this.reportNotAssignable(e, t, r, e.start, .assignment);
+                }
+            }
+            try ctx.returns.append(this.arena, t);
+            this.flow = .unreachable_flow;
+        },
+    }
+    const end_reachable = this.flow.reachable;
+
+    var returns: *const Type = undefined;
+    if (declared_return) |r| {
+        returns = r;
+        if (end_reachable) {
+            try this.checkEndReachable(f, r, ctx);
+        }
+    } else if (ctx.returns.items.len == 0) {
+        // An arrow or function expression that never returns returns `never`; a declaration
+        // returns `void` either way.
+        returns = if (!end_reachable and !ctx.empty_return and f.kind != .declaration) types.never else types.void;
+    } else {
+        if (end_reachable or ctx.empty_return) {
+            try ctx.returns.append(this.arena, types.undefined);
+        }
+        const t = try types.unionOf(this.arena, ctx.returns.items);
+        const literal_context = if (ctx.contextual_return) |c| types.couldHaveSingletons(c) else false;
+        returns = if (literal_context) t else try types.widenFresh(this.arena, t);
+    }
+    if (keep) {
+        if (info.circular and mode == .check) {
+            try this.reportCircular(f, name);
+        }
+        return info.type.?;
+    }
+    if (info.circular) {
+        returns = types.any;
+        if (mode == .check) {
+            try this.reportCircular(f, name);
+        }
+    } else if (refersTo(returns, self_type)) {
+        try this.unsupported(if (name) |n| n.start else f.start, "A function that returns itself is not supported yet.", .{});
+        returns = types.any;
+    }
+    signature.returns = returns;
+    signature.pending = false;
+    return self_type;
+}
+
+fn reportCircular(this: *Checker, f: *const ast.Function, name: ?ast.Function.Name) Error!void {
+    if (f.kind == .expression) {
+        // tsc has its own rules for these.
+        return this.unsupported(if (name) |n| n.start else f.start, "A function expression that calls itself without a return type annotation is not supported yet.", .{});
+    }
+    if (name) |n| {
+        try this.report(n.start, .ts(7023), "'{s}' implicitly has return type 'any' because it does not have a return type annotation and is referenced directly or indirectly in one of its return expressions.", .{n.text});
+    } else {
+        try this.report(f.start, .ts(7024), "Function implicitly has return type 'any' because it does not have a return type annotation and is referenced directly or indirectly in one of its return expressions.", .{});
+    }
+}
+
+/// tsc's `checkAllCodePathsInNonVoidFunctionReturnOrThrow`, for a function with a return type
+/// annotation whose end can be reached.
+fn checkEndReachable(this: *Checker, f: *const ast.Function, returns: *const Type, ctx: *const Context) Error!void {
+    if (returns.* == .never) {
+        return this.report(f.returns_start, .ts(2534), "A function returning 'never' cannot have a reachable end point.", .{});
+    }
+    var buffer: [1]*const Type = undefined;
+    for (returns.members(&buffer)) |m| {
+        if (m.* == .void or m.* == .any or (m.* == .undefined and returns.* != .@"union")) {
+            return;
+        }
+    }
+    if (ctx.returns.items.len == 0 and !ctx.empty_return) {
+        return this.report(f.returns_start, .ts(2355), "A function whose declared type is neither 'undefined', 'void', nor 'any' must return a value.", .{});
+    }
+    if (!types.includesUndefined(returns)) {
+        try this.report(f.returns_start, .ts(2366), "Function lacks ending return statement and return type does not include 'undefined'.", .{});
+    }
+}
+
+/// The function type a context gives a function expression: the context itself, or its only
+/// function type once `null` and `undefined` are left out.
+fn contextualSignature(context: ?*const Type) ?*const types.Function {
+    const t = context orelse return null;
+    var found: ?*const types.Function = null;
+    var buffer: [1]*const Type = undefined;
+    for (t.members(&buffer)) |m| {
+        switch (m.*) {
+            .function => |f| {
+                if (found != null) {
+                    return null;
+                }
+                found = f;
+            },
+            .null, .undefined => {},
+            else => return null,
+        }
+    }
+    return found;
+}
+
+/// How many arguments a function needs.
+fn requiredParameters(f: *const ast.Function) usize {
+    var count: usize = 0;
+    for (f.parameters, 0..) |p, i| {
+        if (!p.optional and p.init == null and !p.rest) {
+            count = i + 1;
+        }
+    }
+    return count;
+}
+
+/// Whether `t` mentions `target`.
+fn refersTo(t: *const Type, target: *const Type) bool {
+    if (t == target) {
+        return true;
+    }
+    return switch (t.*) {
+        .@"union" => |ms| for (ms) |m| {
+            if (refersTo(m, target)) {
+                break true;
+            }
+        } else false,
+        .array => |e| refersTo(e, target),
+        .function => |f| refersTo(f.returns, target) or for (f.parameters) |p| {
+            if (refersTo(p.type, target)) {
+                break true;
+            }
+        } else false,
+        else => false,
+    };
+}
+
+fn returnStatement(this: *Checker, stmt: *const Stmt, value: ?*const Expr) Error!void {
+    const ctx = this.context orelse {
+        try this.report(stmt.start, .ts(1108), "A 'return' statement can only be used within a function body.", .{});
+        if (value) |v| {
+            _ = try this.expression(v);
+        }
+        this.flow = .unreachable_flow;
+        return;
+    };
+    if (value) |v| {
+        const t = try this.contextual(v, ctx.declared_return orelse ctx.contextual_return);
+        if (ctx.declared_return) |r| {
+            if (!types.assignable(t, r)) {
+                try this.reportNotAssignable(v, t, r, stmt.start, .assignment);
+            }
+        }
+        try ctx.returns.append(this.arena, t);
+    } else {
+        ctx.empty_return = true;
+        if (ctx.declared_return) |r| {
+            if (!types.assignable(types.undefined, r)) {
+                try this.notAssignable(stmt.start, types.undefined, r);
+            }
+        }
+    }
+    this.flow = .unreachable_flow;
+}
+
+/// Reports that `expr`, of type `source`, can't be used as a `target`, as an assignment (TS2322)
+/// or an argument (TS2345). Like tsc, a mismatched return type of an arrow function with an
+/// expression body is reported at that expression.
+fn reportNotAssignable(this: *Checker, expr: *const Expr, source: *const Type, target: *const Type, at: u32, kind: enum { assignment, argument }) Error!void {
+    const e = ast.skipParens(expr);
+    if (e.data == .function and source.* == .function) {
+        const f = e.data.function;
+        const annotated = for (f.parameters) |p| {
+            if (p.type != null) {
+                break true;
+            }
+        } else false;
+        if (contextualSignature(target)) |t| {
+            const mismatch = types.functionMismatch(source.function, t);
+            if (f.kind == .arrow and f.body == .expression and !annotated and mismatch != null and mismatch.? == .returns) {
+                return this.report(f.body.expression.start, .ts(2322), "Type '{f}' is not assignable to type '{f}'.", .{ try this.shownSource(source.function.returns, t.returns), t.returns });
+            }
+        }
+    }
+    const elaboration = try this.elaborate(source, target);
+    switch (kind) {
+        .assignment => {
+            var shown = target;
+            if (target.* == .@"union" and !includesNullish(source)) {
+                const rest = try this.removeNullish(target);
+                if (!types.isUnion(rest)) {
+                    shown = rest;
+                }
+            }
+            try this.report(at, .ts(2322), "Type '{f}' is not assignable to type '{f}'.{s}", .{ try this.shownSource(source, shown), shown, elaboration });
+        },
+        .argument => try this.report(at, .ts(2345), "Argument of type '{f}' is not assignable to parameter of type '{f}'.{s}", .{ try this.shownSource(source, target), target, elaboration }),
+    }
+}
+
+/// The lines tsc adds to say why one function type isn't assignable to another.
+fn elaborate(this: *Checker, source: *const Type, target: *const Type) Error![]const u8 {
+    if (source.* != .function or target.* != .function) {
+        return "";
+    }
+    const s = source.function;
+    const t = target.function;
+    const mismatch = types.functionMismatch(s, t) orelse return "";
+    return switch (mismatch) {
+        .arity => |needed| std.fmt.allocPrint(this.arena, "\n  Target signature provides too few arguments. Expected {d} or more, but got {d}.", .{ needed, t.parameters.len }),
+        .parameter => |i| std.fmt.allocPrint(this.arena, "\n  Types of parameters '{s}' and '{s}' are incompatible.\n    Type '{f}' is not assignable to type '{f}'.", .{
+            parameterName(s, i), parameterName(t, i), t.parameterType(i).?, s.parameterType(i).?,
+        }),
+        .returns => std.fmt.allocPrint(this.arena, "\n  Type '{f}' is not assignable to type '{f}'.", .{ try this.shownSource(s.returns, t.returns), t.returns }),
+    };
+}
+
+fn parameterName(f: *const types.Function, i: usize) []const u8 {
+    return if (i < f.parameters.len) f.parameters[i].name else f.rest.?.name;
 }
 
 /// The name tsc uses for a type's methods: `Number` for `number` and `1`, and so on.
@@ -1491,6 +2554,7 @@ fn truthySemantics(this: *const Checker, expr: *const Expr) Semantics {
         .unary => |u| if (u.op == .void) .never else .sometimes,
         .identifier => if (this.isGlobal(e, "undefined")) .never else .sometimes,
         .conditional => |c| combine(this.truthySemantics(c.then), this.truthySemantics(c.otherwise)),
+        .function => .always,
         else => .sometimes,
     };
 }
@@ -1534,7 +2598,7 @@ fn canBeFalsy(this: *Checker, t: *const Type) Error!bool {
     for (t.members(&buffer)) |m| {
         switch (m.*) {
             .literal => if (isFalsyLiteral(m)) return true,
-            .object, .function, .never => {},
+            .object, .function, .array, .never => {},
             else => return true,
         }
     }
@@ -1682,6 +2746,21 @@ fn uses(this: *const Checker, expr: *const Expr, target: *const Expr) bool {
                 break true;
             }
         } else false,
+        .function => |f| this.usesInFunction(f, target),
+    };
+}
+
+fn usesInFunction(this: *const Checker, f: *const ast.Function, target: *const Expr) bool {
+    for (f.parameters) |p| {
+        if (p.init) |init| {
+            if (this.uses(init, target)) {
+                return true;
+            }
+        }
+    }
+    return switch (f.body) {
+        .block => |b| this.usesInStatements(b.statements, target),
+        .expression => |e| this.uses(e, target),
     };
 }
 
@@ -1696,7 +2775,9 @@ fn usesInStatement(this: *const Checker, stmt: *const Stmt, target: *const Expr)
                 }
             }
         } else false,
-        .block => |statements| this.usesInStatements(statements, target),
+        .block => |b| this.usesInStatements(b.statements, target),
+        .function => |f| this.usesInFunction(f, target),
+        .@"return" => |value| if (value) |v| this.uses(v, target) else false,
         .@"if" => |i| this.uses(i.condition, target) or this.usesInStatement(i.then, target) or
             (if (i.otherwise) |o| this.usesInStatement(o, target) else false),
         .@"while", .do_while => |l| this.uses(l.condition, target) or this.usesInStatement(l.body, target),
