@@ -1,4 +1,9 @@
 //! Evaluates a checked program by walking its syntax tree.
+//!
+//! Variables live where the checker put them (see `Checker.Ref`): top-level ones in `slots`,
+//! which outlive the program so the REPL can use them later; a call's own variables in its frame
+//! on `stack`; and variables a closure captures in an `Env` for their scope, created each time the
+//! scope is entered.
 
 const std = @import("std");
 const ast = @import("../syntax/ast.zig");
@@ -6,6 +11,7 @@ const Checker = @import("../check/Checker.zig");
 const value = @import("value.zig");
 const number = @import("number.zig");
 const Value = value.Value;
+const Env = value.Env;
 const Expr = ast.Expr;
 const Stmt = ast.Stmt;
 
@@ -19,19 +25,59 @@ stdout: *std.Io.Writer,
 /// Where `console.error` and `console.warn` write.
 stderr: *std.Io.Writer,
 globals: std.StringHashMapUnmanaged(Value) = .empty,
-/// Every variable's value, indexed by the slot the checker gave it. There are no functions yet,
-/// so each declaration has exactly one slot, kept for the life of the runtime so the REPL can
-/// use it on later lines.
+/// Top-level variables, indexed by the slot the checker gave them, kept for the life of the
+/// runtime so the REPL can use them on later lines.
 slots: std.ArrayList(Value) = .empty,
-/// What the identifiers of the program being run resolve to.
+/// The frames of the calls in progress, each `frames[function.id]` values long.
+stack: std.ArrayList(Value) = .empty,
+/// Where the running call's frame starts in `stack`.
+frame: usize = 0,
+/// The innermost environment of the code that's running.
+env: ?*Env = null,
+/// The program the running code is from; a closure's body runs with its own program's tables.
+program: *const Program = undefined,
+/// `program.resolved.refs`, `bindings` and `environments`, kept here since they're read so often.
 refs: []const Checker.Ref = &.{},
-/// The slot of the running program's first variable.
-slot_base: u32 = 0,
+bindings: []const Checker.Ref = &.{},
+environments: []const u32 = &.{},
+/// How deep the native stack may get, in bytes, before a call throws a RangeError.
+max_stack: usize,
+/// Calls below this stack address throw a RangeError.
+stack_limit: usize = 0,
+/// What was thrown, when a call returns `error.RuntimeError`.
+exception: ?Exception = null,
 
-pub const Error = error{ OutOfMemory, WriteFailed };
+pub const Error = error{
+    OutOfMemory,
+    WriteFailed,
+    /// An exception was thrown and not caught; it's in `exception`.
+    RuntimeError,
+};
 
-pub fn init(arena: std.mem.Allocator, stdout: *std.Io.Writer, stderr: *std.Io.Writer) Error!Interpreter {
-    var interpreter: Interpreter = .{ .arena = arena, .stdout = stdout, .stderr = stderr };
+/// A runtime error. There's no `throw` or `catch` yet, so these always end the program.
+pub const Exception = struct {
+    name: Name,
+    message: []const u8,
+
+    pub const Name = enum {
+        TypeError,
+        ReferenceError,
+        RangeError,
+        /// Something that works in JavaScript but isn't implemented yet. Not a JavaScript error,
+        /// so it can never be caught.
+        Unsupported,
+    };
+
+    pub fn format(this: Exception, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (this.name) {
+            .Unsupported => try writer.print("error ZV9001: {s}", .{this.message}),
+            else => try writer.print("Uncaught {t}: {s}", .{ this.name, this.message }),
+        }
+    }
+};
+
+pub fn init(arena: std.mem.Allocator, stdout: *std.Io.Writer, stderr: *std.Io.Writer, max_stack: usize) error{OutOfMemory}!Interpreter {
+    var interpreter: Interpreter = .{ .arena = arena, .stdout = stdout, .stderr = stderr, .max_stack = max_stack };
     try @import("builtins/console.zig").install(&interpreter);
     try interpreter.globals.put(arena, "undefined", .undefined);
     try interpreter.globals.put(arena, "NaN", .{ .number = std.math.nan(f64) });
@@ -43,22 +89,148 @@ pub fn init(arena: std.mem.Allocator, stdout: *std.Io.Writer, stderr: *std.Io.Wr
 pub const Program = struct {
     ast: ast.Program,
     resolved: Checker.Resolved,
+    /// The source text, for functions' `toString`.
+    text: []const u8,
 };
+
+/// Ends the program with an exception.
+pub fn throw(this: *Interpreter, name: Exception.Name, comptime fmt: []const u8, args: anytype) Error {
+    this.exception = .{ .name = name, .message = try std.fmt.allocPrint(this.arena, fmt, args) };
+    return error.RuntimeError;
+}
 
 /// Runs the statements in order, returning the program's completion value (ECMA-262 §8.4): for
 /// the most part, the value of the last expression statement that ran. It's what the REPL
 /// prints.
 pub fn run(this: *Interpreter, program: Program) Error!Value {
-    this.refs = program.resolved.refs;
-    this.slot_base = program.resolved.slot_base;
+    const owned = try this.arena.create(Program);
+    owned.* = program;
+    this.setProgram(owned);
+    this.exception = null;
+    this.env = null;
+    this.frame = 0;
+    this.stack.clearRetainingCapacity();
+    this.stack_limit = @frameAddress() -| this.max_stack;
     if (this.slots.items.len < program.resolved.slot_count) {
-        try this.slots.appendNTimes(this.arena, .undefined, program.resolved.slot_count - this.slots.items.len);
+        try this.slots.appendNTimes(this.arena, .uninitialized, program.resolved.slot_count - this.slots.items.len);
     }
-    // There's nothing for a `break` to escape at the top level; the checker has made sure.
+    try this.hoist(program.ast.statements);
+    // There's nothing for a `break` or `return` to escape at the top level; the checker has made
+    // sure.
     return switch (try this.statementList(program.ast.statements)) {
         .normal => |v| v orelse .undefined,
         else => unreachable,
     };
+}
+
+fn setProgram(this: *Interpreter, program: *const Program) void {
+    this.program = program;
+    this.refs = program.resolved.refs;
+    this.bindings = program.resolved.bindings;
+    this.environments = program.resolved.environments;
+}
+
+// Variables
+
+fn envAt(this: *const Interpreter, hops: u32) *Env {
+    var env = this.env.?;
+    for (0..hops) |_| {
+        env = env.parent.?;
+    }
+    return env;
+}
+
+/// Where a variable is, or null for a builtin.
+inline fn location(this: *Interpreter, ref: Checker.Ref) ?*Value {
+    return switch (ref) {
+        .slot => |i| &this.slots.items[i],
+        .local => |i| &this.stack.items[this.frame + i],
+        .env => |e| &this.envAt(e.hops).values[e.index],
+        .global => null,
+    };
+}
+
+fn get(this: *Interpreter, id: ast.Identifier) Error!Value {
+    const ref = this.refs[id.ref];
+    const v = (this.location(ref) orelse return this.globals.get(ref.global).?).*;
+    if (v == .uninitialized) {
+        return this.throw(.ReferenceError, "Cannot access '{s}' before initialization", .{id.name});
+    }
+    return v;
+}
+
+/// The variable an assignment target writes to. The checker only lets variables through.
+const Target = struct {
+    ref: Checker.Ref,
+    slot: *Value,
+
+    /// Finds the variable again after evaluating something, which can move the stack.
+    fn refresh(this: *Target, interpreter: *Interpreter) void {
+        if (this.ref == .local) {
+            this.slot = interpreter.location(this.ref).?;
+        }
+    }
+};
+
+fn target(this: *Interpreter, expr: *const Expr) Error!Target {
+    const id = ast.skipParens(expr).data.identifier;
+    const ref = this.refs[id.ref];
+    const slot = this.location(ref).?;
+    if (slot.* == .uninitialized) {
+        return this.throw(.ReferenceError, "Cannot access '{s}' before initialization", .{id.name});
+    }
+    return .{ .ref = ref, .slot = slot };
+}
+
+/// Gives a declared name its first value.
+fn initialize(this: *Interpreter, binding: u32, v: Value) void {
+    this.location(this.bindings[binding]).?.* = v;
+}
+
+/// Enters a scope, giving it an environment if closures capture any of its variables. The caller
+/// restores `env` afterwards.
+fn enterScope(this: *Interpreter, scope: u32) Error!void {
+    const size = this.environments[scope];
+    if (size == 0) {
+        return;
+    }
+    const env = try this.arena.create(Env);
+    const values = try this.arena.alloc(Value, size);
+    @memset(values, .uninitialized);
+    env.* = .{ .parent = this.env, .values = values };
+    this.env = env;
+}
+
+/// CreatePerIterationEnvironment (§14.7.4.4): each pass through a `for` loop gets its own copy
+/// of the variables its head declares, so closures created in different passes don't share them.
+fn copyEnv(this: *Interpreter, scope: u32) Error!void {
+    if (this.environments[scope] == 0) {
+        return;
+    }
+    const env = try this.arena.create(Env);
+    env.* = .{ .parent = this.env.?.parent, .values = try this.arena.dupe(Value, this.env.?.values) };
+    this.env = env;
+}
+
+/// Creates the functions a statement list declares, which can be called before their
+/// declarations.
+fn hoist(this: *Interpreter, statements: []const *const Stmt) Error!void {
+    for (statements) |stmt| {
+        var s = stmt;
+        while (s.data == .labeled) {
+            s = s.data.labeled.body;
+        }
+        if (s.data == .function) {
+            const f = s.data.function;
+            this.initialize(f.name.?.binding, try this.closure(f));
+        }
+    }
+}
+
+fn closure(this: *Interpreter, f: *const ast.Function) Error!Value {
+    const c = try this.arena.create(value.Closure);
+    c.* = .{ .function = f, .env = this.env, .program = this.program };
+    return .{ .function = c };
 }
 
 // Statements
@@ -68,6 +240,7 @@ const Completion = union(enum) {
     normal: ?Value,
     @"break": Jump,
     @"continue": Jump,
+    @"return": Value,
 
     const Jump = struct {
         label: ?[]const u8,
@@ -78,6 +251,7 @@ const Completion = union(enum) {
         return switch (this) {
             .normal => |v| v,
             .@"break", .@"continue" => |j| j.value,
+            .@"return" => null,
         };
     }
 
@@ -87,6 +261,7 @@ const Completion = union(enum) {
             .normal => |current| .{ .normal = current orelse v },
             .@"break" => |j| .{ .@"break" = .{ .label = j.label, .value = j.value orelse v } },
             .@"continue" => |j| .{ .@"continue" = .{ .label = j.label, .value = j.value orelse v } },
+            .@"return" => this,
         };
     }
 };
@@ -111,11 +286,22 @@ fn statement(this: *Interpreter, stmt: *const Stmt, labels: []const []const u8) 
         .variable => |v| {
             for (v.declarators) |d| {
                 const initial: Value = if (d.init) |e| try this.evaluate(e) else .undefined;
-                this.slots.items[this.slotOf(d)] = initial;
+                this.initialize(d.binding, initial);
             }
             return .{ .normal = null };
         },
-        .block => |statements| return this.statementList(statements),
+        // Created when its scope was entered.
+        .function => return .{ .normal = null },
+        .@"return" => |e| return .{ .@"return" = if (e) |v| try this.evaluate(v) else .undefined },
+        .block => |b| {
+            const saved = this.env;
+            defer this.env = saved;
+            try this.enterScope(b.scope);
+            if (b.declares_functions) {
+                try this.hoist(b.statements);
+            }
+            return this.statementList(b.statements);
+        },
         .@"if" => |i| {
             const branch = if ((try this.evaluate(i.condition)).toBoolean()) i.then else i.otherwise orelse return .{ .normal = .undefined };
             return (try this.statement(branch, &.{})).updateEmpty(.undefined);
@@ -136,10 +322,6 @@ fn statement(this: *Interpreter, stmt: *const Stmt, labels: []const []const u8) 
     }
 }
 
-fn slotOf(this: *const Interpreter, d: ast.Declarator) u32 {
-    return this.slot_base + d.binding;
-}
-
 /// A loop or `switch` finishes normally when an unlabeled `break` leaves it.
 fn breakable(completion: Completion) Completion {
     if (completion == .@"break" and completion.@"break".label == null) {
@@ -152,7 +334,7 @@ fn breakable(completion: Completion) Completion {
 fn loopContinues(completion: Completion, labels: []const []const u8) bool {
     return switch (completion) {
         .normal => true,
-        .@"break" => false,
+        .@"break", .@"return" => false,
         .@"continue" => |j| if (j.label) |label| for (labels) |l| {
             if (std.mem.eql(u8, l, label)) {
                 break true;
@@ -182,9 +364,13 @@ fn loop(this: *Interpreter, stmt: *const Stmt, labels: []const []const u8) Error
             }
         },
         .@"for" => |f| {
+            const saved = this.env;
+            defer this.env = saved;
+            try this.enterScope(f.scope);
             if (f.init) |s| {
                 _ = try this.statement(s, &.{});
             }
+            try this.copyEnv(f.scope);
             while (true) {
                 if (f.condition) |c| {
                     if (!(try this.evaluate(c)).toBoolean()) {
@@ -196,6 +382,7 @@ fn loop(this: *Interpreter, stmt: *const Stmt, labels: []const []const u8) Error
                     return result.updateEmpty(v);
                 }
                 v = result.value() orelse v;
+                try this.copyEnv(f.scope);
                 if (f.update) |u| {
                     _ = try this.evaluate(u);
                 }
@@ -210,6 +397,12 @@ fn loop(this: *Interpreter, stmt: *const Stmt, labels: []const []const u8) Error
 /// matches) to the end, unless something breaks out.
 fn switchStatement(this: *Interpreter, sw: ast.Switch) Error!Completion {
     const discriminant = try this.evaluate(sw.discriminant);
+    const saved = this.env;
+    defer this.env = saved;
+    try this.enterScope(sw.scope);
+    for (sw.clauses) |clause| {
+        try this.hoist(clause.statements);
+    }
     var start: ?usize = null;
     for (sw.clauses, 0..) |clause, i| {
         const case = clause.case orelse continue;
@@ -244,6 +437,7 @@ fn evaluate(this: *Interpreter, expr: *const Expr) Error!Value {
         .null => .null,
         .template => |t| this.template(t),
         .identifier => |id| this.get(id),
+        .function => |f| this.closure(f),
         .paren => |inner| this.evaluate(inner),
         .unary => |u| this.unary(u),
         .update => |u| this.update(u),
@@ -255,35 +449,23 @@ fn evaluate(this: *Interpreter, expr: *const Expr) Error!Value {
     };
 }
 
-fn get(this: *Interpreter, id: ast.Identifier) Value {
-    return switch (this.refs[id.ref]) {
-        .slot => |slot| this.slots.items[slot],
-        // The checker has already rejected unknown names.
-        .global => |name| this.globals.get(name).?,
-    };
-}
-
-/// The slot an assignment target writes to. The checker only lets variables through.
-fn targetSlot(this: *const Interpreter, target: *const Expr) u32 {
-    return this.refs[ast.skipParens(target).data.identifier.ref].slot;
-}
-
 fn update(this: *Interpreter, u: ast.Update) Error!Value {
-    const slot = this.targetSlot(u.operand);
-    const old = this.slots.items[slot].toNumber();
+    const t = try this.target(u.operand);
+    const old = t.slot.toNumber();
     const new = if (u.increment) old + 1 else old - 1;
-    this.slots.items[slot] = .{ .number = new };
+    t.slot.* = .{ .number = new };
     return .{ .number = if (u.prefix) new else old };
 }
 
 fn assign(this: *Interpreter, a: ast.Assign) Error!Value {
-    const slot = this.targetSlot(a.target);
     const op = a.op orelse {
+        // A variable still in its temporal dead zone throws only after the value is evaluated.
         const v = try this.evaluate(a.value);
-        this.slots.items[slot] = v;
+        (try this.target(a.target)).slot.* = v;
         return v;
     };
-    const current = this.slots.items[slot];
+    var t = try this.target(a.target);
+    const current = t.slot.*;
     // The logical assignments only evaluate and assign the right side when they need it.
     const skip = switch (op) {
         .logical_and => !current.toBoolean(),
@@ -291,7 +473,8 @@ fn assign(this: *Interpreter, a: ast.Assign) Error!Value {
         .nullish => current != .null and current != .undefined,
         else => {
             const result = try this.operate(op, current, try this.evaluate(a.value));
-            this.slots.items[slot] = result;
+            t.refresh(this);
+            t.slot.* = result;
             return result;
         },
     };
@@ -299,7 +482,8 @@ fn assign(this: *Interpreter, a: ast.Assign) Error!Value {
         return current;
     }
     const v = try this.evaluate(a.value);
-    this.slots.items[slot] = v;
+    t.refresh(this);
+    t.slot.* = v;
     return v;
 }
 
@@ -370,13 +554,13 @@ fn operate(this: *Interpreter, op: ast.BinaryOp, left: Value, right: Value) Erro
         .bitwise_and => int32(value.toInt32(left.toNumber()) & value.toInt32(right.toNumber())),
         .bitwise_or => int32(value.toInt32(left.toNumber()) | value.toInt32(right.toNumber())),
         .bitwise_xor => int32(value.toInt32(left.toNumber()) ^ value.toInt32(right.toNumber())),
-        .less => .{ .boolean = lessThan(left, right) orelse false },
-        .greater => .{ .boolean = lessThan(right, left) orelse false },
+        .less => .{ .boolean = try this.lessThan(left, right) orelse false },
+        .greater => .{ .boolean = try this.lessThan(right, left) orelse false },
         // `a <= b` is `!(b < a)`, except that NaN makes every comparison false.
-        .less_equal => .{ .boolean = if (lessThan(right, left)) |r| !r else false },
-        .greater_equal => .{ .boolean = if (lessThan(left, right)) |r| !r else false },
-        .equal => .{ .boolean = left.looseEquals(right) },
-        .not_equal => .{ .boolean = !left.looseEquals(right) },
+        .less_equal => .{ .boolean = if (try this.lessThan(right, left)) |r| !r else false },
+        .greater_equal => .{ .boolean = if (try this.lessThan(left, right)) |r| !r else false },
+        .equal => .{ .boolean = try left.looseEquals(right, this.arena) },
+        .not_equal => .{ .boolean = !try left.looseEquals(right, this.arena) },
         .strict_equal => .{ .boolean = left.strictEquals(right) },
         .strict_not_equal => .{ .boolean = !left.strictEquals(right) },
         .logical_and, .logical_or, .nullish => unreachable,
@@ -407,8 +591,11 @@ fn remainder(n: f64, d: f64) f64 {
 /// The `+` operator (§13.15.3): string concatenation if either side is a string after
 /// ToPrimitive, numeric addition otherwise.
 fn add(this: *Interpreter, left: Value, right: Value) Error!Value {
-    const lp = left.toPrimitive();
-    const rp = right.toPrimitive();
+    if (left == .number and right == .number) {
+        return .{ .number = left.number + right.number };
+    }
+    const lp = try left.toPrimitive(this.arena);
+    const rp = try right.toPrimitive(this.arena);
     if (lp == .string or rp == .string) {
         const ls = try lp.toString(this.arena);
         const rs = try rp.toString(this.arena);
@@ -418,9 +605,12 @@ fn add(this: *Interpreter, left: Value, right: Value) Error!Value {
 }
 
 /// IsLessThan (§7.2.13): null when either side is NaN.
-fn lessThan(a: Value, b: Value) ?bool {
-    const ap = a.toPrimitive();
-    const bp = b.toPrimitive();
+fn lessThan(this: *Interpreter, a: Value, b: Value) Error!?bool {
+    if (a == .number and b == .number) {
+        return if (std.math.isNan(a.number) or std.math.isNan(b.number)) null else a.number < b.number;
+    }
+    const ap = try a.toPrimitive(this.arena);
+    const bp = try b.toPrimitive(this.arena);
     if (ap == .string and bp == .string) {
         return value.compareStrings(ap.string, bp.string) == .lt;
     }
@@ -433,12 +623,33 @@ fn lessThan(a: Value, b: Value) ?bool {
 }
 
 fn member(this: *Interpreter, m: ast.Member) Error!Value {
-    const object = try this.evaluate(m.object);
-    return switch (object) {
-        .object => |o| o.get(m.property),
-        // The checker only lets property reads through on objects so far.
-        else => unreachable,
-    };
+    return this.property(try this.evaluate(m.object), m);
+}
+
+fn property(this: *Interpreter, object: Value, m: ast.Member) Error!Value {
+    const name = m.property;
+    switch (object) {
+        .object => |o| return o.get(name),
+        .function => |f| {
+            if (std.mem.eql(u8, name, "name")) {
+                return .{ .string = f.name() };
+            }
+            if (std.mem.eql(u8, name, "length")) {
+                return .{ .number = @floatFromInt(f.function.length()) };
+            }
+        },
+        .native_function => |f| {
+            if (std.mem.eql(u8, name, "name")) {
+                return .{ .string = f.name };
+            }
+        },
+        .array => |a| if (std.mem.eql(u8, name, "length")) {
+            return .{ .number = @floatFromInt(a.items.len) };
+        },
+        .undefined, .null => return this.throw(.TypeError, "Cannot read properties of {t} (reading '{s}')", .{ object, name }),
+        else => {},
+    }
+    return this.throw(.Unsupported, "Reading the property '{s}' of a {s} is not supported yet.", .{ name, object.typeOf() });
 }
 
 fn call(this: *Interpreter, c: ast.Call) Error!Value {
@@ -446,7 +657,7 @@ fn call(this: *Interpreter, c: ast.Call) Error!Value {
     const callee = switch (c.callee.data) {
         .member => |m| blk: {
             receiver = try this.evaluate(m.object);
-            break :blk receiver.object.get(m.property);
+            break :blk try this.property(receiver, m);
         },
         else => try this.evaluate(c.callee),
     };
@@ -458,10 +669,77 @@ fn call(this: *Interpreter, c: ast.Call) Error!Value {
         .native_function => |f| f.call(this, receiver, args) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.WriteFailed => error.WriteFailed,
+            error.RuntimeError => error.RuntimeError,
             else => unreachable,
         },
-        else => unreachable,
+        .function => |f| this.callFunction(f, args),
+        // Only possible through `any`.
+        else => this.throw(.TypeError, "{s} is not a function", .{calleeText(c.callee)}),
     };
+}
+
+/// How node names a callee in "is not a function".
+fn calleeText(expr: *const Expr) []const u8 {
+    return switch (expr.data) {
+        .identifier => |id| id.name,
+        .member => |m| m.property,
+        else => "expression",
+    };
+}
+
+/// Calls a function from the source with evaluated arguments.
+pub fn callFunction(this: *Interpreter, c: *const value.Closure, args: []const Value) Error!Value {
+    if (@frameAddress() < this.stack_limit) {
+        return this.throw(.RangeError, "Maximum call stack size exceeded", .{});
+    }
+    const f = c.function;
+    const saved_program = this.program;
+    const saved_env = this.env;
+    const saved_frame = this.frame;
+    const saved_len = this.stack.items.len;
+    defer {
+        this.setProgram(saved_program);
+        this.env = saved_env;
+        this.frame = saved_frame;
+        this.stack.shrinkRetainingCapacity(saved_len);
+    }
+    this.setProgram(c.program);
+    this.env = c.env;
+    this.frame = saved_len;
+    try this.stack.appendNTimes(this.arena, .undefined, this.program.resolved.frames[f.id]);
+
+    try this.enterScope(f.scope);
+    if (f.kind == .expression) {
+        if (f.name) |n| {
+            this.initialize(n.binding, .{ .function = c });
+        }
+    }
+    for (f.parameters, 0..) |p, i| {
+        if (p.rest) {
+            const array = try this.arena.create(value.Array);
+            array.* = .{ .items = try this.arena.dupe(Value, args[@min(i, args.len)..]) };
+            this.initialize(p.binding, .{ .array = array });
+            break;
+        }
+        var v: Value = if (i < args.len) args[i] else .undefined;
+        if (v == .undefined) {
+            if (p.init) |default| {
+                v = try this.evaluate(default);
+            }
+        }
+        this.initialize(p.binding, v);
+    }
+    switch (f.body) {
+        .expression => |e| return this.evaluate(e),
+        .block => |b| {
+            try this.enterScope(b.scope);
+            try this.hoist(b.statements);
+            return switch (try this.statementList(b.statements)) {
+                .@"return" => |v| v,
+                else => .undefined,
+            };
+        },
+    }
 }
 
 /// Reaches the interpreter from a native function's opaque context.

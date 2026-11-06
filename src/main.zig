@@ -45,7 +45,22 @@ fn parseOptions(io: std.Io, args: std.process.Args, arena: std.mem.Allocator) !O
     return options;
 }
 
+/// The interpreter recurses on the native stack, so programs run on a thread with a big one; it
+/// only uses address space until it's touched.
+const thread_stack = 64 * 1024 * 1024;
+
 pub fn main(init: std.process.Init) !void {
+    var result: anyerror!void = {};
+    const thread = try std.Thread.spawn(.{ .stack_size = thread_stack }, struct {
+        fn run(i: std.process.Init, out: *anyerror!void) void {
+            out.* = mainThread(i);
+        }
+    }.run, .{ init, &result });
+    thread.join();
+    return result;
+}
+
+fn mainThread(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
     const options = try parseOptions(io, init.minimal.args, init.arena.allocator());
@@ -57,7 +72,7 @@ pub fn main(init: std.process.Init) !void {
     var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
 
-    var runtime: zavascript.Runtime = try .init(gpa, .{ .stdout = stdout, .stderr = stderr });
+    var runtime: zavascript.Runtime = try .init(gpa, .{ .stdout = stdout, .stderr = stderr, .max_stack = thread_stack - 4 * 1024 * 1024 });
     defer runtime.deinit();
 
     const stdin = std.Io.File.stdin();
@@ -104,6 +119,11 @@ fn runSource(runtime: *zavascript.Runtime, path: []const u8, source: []const u8,
             try runtime.diagnostics.render(stderr);
             return 1;
         },
+        error.RuntimeError => {
+            try stdout.flush();
+            try stderr.print("{s}: {f}\n", .{ path, runtime.exception().? });
+            return 1;
+        },
         else => return err,
     };
     return 0;
@@ -142,13 +162,21 @@ fn repl(io: std.Io, runtime: *zavascript.Runtime, stdin: std.Io.File, stdout: *s
             continue;
         }
         if (runtime.run("repl", input)) |value| {
-            try zavascript.Runtime.inspect(stdout, value);
+            runtime.inspect(stdout, value) catch |err| switch (err) {
+                error.Unsupported => try stdout.writeAll("(can't show this value yet)"),
+                else => |e| return e,
+            };
             try stdout.writeByte('\n');
         } else |err| {
             switch (err) {
                 error.CompileError => {
                     try stdout.flush();
                     try runtime.diagnostics.render(stderr);
+                    try stderr.flush();
+                },
+                error.RuntimeError => {
+                    try stdout.flush();
+                    try stderr.print("{f}\n", .{runtime.exception().?});
                     try stderr.flush();
                 },
                 else => return err,

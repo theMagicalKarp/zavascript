@@ -35,15 +35,27 @@ pub const Options = struct {
     stdout: *std.Io.Writer,
     /// Where `console.error` and `console.warn` write.
     stderr: *std.Io.Writer,
+    /// How much of the calling thread's stack the interpreter may use, in bytes. Deeper
+    /// recursion throws a RangeError, as in node. Keep it well below the thread's stack size.
+    max_stack: usize = 4 * 1024 * 1024,
 };
 
 pub const Error = error{
     /// The source has syntax or type errors; they're in `diagnostics`.
     CompileError,
+    /// The program threw an exception it didn't catch; it's in `exception()`.
+    RuntimeError,
     OutOfMemory,
     /// Writing to `stdout` or `stderr` failed.
     WriteFailed,
 };
+
+pub const Exception = Interpreter.Exception;
+
+/// What the last `run` or `execute` that returned `error.RuntimeError` threw.
+pub fn exception(this: *const Runtime) ?Exception {
+    return this.interpreter.exception;
+}
 
 pub fn init(gpa: std.mem.Allocator, options: Options) error{ OutOfMemory, WriteFailed }!Runtime {
     const arena = try gpa.create(std.heap.ArenaAllocator);
@@ -54,7 +66,7 @@ pub fn init(gpa: std.mem.Allocator, options: Options) error{ OutOfMemory, WriteF
         .gpa = gpa,
         .arena = arena,
         .diagnostics = .init(gpa),
-        .interpreter = try .init(arena.allocator(), options.stdout, options.stderr),
+        .interpreter = try .init(arena.allocator(), options.stdout, options.stderr, options.max_stack),
     };
 }
 
@@ -97,14 +109,16 @@ pub fn compile(this: *Runtime, path: []const u8, text: []const u8) Error!Program
     }
     const resolved = try Checker.check(arena, source, &this.diagnostics, &this.session, program);
     if (this.diagnostics.items().len > 0) {
+        // Like tsc, in source order; functions can be checked out of order.
+        this.diagnostics.sort();
         return error.CompileError;
     }
-    return .{ .ast = program, .resolved = resolved };
+    return .{ .ast = program, .resolved = resolved, .text = source.text };
 }
 
 /// Writes `value` the way node's REPL shows it.
-pub fn inspect(writer: *std.Io.Writer, value: Value) std.Io.Writer.Error!void {
-    return @import("runtime/value.zig").inspect(writer, value);
+pub fn inspect(this: *Runtime, writer: *std.Io.Writer, value: Value) error{ WriteFailed, OutOfMemory, Unsupported }!void {
+    return @import("runtime/value.zig").inspect(this.arena.allocator(), writer, value);
 }
 
 const testing = std.testing;
@@ -184,4 +198,40 @@ test "completion values" {
     try testing.expectEqual(@as(f64, 9), (try runtime.run("repl", "let i = 0; while (i < 10) { if (i === 9) { i; break; } i++; }")).number);
     try testing.expectEqual(@as(f64, 2), (try runtime.run("repl", "switch (x) { case 1: 1; case 2: 2; break; default: 3 }")).number);
     try testing.expectEqual(@as(f64, 5), (try runtime.run("repl", "outer: { 5; break outer; }")).number);
+}
+
+fn expectThrows(source: []const u8, expected: []const u8) !void {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var runtime: Runtime = try .init(testing.allocator, .{ .stdout = &out.writer, .stderr = &out.writer });
+    defer runtime.deinit();
+    try testing.expectError(error.RuntimeError, runtime.run("test.ts", source));
+    try testing.expectFmt(expected, "{f}", .{runtime.exception().?});
+}
+
+test "runtime errors" {
+    try expectThrows("function f(n: number): number { return f(n + 1); } f(0)", "Uncaught RangeError: Maximum call stack size exceeded");
+    try expectThrows("const f = () => x; f(); let x = 1;", "Uncaught ReferenceError: Cannot access 'x' before initialization");
+    try expectThrows("function g() { y = 2; } g(); let y = 1;", "Uncaught ReferenceError: Cannot access 'y' before initialization");
+    try expectThrows("function g() { y = console.log('evaluated first'); } g(); let y: void;", "Uncaught ReferenceError: Cannot access 'y' before initialization");
+    try expectThrows("let a: any = 1; a()", "Uncaught TypeError: a is not a function");
+    try expectThrows("let a: any = undefined; a.b", "Uncaught TypeError: Cannot read properties of undefined (reading 'b')");
+    try expectThrows("let a: any = 1; a.b", "error ZV9001: Reading the property 'b' of a number is not supported yet.");
+}
+
+test "keeps functions between runs" {
+    var stdout: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout.deinit();
+    var runtime: Runtime = try .init(testing.allocator, .{ .stdout = &stdout.writer, .stderr = &stdout.writer });
+    defer runtime.deinit();
+    _ = try runtime.run("repl", "function counter() { let n = 0; return () => ++n; }");
+    _ = try runtime.run("repl", "const next = counter()");
+    _ = try runtime.run("repl", "next(); next()");
+    try testing.expectEqual(@as(f64, 3), (try runtime.run("repl", "next()")).number);
+    try testing.expectEqual(@as(f64, 1), (try runtime.run("repl", "counter()()")).number);
+    // A REPL line can call itself through an earlier one.
+    _ = try runtime.run("repl", "function fact(n: number): number { return n <= 1 ? 1 : n * fact(n - 1); }");
+    try testing.expectEqual(@as(f64, 120), (try runtime.run("repl", "fact(5)")).number);
+    try testing.expectError(error.CompileError, runtime.run("repl", "fact('x')"));
+    try testing.expectEqual(2345, runtime.diagnostics.items()[0].code.number);
 }

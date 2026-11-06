@@ -62,7 +62,7 @@ fn runCase(gpa: std.mem.Allocator, arena: std.mem.Allocator, path: []const u8, s
 
     var stdout: std.Io.Writer.Allocating = .init(arena);
     var stderr: std.Io.Writer.Allocating = .init(arena);
-    var runtime: zavascript.Runtime = try .init(gpa, .{ .stdout = &stdout.writer, .stderr = &stderr.writer });
+    var runtime: zavascript.Runtime = try .init(gpa, .{ .stdout = &stdout.writer, .stderr = &stderr.writer, .max_stack = thread_stack - 4 * 1024 * 1024 });
     defer runtime.deinit();
 
     var report: std.Io.Writer.Allocating = .init(arena);
@@ -89,6 +89,10 @@ fn runCase(gpa: std.mem.Allocator, arena: std.mem.Allocator, path: []const u8, s
             }
             try w.writeAll("\n");
             try runtime.diagnostics.render(w);
+            return .{ .fail = report.written() };
+        },
+        error.RuntimeError => {
+            try w.print("threw: {f}\n", .{runtime.exception().?});
             return .{ .fail = report.written() };
         },
         else => return err,
@@ -146,7 +150,21 @@ fn diffLines(w: *std.Io.Writer, expected: []const u8, actual: []const u8) !void 
     }
 }
 
+/// Cases run on a thread with a big stack, like the CLI's, so deep recursion works the same.
+const thread_stack = 64 * 1024 * 1024;
+
 pub fn main(init: std.process.Init) !void {
+    var result: anyerror!void = {};
+    const thread = try std.Thread.spawn(.{ .stack_size = thread_stack }, struct {
+        fn run(i: std.process.Init, out: *anyerror!void) void {
+            out.* = mainThread(i);
+        }
+    }.run, .{ init, &result });
+    thread.join();
+    return result;
+}
+
+fn mainThread(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
     const arena = init.arena.allocator();

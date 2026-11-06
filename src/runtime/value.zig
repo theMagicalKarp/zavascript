@@ -3,6 +3,8 @@
 
 const std = @import("std");
 const number = @import("number.zig");
+const ast = @import("../syntax/ast.zig");
+const Interpreter = @import("Interpreter.zig");
 
 pub const Value = union(enum) {
     undefined,
@@ -13,6 +15,11 @@ pub const Value = union(enum) {
     string: []const u8,
     object: *Object,
     native_function: *const NativeFunction,
+    function: *const Closure,
+    array: *Array,
+    /// What a `let` or `const` holds before its declaration runs (its temporal dead zone).
+    /// Reading it is a ReferenceError, so it never gets any further.
+    uninitialized,
 
     pub fn typeOf(this: Value) []const u8 {
         return switch (this) {
@@ -21,8 +28,16 @@ pub const Value = union(enum) {
             .boolean => "boolean",
             .number => "number",
             .string => "string",
-            .object => "object",
-            .native_function => "function",
+            .object, .array => "object",
+            .native_function, .function => "function",
+            .uninitialized => unreachable,
+        };
+    }
+
+    fn isObject(this: Value) bool {
+        return switch (this) {
+            .object, .native_function, .function, .array => true,
+            else => false,
         };
     }
 
@@ -33,28 +48,49 @@ pub const Value = union(enum) {
             .boolean => |b| b,
             .number => |n| !(n == 0 or std.math.isNan(n)),
             .string => |s| s.len > 0,
-            .object, .native_function => true,
+            .object, .native_function, .function, .array => true,
+            .uninitialized => unreachable,
         };
     }
 
-    /// ToNumber (§7.1.4) for primitives. Objects are first converted with `toPrimitive`.
-    pub fn toNumber(this: Value) f64 {
+    /// ToNumber (§7.1.4).
+    pub inline fn toNumber(this: Value) f64 {
         return switch (this) {
             .undefined => std.math.nan(f64),
             .null => 0,
             .boolean => |b| if (b) 1 else 0,
             .number => |n| n,
             .string => |s| number.parseString(s),
-            .object, .native_function => toPrimitive(this).toNumber(),
+            // Their string forms never parse as numbers.
+            .object, .native_function, .function => std.math.nan(f64),
+            .array => |a| arrayToNumber(a),
+            .uninitialized => unreachable,
+        };
+    }
+
+    /// An array's string form joins its elements with commas, so it's a number only with a single
+    /// element (`+[5]`) or none (`+[]` is 0).
+    noinline fn arrayToNumber(a: *const Array) f64 {
+        return switch (a.items.len) {
+            0 => 0,
+            1 => switch (a.items[0]) {
+                .undefined, .null => 0,
+                // Through `String()` and back, which makes -0 into 0.
+                .number => |n| if (n == 0) 0 else n,
+                else => |v| v.toNumber(),
+            },
+            else => std.math.nan(f64),
         };
     }
 
     /// ToPrimitive (§7.1.1). There are no user-defined `valueOf`/`toString` methods yet, so every
     /// object becomes its default string.
-    pub fn toPrimitive(this: Value) Value {
+    pub fn toPrimitive(this: Value, allocator: std.mem.Allocator) error{OutOfMemory}!Value {
         return switch (this) {
             .object => .{ .string = "[object Object]" },
             .native_function => |f| .{ .string = f.source },
+            .function => |f| .{ .string = try f.sourceText(allocator) },
+            .array => |a| .{ .string = try a.join(allocator) },
             else => this,
         };
     }
@@ -67,7 +103,8 @@ pub const Value = union(enum) {
             .boolean => |b| if (b) "true" else "false",
             .number => |n| number.toString(allocator, n),
             .string => |s| s,
-            .object, .native_function => toPrimitive(this).toString(allocator),
+            .object, .native_function, .function, .array => (try this.toPrimitive(allocator)).toString(allocator),
+            .uninitialized => unreachable,
         };
     }
 
@@ -81,11 +118,14 @@ pub const Value = union(enum) {
             .string => |x| b == .string and std.mem.eql(u8, x, b.string),
             .object => |x| b == .object and b.object == x,
             .native_function => |x| b == .native_function and b.native_function == x,
+            .function => |x| b == .function and b.function == x,
+            .array => |x| b == .array and b.array == x,
+            .uninitialized => unreachable,
         };
     }
 
     /// IsLooselyEqual (`==`, §7.2.14).
-    pub fn looseEquals(a: Value, b: Value) bool {
+    pub fn looseEquals(a: Value, b: Value, allocator: std.mem.Allocator) error{OutOfMemory}!bool {
         const a_nullish = a == .undefined or a == .null;
         const b_nullish = b == .undefined or b == .null;
         if (a_nullish or b_nullish) {
@@ -94,16 +134,16 @@ pub const Value = union(enum) {
         if (std.meta.activeTag(a) == std.meta.activeTag(b)) {
             return strictEquals(a, b);
         }
-        const a_object = a == .object or a == .native_function;
-        const b_object = b == .object or b == .native_function;
+        const a_object = a.isObject();
+        const b_object = b.isObject();
         if (a_object and b_object) {
             return false;
         }
         if (a_object) {
-            return looseEquals(toPrimitive(a), b);
+            return looseEquals(try a.toPrimitive(allocator), b, allocator);
         }
         if (b_object) {
-            return looseEquals(a, toPrimitive(b));
+            return looseEquals(a, try b.toPrimitive(allocator), allocator);
         }
         // Different primitive types: compare as numbers.
         return a.toNumber() == b.toNumber();
@@ -118,6 +158,60 @@ pub const Object = struct {
 
     pub fn get(this: *const Object, name: []const u8) Value {
         return this.properties.get(name) orelse .undefined;
+    }
+};
+
+/// The variables of one scope that closures capture. See `Checker.Ref.env`.
+pub const Env = struct {
+    parent: ?*Env,
+    values: []Value,
+};
+
+/// A function value: a function from the source, with the environment it was created in.
+pub const Closure = struct {
+    function: *const ast.Function,
+    env: ?*Env,
+    /// The program it's from, whose tables its body's references index.
+    program: *const Interpreter.Program,
+
+    pub fn name(this: *const Closure) []const u8 {
+        return this.function.inferred_name;
+    }
+
+    /// What `String(f)` gives: the function's source, with type annotations replaced by spaces
+    /// the way node strips types.
+    pub fn sourceText(this: *const Closure, allocator: std.mem.Allocator) error{OutOfMemory}![]const u8 {
+        const f = this.function;
+        const text = try allocator.dupe(u8, this.program.text[f.start..f.end]);
+        for (this.program.ast.type_spans) |span| {
+            if (span.start >= f.start and span.end <= f.end) {
+                for (text[span.start - f.start .. span.end - f.start]) |*c| {
+                    if (c.* != '\n' and c.* != '\r') {
+                        c.* = ' ';
+                    }
+                }
+            }
+        }
+        return text;
+    }
+};
+
+pub const Array = struct {
+    items: []Value,
+
+    /// Array.prototype.join with `,`, which is also what `String(array)` gives.
+    pub fn join(this: *const Array, allocator: std.mem.Allocator) error{OutOfMemory}![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        for (this.items, 0..) |item, i| {
+            if (i > 0) {
+                try out.append(allocator, ',');
+            }
+            switch (item) {
+                .undefined, .null => {},
+                else => try out.appendSlice(allocator, try item.toString(allocator)),
+            }
+        }
+        return out.toOwnedSlice(allocator);
     }
 };
 
@@ -200,7 +294,14 @@ pub fn exponentiate(base: f64, exponent: f64) f64 {
 
 // Formatting like node's `util.inspect`, used by `console.log` and the REPL.
 
-pub fn inspect(writer: *std.Io.Writer, value: Value) std.Io.Writer.Error!void {
+pub const InspectError = error{
+    WriteFailed,
+    OutOfMemory,
+    /// Something node formats in a way that isn't implemented yet, like an array of arrays.
+    Unsupported,
+};
+
+pub fn inspect(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: Value) InspectError!void {
     switch (value) {
         .undefined => try writer.writeAll("undefined"),
         .null => try writer.writeAll("null"),
@@ -209,6 +310,11 @@ pub fn inspect(writer: *std.Io.Writer, value: Value) std.Io.Writer.Error!void {
         .number => |n| if (n == 0 and std.math.signbit(n)) try writer.writeAll("-0") else try number.format(writer, n),
         .string => |s| try quoteString(writer, s),
         .native_function => |f| try writer.print("[Function: {s}]", .{f.name}),
+        .function => |f| if (f.name().len == 0)
+            try writer.writeAll("[Function (anonymous)]")
+        else
+            try writer.print("[Function: {s}]", .{f.name()}),
+        .array => |a| try inspectArray(allocator, writer, a),
         .object => |o| {
             if (o.tag) |tag| {
                 try writer.print("{s} ", .{tag});
@@ -225,11 +331,152 @@ pub fn inspect(writer: *std.Io.Writer, value: Value) std.Io.Writer.Error!void {
                 }
                 first = false;
                 try writer.print("{s}: ", .{entry.key_ptr.*});
-                try inspect(writer, entry.value_ptr.*);
+                try inspect(allocator, writer, entry.value_ptr.*);
             }
             try writer.writeAll(" }");
         },
+        .uninitialized => unreachable,
     }
+}
+
+/// Node's `formatList` for an array of primitives and functions at the top level: on one line if
+/// it fits in 80 columns, otherwise one entry per line, or in columns (`groupArrayElements`) when
+/// there are more than six.
+fn inspectArray(allocator: std.mem.Allocator, writer: *std.Io.Writer, array: *const Array) InspectError!void {
+    if (array.items.len == 0) {
+        return writer.writeAll("[]");
+    }
+    const max_length = 100;
+    const shown = @min(array.items.len, max_length);
+    var entries: std.ArrayList([]const u8) = .empty;
+    for (array.items[0..shown]) |item| {
+        switch (item) {
+            .array, .object => return error.Unsupported,
+            // Node splits long strings over several lines.
+            .string => |s| if (jsLength(s) > 76) return error.Unsupported,
+            else => {},
+        }
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        inspect(allocator, &out.writer, item) catch |err| switch (err) {
+            error.WriteFailed => return error.OutOfMemory,
+            else => |e| return e,
+        };
+        try entries.append(allocator, out.written());
+    }
+    if (array.items.len > max_length) {
+        const more = array.items.len - max_length;
+        try entries.append(allocator, try std.fmt.allocPrint(allocator, "... {d} more item{s}", .{ more, if (more > 1) "s" else "" }));
+    }
+    var output: []const []const u8 = entries.items;
+    if (entries.items.len > 6) {
+        output = try groupArrayElements(allocator, entries.items, array.items.len > max_length, array.items[0..shown]);
+    }
+    if (output.len == entries.items.len) {
+        // `isBelowBreakLength`, with `start` for the `[` and the `10` node adds.
+        var total = output.len + (output.len + 1 + 10);
+        for (output) |entry| {
+            total += jsLength(entry);
+        }
+        if (total <= 80) {
+            try writer.writeAll("[ ");
+            for (output, 0..) |entry, i| {
+                if (i > 0) {
+                    try writer.writeAll(", ");
+                }
+                try writer.writeAll(entry);
+            }
+            return writer.writeAll(" ]");
+        }
+    }
+    try writer.writeAll("[\n  ");
+    for (output, 0..) |entry, i| {
+        if (i > 0) {
+            try writer.writeAll(",\n  ");
+        }
+        try writer.writeAll(entry);
+    }
+    try writer.writeAll("\n]");
+}
+
+/// Node's `groupArrayElements`: lays short entries out in aligned columns, numbers padded on
+/// the left and anything else on the right.
+fn groupArrayElements(allocator: std.mem.Allocator, output: []const []const u8, has_more: bool, values: []const Value) error{OutOfMemory}![]const []const u8 {
+    const break_length = 80;
+    const separator_space = 2;
+    const output_length = if (has_more) output.len - 1 else output.len;
+    const data_len = try allocator.alloc(usize, output_length);
+    var total_length: usize = 0;
+    var max_length: usize = 0;
+    for (output[0..output_length], data_len) |entry, *len| {
+        len.* = jsLength(entry);
+        total_length += len.* + separator_space;
+        max_length = @max(max_length, len.*);
+    }
+    const actual_max = max_length + separator_space;
+    const total: f64 = @floatFromInt(total_length);
+    const actual: f64 = @floatFromInt(actual_max);
+    if (!(actual_max * 3 < break_length and (total / actual > 5 or max_length <= 6))) {
+        return output;
+    }
+    const average_bias = @sqrt(actual - total / @as(f64, @floatFromInt(output.len)));
+    const biased_max = @max(actual - 3 - average_bias, 1);
+    const columns: usize = @intFromFloat(@min(
+        @min(@round(@sqrt(2.5 * biased_max * @as(f64, @floatFromInt(output_length))) / biased_max), @floor(@as(f64, break_length) / actual)),
+        @min(3 * 4, 15),
+    ));
+    if (columns <= 1) {
+        return output;
+    }
+    const max_line_length = try allocator.alloc(usize, columns);
+    for (max_line_length, 0..) |*line_length, i| {
+        line_length.* = 0;
+        var j = i;
+        while (j < output_length) : (j += columns) {
+            line_length.* = @max(line_length.*, data_len[j]);
+        }
+        line_length.* += separator_space;
+    }
+    const pad_start = for (values) |v| {
+        if (v != .number) {
+            break false;
+        }
+    } else true;
+    var rows: std.ArrayList([]const u8) = .empty;
+    var i: usize = 0;
+    while (i < output_length) : (i += columns) {
+        const end = @min(i + columns, output_length);
+        var row: std.ArrayList(u8) = .empty;
+        for (i..end) |j| {
+            const last = j == end - 1;
+            const cell = if (last) output[j] else try std.fmt.allocPrint(allocator, "{s}, ", .{output[j]});
+            const width = if (last and pad_start) max_line_length[j - i] - separator_space else if (last) 0 else max_line_length[j - i];
+            const padding = width -| jsLength(cell);
+            if (pad_start) {
+                try row.appendNTimes(allocator, ' ', padding);
+                try row.appendSlice(allocator, cell);
+            } else {
+                try row.appendSlice(allocator, cell);
+                try row.appendNTimes(allocator, ' ', padding);
+            }
+        }
+        try rows.append(allocator, row.items);
+    }
+    if (has_more) {
+        try rows.append(allocator, output[output_length]);
+    }
+    return rows.items;
+}
+
+/// The length of a string in UTF-16 code units, which is what node measures.
+fn jsLength(s: []const u8) usize {
+    var length: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        length += if (len == 4) 2 else 1;
+        i += len;
+    }
+    return length;
 }
 
 /// Quotes like node: single quotes unless the string contains them, then double quotes, then
@@ -274,11 +521,12 @@ test "conversions" {
 test "equality" {
     const null_value: Value = .null;
     const undefined_value: Value = .undefined;
-    try testing.expect(null_value.looseEquals(undefined_value));
+    const a = testing.allocator;
+    try testing.expect(try null_value.looseEquals(undefined_value, a));
     try testing.expect(!null_value.strictEquals(undefined_value));
-    try testing.expect((Value{ .number = 1 }).looseEquals(.{ .string = "1" }));
-    try testing.expect((Value{ .boolean = true }).looseEquals(.{ .number = 1 }));
-    try testing.expect(!(Value{ .number = 0 }).looseEquals(.null));
+    try testing.expect(try (Value{ .number = 1 }).looseEquals(.{ .string = "1" }, a));
+    try testing.expect(try (Value{ .boolean = true }).looseEquals(.{ .number = 1 }, a));
+    try testing.expect(!try (Value{ .number = 0 }).looseEquals(.null, a));
     const nan: Value = .{ .number = std.math.nan(f64) };
     try testing.expect(!nan.strictEquals(nan));
 }
@@ -317,7 +565,29 @@ test inspect {
     };
     for (cases) |case| {
         var writer: std.Io.Writer = .fixed(&buffer);
-        try inspect(&writer, case[0]);
+        try inspect(testing.allocator, &writer, case[0]);
         try testing.expectEqualStrings(case[1], writer.buffered());
+    }
+}
+
+test "inspect arrays" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_]struct { []const f64, []const u8 }{
+        .{ &.{}, "[]" },
+        .{ &.{ 1, 2, 3, 4, 5, 6 }, "[ 1, 2, 3, 4, 5, 6 ]" },
+        .{ &.{ 1, 2, 3, 4, 5, 6, 7 }, "[\n  1, 2, 3, 4,\n  5, 6, 7\n]" },
+        .{ &.{ 100000, 2, 3333, 4, 5, 6, 7777777, 8, 9 }, "[ 100000, 2, 3333, 4, 5, 6, 7777777, 8, 9 ]" },
+    };
+    for (cases) |case| {
+        const items = try a.alloc(Value, case[0].len);
+        for (items, case[0]) |*item, n| {
+            item.* = .{ .number = n };
+        }
+        var array: Array = .{ .items = items };
+        var out: std.Io.Writer.Allocating = .init(a);
+        try inspect(a, &out.writer, .{ .array = &array });
+        try testing.expectEqualStrings(case[1], out.written());
     }
 }
