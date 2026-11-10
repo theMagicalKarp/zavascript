@@ -3,6 +3,9 @@ zig = "0.17.0"
 node = "24.22.2"
 "npm:typescript" = "6.0.3"
 
+[env]
+ZIG_OPTIMIZE = "fast"
+
 [tasks.build]
 description = "Build the project"
 run = "zig build -Doptimize=${ZIG_OPTIMIZE:-Debug}"
