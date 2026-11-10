@@ -23,6 +23,8 @@ pub const Type = union(enum) {
     function: *const Function,
     /// `T[]`, with the element type.
     array: *const Type,
+    /// `[T, U]`, with the element types.
+    tuple: []const *const Type,
 
     pub const Literal = struct {
         value: Value,
@@ -49,9 +51,14 @@ pub const Type = union(enum) {
                     break false;
                 }
             } else true,
-            .object => |o| b.* == .object and b.object == o,
+            .object => |o| b.* == .object and (b.object == o or o.eql(b.object)),
             .function => |f| b.* == .function and (b.function == f or f.eql(b.function)),
             .array => |e| b.* == .array and e.eql(b.array),
+            .tuple => |es| b.* == .tuple and es.len == b.tuple.len and for (es, b.tuple) |x, y| {
+                if (!x.eql(y)) {
+                    break false;
+                }
+            } else true,
             else => std.meta.activeTag(a.*) == std.meta.activeTag(b.*),
         };
     }
@@ -90,11 +97,18 @@ pub const Type = union(enum) {
                 }
                 try m.formatParenthesized(writer, m.* == .function);
             },
-            .object => |o| try writer.writeAll(o.name),
+            .object => |o| try o.format(writer),
             .function => |f| try f.format(writer),
             .array => |e| {
                 try e.formatParenthesized(writer, e.* == .function or e.* == .@"union");
                 try writer.writeAll("[]");
+            },
+            .tuple => |es| {
+                try writer.writeAll("[");
+                for (es, 0..) |e, i| {
+                    try writer.print("{s}{f}", .{ if (i > 0) ", " else "", e });
+                }
+                try writer.writeAll("]");
             },
             else => try writer.writeAll(@tagName(this.*)),
         }
@@ -119,21 +133,74 @@ fn literalEql(a: Type.Literal.Value, b: Type.Literal.Value) bool {
 
 pub const Property = struct {
     name: []const u8,
+    /// For an optional property, this includes `undefined`.
     type: *const Type,
+    optional: bool = false,
+    readonly: bool = false,
+    /// Declared as a method (`m(): void`), which only changes how it's shown.
+    method: bool = false,
+
+    fn eql(a: Property, b: Property) bool {
+        return std.mem.eql(u8, a.name, b.name) and a.optional == b.optional and a.readonly == b.readonly and a.method == b.method and a.type.eql(b.type);
+    }
 };
 
+/// An object type: an interface, a type alias's object type, or an anonymous one like
+/// `{ a: number }` or an object literal's.
 pub const Object = struct {
-    /// Shown in diagnostics, e.g. `Console`.
-    name: []const u8,
+    /// Shown in diagnostics, e.g. `Console`. Empty for an anonymous object type, which is shown
+    /// by its members and compared structurally; a named one is only equal to itself.
+    name: []const u8 = "",
     properties: []const Property,
 
     pub fn property(this: *const Object, name: []const u8) ?*const Type {
-        for (this.properties) |p| {
+        const p = this.find(name) orelse return null;
+        return p.type;
+    }
+
+    pub fn find(this: *const Object, name: []const u8) ?*const Property {
+        for (this.properties) |*p| {
             if (std.mem.eql(u8, p.name, name)) {
-                return p.type;
+                return p;
             }
         }
         return null;
+    }
+
+    fn eql(a: *const Object, b: *const Object) bool {
+        if (a.name.len > 0 or b.name.len > 0 or a.properties.len != b.properties.len) {
+            return false;
+        }
+        for (a.properties) |p| {
+            const q = b.find(p.name) orelse return false;
+            if (!p.eql(q.*)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    pub fn format(this: *const Object, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (this.name.len > 0) {
+            return writer.writeAll(this.name);
+        }
+        if (this.properties.len == 0) {
+            return writer.writeAll("{}");
+        }
+        try writer.writeAll("{ ");
+        for (this.properties) |p| {
+            if (p.readonly) {
+                try writer.writeAll("readonly ");
+            }
+            try writer.print("{s}{s}", .{ p.name, if (p.optional) "?" else "" });
+            if (p.method and p.type.* == .function) {
+                try p.type.function.formatParameters(writer);
+                try writer.print(": {f}; ", .{p.type.function.returns});
+            } else {
+                try writer.print(": {f}; ", .{p.type});
+            }
+        }
+        try writer.writeAll("}");
     }
 };
 
@@ -192,6 +259,11 @@ pub const Function = struct {
     }
 
     pub fn format(this: *const Function, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try this.formatParameters(writer);
+        try writer.print(" => {f}", .{this.returns});
+    }
+
+    fn formatParameters(this: *const Function, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.writeAll("(");
         for (this.parameters, 0..) |p, i| {
             if (i > 0) {
@@ -205,7 +277,7 @@ pub const Function = struct {
             }
             try writer.print("...{s}: {f}", .{ r.name, r.type });
         }
-        try writer.print(") => {f}", .{this.returns});
+        try writer.writeAll(")");
     }
 };
 
@@ -362,7 +434,7 @@ fn printRank(t: *const Type) u8 {
             else => 5,
         },
         .void => 6,
-        .object, .function, .array => 7,
+        .object, .function, .array, .tuple => 7,
         .null => 8,
         .undefined => 9,
         .any, .unknown, .never, .@"union" => 10,
@@ -449,16 +521,24 @@ fn overlaps(x: *const Type, y: *const Type) bool {
     if (x.* == .literal and y.* == .literal) {
         return literalEql(x.literal.value, y.literal.value);
     }
-    if (x.* == .object and y.* == .object) {
-        return x.object == y.object;
-    }
     if (x.* == .function and y.* == .function) {
         return true;
     }
     if (x.* == .array and y.* == .array) {
         return comparable(x.array, y.array);
     }
+    if (isObjectLike(x) and isObjectLike(y)) {
+        // tsc's comparable relation holds when either side is assignable to the other.
+        return assignable(x, y) or assignable(y, x);
+    }
     return primitiveKind(x) != .other and primitiveKind(x) == primitiveKind(y);
+}
+
+fn isObjectLike(t: *const Type) bool {
+    return switch (t.*) {
+        .object, .function, .array, .tuple => true,
+        else => false,
+    };
 }
 
 fn isNullish(t: *const Type) bool {
@@ -507,6 +587,29 @@ fn allOfKind(t: *const Type, kind: Kind) bool {
 
 /// Whether a value of type `source` can be used where `target` is expected.
 pub fn assignable(source: *const Type, target: *const Type) bool {
+    return assignableIn(source, target, null);
+}
+
+/// Pairs of types being related further up, which are assumed to be related, so that recursive
+/// types like `interface List { next?: List }` terminate (tsc's "maybe" stack).
+pub const Assumption = struct {
+    source: *const Type,
+    target: *const Object,
+    parent: ?*const Assumption,
+    depth: u32,
+
+    fn holds(this: ?*const Assumption, source: *const Type, target: *const Object) bool {
+        var a = this;
+        while (a) |x| : (a = x.parent) {
+            if (x.source == source and x.target == target) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+fn assignableIn(source: *const Type, target: *const Type, assumed: ?*const Assumption) bool {
     if (source.eql(target)) {
         return true;
     }
@@ -515,18 +618,18 @@ pub fn assignable(source: *const Type, target: *const Type) bool {
     }
     if (source.* == .@"union") {
         for (source.@"union") |m| {
-            if (!assignable(m, target)) {
+            if (!assignableIn(m, target, assumed)) {
                 return false;
             }
         }
         return true;
     }
     if (source.* == .boolean) {
-        return assignable(@"true", target) and assignable(@"false", target);
+        return assignableIn(@"true", target, assumed) and assignableIn(@"false", target, assumed);
     }
     if (target.* == .@"union") {
         for (target.@"union") |m| {
-            if (assignable(source, m)) {
+            if (assignableIn(source, m, assumed)) {
                 return true;
             }
         }
@@ -537,10 +640,108 @@ pub fn assignable(source: *const Type, target: *const Type) bool {
         .string => isStringLike(source),
         .boolean => source.* == .literal and source.literal.value == .boolean,
         .void => source.* == .undefined,
-        .array => |element| source.* == .array and assignable(source.array, element),
-        .function => |f| source.* == .function and functionAssignable(source.function, f),
+        .array => |element| switch (source.*) {
+            .array => |e| assignableIn(e, element, assumed),
+            .tuple => |es| for (es) |e| {
+                if (!assignableIn(e, element, assumed)) {
+                    break false;
+                }
+            } else true,
+            else => false,
+        },
+        .tuple => |ts| source.* == .tuple and source.tuple.len == ts.len and for (source.tuple, ts) |s, t| {
+            if (!assignableIn(s, t, assumed)) {
+                break false;
+            }
+        } else true,
+        .function => |f| source.* == .function and functionMismatchIn(source.function, f, assumed) == null,
+        .object => |o| objectMismatch(source, o, assumed) == null,
         else => false,
     };
+}
+
+/// Why `source` isn't assignable to the object type `target`, for tsc's elaborations, or null if
+/// it is.
+pub const ObjectMismatch = union(enum) {
+    /// `null`, `undefined` or another type that can't be an object.
+    not_object,
+    /// It lacks required properties; see `missingProperties`.
+    missing,
+    /// The property is optional in `source` but required in `target`.
+    optional: []const u8,
+    /// The types of this property don't match.
+    property: []const u8,
+};
+
+pub fn objectMismatch(source: *const Type, target: *const Object, assumed: ?*const Assumption) ?ObjectMismatch {
+    switch (source.*) {
+        .null, .undefined, .void, .unknown => return .not_object,
+        .object => |s| {
+            if (s == target or Assumption.holds(assumed, source, target)) {
+                return null;
+            }
+            for (target.properties) |p| {
+                if (!p.optional and s.find(p.name) == null) {
+                    return .missing;
+                }
+            }
+            const depth = if (assumed) |a| a.depth + 1 else 0;
+            if (depth > 64) {
+                return null;
+            }
+            const link: Assumption = .{ .source = source, .target = target, .parent = assumed, .depth = depth };
+            for (target.properties) |p| {
+                const sp = s.find(p.name) orelse continue;
+                if (!assignableIn(sp.type, p.type, &link)) {
+                    return .{ .property = p.name };
+                }
+            }
+            for (target.properties) |p| {
+                const sp = s.find(p.name) orelse continue;
+                if (sp.optional and !p.optional) {
+                    return .{ .optional = p.name };
+                }
+            }
+            return null;
+        },
+        else => {
+            // Primitives, arrays and functions: of the properties they have, only `length` is
+            // known so far.
+            for (target.properties) |p| {
+                if (p.optional) {
+                    continue;
+                }
+                const has_length = source.* == .array or source.* == .tuple or source.* == .function;
+                if (!has_length or !std.mem.eql(u8, p.name, "length")) {
+                    return .missing;
+                }
+                const length: Type = if (source.* == .tuple) .{ .literal = .{ .value = .{ .number = @floatFromInt(source.tuple.len) } } } else .number;
+                if (!assignableIn(&length, p.type, assumed)) {
+                    return .{ .property = p.name };
+                }
+            }
+            return null;
+        },
+    }
+}
+
+/// The required properties of `target` that `source` lacks.
+pub fn missingProperties(arena: std.mem.Allocator, source: *const Type, target: *const Object) error{OutOfMemory}![]const []const u8 {
+    var missing: std.ArrayList([]const u8) = .empty;
+    for (target.properties) |p| {
+        if (p.optional) {
+            continue;
+        }
+        const has = switch (source.*) {
+            .object => |s| s.find(p.name) != null,
+            .array, .tuple, .function => std.mem.eql(u8, p.name, "length"),
+            else => false,
+        };
+        if (!has) {
+            try missing.append(arena, p.name);
+        }
+    }
+    return missing.items;
 }
 
 /// Whether a function of type `source` can be called the way `target` says it will be: with at
@@ -560,6 +761,10 @@ pub const FunctionMismatch = union(enum) {
 };
 
 pub fn functionMismatch(source: *const Function, target: *const Function) ?FunctionMismatch {
+    return functionMismatchIn(source, target, null);
+}
+
+fn functionMismatchIn(source: *const Function, target: *const Function, assumed: ?*const Assumption) ?FunctionMismatch {
     if (target.rest == null and source.minArguments() > target.parameters.len) {
         return .{ .arity = source.minArguments() };
     }
@@ -567,11 +772,11 @@ pub fn functionMismatch(source: *const Function, target: *const Function) ?Funct
     for (0..count) |i| {
         const s = source.parameterType(i) orelse continue;
         const t = target.parameterType(i) orelse continue;
-        if (!assignable(t, s)) {
+        if (!assignableIn(t, s, assumed)) {
             return .{ .parameter = i };
         }
     }
-    if (target.returns.* != .void and !assignable(source.returns, target.returns)) {
+    if (target.returns.* != .void and !assignableIn(source.returns, target.returns, assumed)) {
         return .returns;
     }
     return null;
@@ -587,6 +792,19 @@ pub fn includesUndefined(t: *const Type) bool {
         }
     }
     return false;
+}
+
+/// tsc's `isLiteralType`: a literal, `null`, `undefined`, `boolean`, or a union of those. Only
+/// such a source type is shown widened in "not assignable" messages.
+pub fn isLiteralType(t: *const Type) bool {
+    var buffer: [1]*const Type = undefined;
+    for (t.members(&buffer)) |m| {
+        switch (m.*) {
+            .literal, .null, .undefined, .boolean => {},
+            else => return false,
+        }
+    }
+    return true;
 }
 
 /// tsc's `typeCouldHaveTopLevelSingletonTypes`: when it's false, a literal source type is shown

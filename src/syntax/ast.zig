@@ -48,6 +48,10 @@ pub const Stmt = struct {
         @"continue": Jump,
         labeled: Labeled,
         @"switch": Switch,
+        /// `for (x of xs)` and `for (k in o)`.
+        for_each: ForEach,
+        interface: *const Interface,
+        type_alias: *const TypeAlias,
     };
 };
 
@@ -71,15 +75,94 @@ pub const Variable = struct {
 };
 
 pub const Declarator = struct {
+    /// The declared name; empty when `pattern` is set.
     name: []const u8,
-    /// Where the name starts.
+    /// Where the name (or the pattern) starts.
     start: u32,
     /// Where the declarator (including its initializer) ends. A reference before this point is a
     /// use before declaration (TS2448).
     end: u32,
-    /// Dense index among the program's declarations; see `Program.binding_count`.
+    /// Dense index among the program's declarations; see `Program.binding_count`. Unused when
+    /// `pattern` is set, since each name in the pattern has its own.
     binding: u32,
+    /// `const { a, b } = ...` or `const [a, b] = ...`.
+    pattern: ?*const Pattern = null,
     type: ?*const TypeNode,
+    init: ?*Expr,
+};
+
+/// A destructuring pattern, or a plain name inside one.
+pub const Pattern = struct {
+    start: u32,
+    data: Data,
+
+    pub const Data = union(enum) {
+        identifier: Binding,
+        object: ObjectPattern,
+        array: ArrayPattern,
+    };
+
+    /// Every name the pattern declares, in source order.
+    pub fn bindings(this: *const Pattern, arena: std.mem.Allocator) error{OutOfMemory}![]const Binding {
+        var list: std.ArrayList(Binding) = .empty;
+        try this.collect(arena, &list);
+        return list.items;
+    }
+
+    fn collect(this: *const Pattern, arena: std.mem.Allocator, list: *std.ArrayList(Binding)) error{OutOfMemory}!void {
+        switch (this.data) {
+            .identifier => |b| try list.append(arena, b),
+            .object => |o| {
+                for (o.properties) |p| {
+                    try p.value.collect(arena, list);
+                }
+                if (o.rest) |r| {
+                    try list.append(arena, r);
+                }
+            },
+            .array => |a| {
+                for (a.elements) |e| {
+                    if (e) |element| {
+                        try element.pattern.collect(arena, list);
+                    }
+                }
+                if (a.rest) |r| {
+                    try r.collect(arena, list);
+                }
+            },
+        }
+    }
+};
+
+pub const Binding = struct {
+    name: []const u8,
+    start: u32,
+    binding: u32,
+};
+
+/// `{ a, b: c = 1, ...rest }`
+pub const ObjectPattern = struct {
+    properties: []const PatternProperty,
+    rest: ?Binding,
+};
+
+pub const PatternProperty = struct {
+    key: []const u8,
+    key_start: u32,
+    value: *const Pattern,
+    /// The default value, for when the property is `undefined`.
+    init: ?*Expr,
+};
+
+/// `[a, , b = 1, ...rest]`
+pub const ArrayPattern = struct {
+    /// Null for a hole.
+    elements: []const ?PatternElement,
+    rest: ?*const Pattern,
+};
+
+pub const PatternElement = struct {
+    pattern: *const Pattern,
     init: ?*Expr,
 };
 
@@ -93,6 +176,23 @@ pub const If = struct {
 pub const Loop = struct {
     condition: *Expr,
     body: *Stmt,
+};
+
+/// `for (const x of xs) body`, `for (k in o) body`, and so on.
+pub const ForEach = struct {
+    /// `of` or `in`.
+    of: bool,
+    /// The scope of the variables the head declares.
+    scope: u32,
+    /// What each value is assigned to: a declaration, or an existing variable.
+    head: Head,
+    right: *Expr,
+    body: *Stmt,
+
+    pub const Head = union(enum) {
+        declaration: struct { kind: VariableKind, pattern: *const Pattern, end: u32 },
+        target: *Expr,
+    };
 };
 
 pub const For = struct {
@@ -129,8 +229,39 @@ pub const Clause = struct {
     statements: []const *Stmt,
 };
 
-/// A type annotation: a primitive keyword, an array or function type, or a name the checker
-/// rejects for now.
+/// `interface Name extends A, B { members }`
+pub const Interface = struct {
+    name: []const u8,
+    start: u32,
+    extends: []const TypeReference,
+    members: []const TypeMember,
+};
+
+/// `type Name = T;`
+pub const TypeAlias = struct {
+    name: []const u8,
+    start: u32,
+    type: *const TypeNode,
+};
+
+pub const TypeReference = struct {
+    name: []const u8,
+    start: u32,
+};
+
+/// A property or method in an interface or an object type.
+pub const TypeMember = struct {
+    name: []const u8,
+    start: u32,
+    optional: bool,
+    readonly: bool,
+    /// `m(a: T): R`, whose type is a function type.
+    method: bool,
+    /// Null for a property without a type, which is `any` (and TS7008).
+    type: ?*const TypeNode,
+};
+
+/// A type annotation: a primitive keyword, a name, an array, tuple, object or function type.
 pub const TypeNode = struct {
     start: u32,
     data: Data,
@@ -140,6 +271,10 @@ pub const TypeNode = struct {
         reference: []const u8,
         /// `T[]`
         array: *const TypeNode,
+        /// `[T, U]`
+        tuple: []const *const TypeNode,
+        /// `{ a: T; b?: U }`
+        object: []const TypeMember,
         /// `(a: T, b?: U, ...c: V[]) => R`
         function: FunctionType,
     };
@@ -149,7 +284,8 @@ pub const TypeNode = struct {
 
 pub const FunctionType = struct {
     parameters: []const TypeParameter,
-    returns: *const TypeNode,
+    /// Null only for a method signature without a return type, which returns `any` (TS7010).
+    returns: ?*const TypeNode,
 };
 
 /// A parameter of a function type, which only has a name and a type.
@@ -209,6 +345,7 @@ pub const Function = struct {
 };
 
 pub const Parameter = struct {
+    /// The name, or for a destructured parameter its source text.
     name: []const u8,
     /// Where the name is.
     start: u32,
@@ -217,7 +354,10 @@ pub const Parameter = struct {
     /// Where the parameter (including its default value) ends. A default value that refers to a
     /// parameter which ends after it is an error (TS2373).
     end: u32,
+    /// Unused when `pattern` is set.
     binding: u32,
+    /// `({ a, b }: T) => ...`
+    pattern: ?*const Pattern = null,
     type: ?*const TypeNode,
     init: ?*Expr,
     /// `a?: T`
@@ -245,6 +385,10 @@ pub const Expr = struct {
         conditional: Conditional,
         member: Member,
         call: Call,
+        /// `o[k]`
+        index: Index,
+        object: ObjectLiteral,
+        array: ArrayLiteral,
         function: *Function,
         /// Kept so that `(a ?? b) || c` can be told apart from `a ?? b || c`, which is an error, and
         /// so syntactic checks see through parentheses the way tsc does.
@@ -271,6 +415,7 @@ pub const UnaryOp = enum {
     bitwise_not,
     typeof,
     void,
+    delete,
 
     pub fn lexeme(this: UnaryOp) []const u8 {
         return switch (this) {
@@ -280,6 +425,7 @@ pub const UnaryOp = enum {
             .bitwise_not => "~",
             .typeof => "typeof",
             .void => "void",
+            .delete => "delete",
         };
     }
 };
@@ -329,6 +475,8 @@ pub const BinaryOp = enum {
     logical_and,
     logical_or,
     nullish,
+    /// `key in object`
+    in,
     /// The comma operator.
     comma,
 
@@ -357,6 +505,7 @@ pub const BinaryOp = enum {
             .logical_and => "&&",
             .logical_or => "||",
             .nullish => "??",
+            .in => "in",
             .comma => ",",
         };
     }
@@ -399,6 +548,49 @@ pub const Member = struct {
 pub const Call = struct {
     callee: *Expr,
     arguments: []const *Expr,
+};
+
+pub const Index = struct {
+    object: *Expr,
+    index: *Expr,
+};
+
+/// `{ a: 1, b, [k]: 2, ...o, m() {} }`
+pub const ObjectLiteral = struct {
+    properties: []const ObjectProperty,
+};
+
+pub const ObjectProperty = union(enum) {
+    /// `key: value`, a shorthand `key` (whose value is an identifier), or a method (whose value
+    /// is a function).
+    property: struct {
+        key: PropertyKey,
+        key_start: u32,
+        value: *Expr,
+        method: bool = false,
+    },
+    spread: struct {
+        /// Where the `...` is.
+        start: u32,
+        expr: *Expr,
+    },
+};
+
+pub const PropertyKey = union(enum) {
+    /// An identifier, string or number key, as the property name it gives.
+    name: []const u8,
+    /// `[expression]`
+    computed: *Expr,
+};
+
+/// `[a, ...b, c]`
+pub const ArrayLiteral = struct {
+    elements: []const ArrayElement,
+};
+
+pub const ArrayElement = union(enum) {
+    expr: *Expr,
+    spread: *Expr,
 };
 
 /// The expression with any parentheses around it removed.

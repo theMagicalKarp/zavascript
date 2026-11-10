@@ -18,15 +18,20 @@ $ echo 'console.log("a" * 2)' | zavascript
 ```
 
 > [!NOTE]
-> zavascript is early. Today it runs `let` and `const` (with primitive, array
-> and function type annotations), every operator including assignment, `if`,
-> the loops, `switch`, labeled `break`/`continue`, functions (declarations,
-> expressions and arrows, with closures, default, optional and rest
-> parameters, and recursion), and `console.log`. The checker covers tsc's
-> definite assignment, narrowing by assignment and truthiness, argument and
-> return types, return type inference and contextual typing of arrow
-> parameters. Objects, arrays and the rest are coming. Anything not supported
-> yet is a compile error (`ZV9001`), never a silent misbehavior.
+> zavascript is early. Today it runs `let` and `const`, every operator
+> including assignment, `in` and `delete`, `if`, the loops (including
+> `for...of` over arrays and `for...in`), `switch`, labeled
+> `break`/`continue`, functions (declarations, expressions and arrows, with
+> closures, default, optional and rest parameters, and recursion), object and
+> array literals (with shorthand, computed keys, methods and spread),
+> destructuring with defaults and rest in declarations and parameters, and
+> `console.log`, which prints nested values the way node does. The checker
+> covers primitive, array, tuple, object and function types, interfaces
+> (with `extends`) and type aliases, optional and `readonly` properties,
+> structural assignability with tsc's excess and missing property checks,
+> definite assignment, narrowing by assignment and truthiness, and contextual
+> typing. Unions, generics, classes and the builtins are coming. Anything not
+> supported yet is a compile error (`ZV9001`), never a silent misbehavior.
 
 ## Usage
 
