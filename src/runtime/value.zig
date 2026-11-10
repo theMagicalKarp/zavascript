@@ -71,9 +71,9 @@ pub const Value = union(enum) {
     /// An array's string form joins its elements with commas, so it's a number only with a single
     /// element (`+[5]`) or none (`+[]` is 0).
     noinline fn arrayToNumber(a: *const Array) f64 {
-        return switch (a.items.len) {
+        return switch (a.items().len) {
             0 => 0,
-            1 => switch (a.items[0]) {
+            1 => switch (a.items()[0]) {
                 .undefined, .null => 0,
                 // Through `String()` and back, which makes -0 into 0.
                 .number => |n| if (n == 0) 0 else n,
@@ -151,7 +151,7 @@ pub const Value = union(enum) {
 };
 
 pub const Object = struct {
-    /// Property names in insertion order, which is the order `console.log` prints them in.
+    /// Properties in the order they were created.
     properties: std.StringArrayHashMapUnmanaged(Value) = .empty,
     /// Shown by `console.log`, e.g. `Object [console]`; null for plain objects.
     tag: ?[]const u8 = null,
@@ -159,7 +159,54 @@ pub const Object = struct {
     pub fn get(this: *const Object, name: []const u8) Value {
         return this.properties.get(name) orelse .undefined;
     }
+
+    /// OrdinaryOwnPropertyKeys (§10.1.11.1): array indices in ascending order, then the other
+    /// names in the order they were created. This is the order `for...in`, spread and
+    /// `console.log` see.
+    pub fn keys(this: *const Object, allocator: std.mem.Allocator) error{OutOfMemory}![]const []const u8 {
+        const all = this.properties.keys();
+        var indices: std.ArrayList(Index) = .empty;
+        for (all) |key| {
+            if (arrayIndex(key)) |i| {
+                try indices.append(allocator, .{ .index = i, .key = key });
+            }
+        }
+        if (indices.items.len == 0) {
+            return all;
+        }
+        std.mem.sort(Index, indices.items, {}, Index.lessThan);
+        const ordered = try allocator.alloc([]const u8, all.len);
+        for (indices.items, 0..) |entry, i| {
+            ordered[i] = entry.key;
+        }
+        var n = indices.items.len;
+        for (all) |key| {
+            if (arrayIndex(key) == null) {
+                ordered[n] = key;
+                n += 1;
+            }
+        }
+        return ordered;
+    }
+
+    const Index = struct {
+        index: u32,
+        key: []const u8,
+
+        fn lessThan(_: void, a: Index, b: Index) bool {
+            return a.index < b.index;
+        }
+    };
 };
+
+/// `key` as an array index (CanonicalNumericIndexString below 2^32 - 1), if it's one.
+pub fn arrayIndex(key: []const u8) ?u32 {
+    if (key.len == 0 or key.len > 10 or (key.len > 1 and key[0] == '0')) {
+        return null;
+    }
+    const n = std.fmt.parseInt(u32, key, 10) catch return null;
+    return if (n == std.math.maxInt(u32)) null else n;
+}
 
 /// The variables of one scope that closures capture. See `Checker.Ref.env`.
 pub const Env = struct {
@@ -173,9 +220,11 @@ pub const Closure = struct {
     env: ?*Env,
     /// The program it's from, whose tables its body's references index.
     program: *const Interpreter.Program,
+    /// The name it was given at runtime, as by a computed property key, if any.
+    given_name: ?[]const u8 = null,
 
     pub fn name(this: *const Closure) []const u8 {
-        return this.function.inferred_name;
+        return this.given_name orelse this.function.inferred_name;
     }
 
     /// What `String(f)` gives: the function's source, with type annotations replaced by spaces
@@ -197,12 +246,16 @@ pub const Closure = struct {
 };
 
 pub const Array = struct {
-    items: []Value,
+    elements: std.ArrayList(Value),
+
+    pub fn items(this: *const Array) []Value {
+        return this.elements.items;
+    }
 
     /// Array.prototype.join with `,`, which is also what `String(array)` gives.
     pub fn join(this: *const Array, allocator: std.mem.Allocator) error{OutOfMemory}![]const u8 {
         var out: std.ArrayList(u8) = .empty;
-        for (this.items, 0..) |item, i| {
+        for (this.items(), 0..) |item, i| {
             if (i > 0) {
                 try out.append(allocator, ',');
             }
@@ -294,177 +347,276 @@ pub fn exponentiate(base: f64, exponent: f64) f64 {
 
 // Formatting like node's `util.inspect`, used by `console.log` and the REPL.
 
-pub const InspectError = error{
-    WriteFailed,
-    OutOfMemory,
-    /// Something node formats in a way that isn't implemented yet, like an array of arrays.
-    Unsupported,
-};
+pub const InspectError = error{ WriteFailed, OutOfMemory };
 
 pub fn inspect(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: Value) InspectError!void {
-    switch (value) {
-        .undefined => try writer.writeAll("undefined"),
-        .null => try writer.writeAll("null"),
-        .boolean => |b| try writer.writeAll(if (b) "true" else "false"),
-        // `util.inspect` shows the sign of zero, unlike `String(-0)`.
-        .number => |n| if (n == 0 and std.math.signbit(n)) try writer.writeAll("-0") else try number.format(writer, n),
-        .string => |s| try quoteString(writer, s),
-        .native_function => |f| try writer.print("[Function: {s}]", .{f.name}),
-        .function => |f| if (f.name().len == 0)
-            try writer.writeAll("[Function (anonymous)]")
-        else
-            try writer.print("[Function: {s}]", .{f.name()}),
-        .array => |a| try inspectArray(allocator, writer, a),
-        .object => |o| {
-            if (o.tag) |tag| {
-                try writer.print("{s} ", .{tag});
-            }
-            if (o.properties.count() == 0) {
-                return writer.writeAll("{}");
-            }
-            try writer.writeAll("{ ");
-            var it = o.properties.iterator();
-            var first = true;
-            while (it.next()) |entry| {
-                if (!first) {
-                    try writer.writeAll(", ");
-                }
-                first = false;
-                try writer.print("{s}: ", .{entry.key_ptr.*});
-                try inspect(allocator, writer, entry.value_ptr.*);
-            }
-            try writer.writeAll(" }");
-        },
-        .uninitialized => unreachable,
-    }
+    var inspector: Inspector = .{ .allocator = allocator };
+    try writer.writeAll(try inspector.format(value, 0));
 }
 
-/// Node's `formatList` for an array of primitives and functions at the top level: on one line if
-/// it fits in 80 columns, otherwise one entry per line, or in columns (`groupArrayElements`) when
-/// there are more than six.
-fn inspectArray(allocator: std.mem.Allocator, writer: *std.Io.Writer, array: *const Array) InspectError!void {
-    if (array.items.len == 0) {
-        return writer.writeAll("[]");
-    }
-    const max_length = 100;
-    const shown = @min(array.items.len, max_length);
-    var entries: std.ArrayList([]const u8) = .empty;
-    for (array.items[0..shown]) |item| {
-        switch (item) {
-            .array, .object => return error.Unsupported,
-            // Node splits long strings over several lines.
-            .string => |s| if (jsLength(s) > 76) return error.Unsupported,
-            else => {},
-        }
-        var out: std.Io.Writer.Allocating = .init(allocator);
-        inspect(allocator, &out.writer, item) catch |err| switch (err) {
-            error.WriteFailed => return error.OutOfMemory,
-            else => |e| return e,
-        };
-        try entries.append(allocator, out.written());
-    }
-    if (array.items.len > max_length) {
-        const more = array.items.len - max_length;
-        try entries.append(allocator, try std.fmt.allocPrint(allocator, "... {d} more item{s}", .{ more, if (more > 1) "s" else "" }));
-    }
-    var output: []const []const u8 = entries.items;
-    if (entries.items.len > 6) {
-        output = try groupArrayElements(allocator, entries.items, array.items.len > max_length, array.items[0..shown]);
-    }
-    if (output.len == entries.items.len) {
-        // `isBelowBreakLength`, with `start` for the `[` and the `10` node adds.
-        var total = output.len + (output.len + 1 + 10);
-        for (output) |entry| {
-            total += jsLength(entry);
-        }
-        if (total <= 80) {
-            try writer.writeAll("[ ");
-            for (output, 0..) |entry, i| {
-                if (i > 0) {
-                    try writer.writeAll(", ");
-                }
-                try writer.writeAll(entry);
-            }
-            return writer.writeAll(" ]");
-        }
-    }
-    try writer.writeAll("[\n  ");
-    for (output, 0..) |entry, i| {
-        if (i > 0) {
-            try writer.writeAll(",\n  ");
-        }
-        try writer.writeAll(entry);
-    }
-    try writer.writeAll("\n]");
-}
+/// Node's `formatValue` with its default options: nested objects shown to a depth of 2, at most
+/// 100 array elements, and lines broken at 80 columns.
+const Inspector = struct {
+    allocator: std.mem.Allocator,
+    /// How far the current entry is indented.
+    indentation: usize = 0,
+    /// The depth of the object most recently entered (`ctx.currentDepth`).
+    current_depth: usize = 0,
+    /// The objects being formatted, outermost first, for spotting circular references.
+    seen: std.ArrayList(*const anyopaque) = .empty,
+    /// Objects referred to circularly; `*1` is the first.
+    circular: std.ArrayList(*const anyopaque) = .empty,
 
-/// Node's `groupArrayElements`: lays short entries out in aligned columns, numbers padded on
-/// the left and anything else on the right.
-fn groupArrayElements(allocator: std.mem.Allocator, output: []const []const u8, has_more: bool, values: []const Value) error{OutOfMemory}![]const []const u8 {
     const break_length = 80;
-    const separator_space = 2;
-    const output_length = if (has_more) output.len - 1 else output.len;
-    const data_len = try allocator.alloc(usize, output_length);
-    var total_length: usize = 0;
-    var max_length: usize = 0;
-    for (output[0..output_length], data_len) |entry, *len| {
-        len.* = jsLength(entry);
-        total_length += len.* + separator_space;
-        max_length = @max(max_length, len.*);
+    const max_depth = 2;
+    const max_array_length = 100;
+
+    fn format(this: *Inspector, value: Value, depth: usize) InspectError![]const u8 {
+        return switch (value) {
+            .undefined => "undefined",
+            .null => "null",
+            .boolean => |b| if (b) "true" else "false",
+            // `util.inspect` shows the sign of zero, unlike `String(-0)`.
+            .number => |n| if (n == 0 and std.math.signbit(n)) "-0" else number.toString(this.allocator, n),
+            .string => |str| this.formatString(str),
+            .native_function => |f| std.fmt.allocPrint(this.allocator, "[Function: {s}]", .{f.name}),
+            .function => |f| if (f.name().len == 0)
+                "[Function (anonymous)]"
+            else
+                std.fmt.allocPrint(this.allocator, "[Function: {s}]", .{f.name()}),
+            .array => |a| this.formatObject(.{ .array = a }, depth),
+            .object => |o| this.formatObject(.{ .object = o }, depth),
+            .uninitialized => unreachable,
+        };
     }
-    const actual_max = max_length + separator_space;
-    const total: f64 = @floatFromInt(total_length);
-    const actual: f64 = @floatFromInt(actual_max);
-    if (!(actual_max * 3 < break_length and (total / actual > 5 or max_length <= 6))) {
-        return output;
-    }
-    const average_bias = @sqrt(actual - total / @as(f64, @floatFromInt(output.len)));
-    const biased_max = @max(actual - 3 - average_bias, 1);
-    const columns: usize = @intFromFloat(@min(
-        @min(@round(@sqrt(2.5 * biased_max * @as(f64, @floatFromInt(output_length))) / biased_max), @floor(@as(f64, break_length) / actual)),
-        @min(3 * 4, 15),
-    ));
-    if (columns <= 1) {
-        return output;
-    }
-    const max_line_length = try allocator.alloc(usize, columns);
-    for (max_line_length, 0..) |*line_length, i| {
-        line_length.* = 0;
-        var j = i;
-        while (j < output_length) : (j += columns) {
-            line_length.* = @max(line_length.*, data_len[j]);
+
+    /// `formatPrimitive` for a string: quoted, and split after each line break if it's too long
+    /// to fit.
+    fn formatString(this: *Inspector, s: []const u8) InspectError![]const u8 {
+        const length = jsLength(s);
+        if (length <= 16 or length <= break_length -| (this.indentation + 4) or std.mem.indexOfScalar(u8, s[0 .. s.len - 1], '\n') == null) {
+            return quoted(this.allocator, s);
         }
-        line_length.* += separator_space;
-    }
-    const pad_start = for (values) |v| {
-        if (v != .number) {
-            break false;
+        var out: std.ArrayList(u8) = .empty;
+        var rest = s;
+        while (rest.len > 0) {
+            const end = if (std.mem.indexOfScalar(u8, rest, '\n')) |i| i + 1 else rest.len;
+            if (out.items.len > 0) {
+                try out.appendSlice(this.allocator, " +\n");
+                try out.appendNTimes(this.allocator, ' ', this.indentation + 2);
+            }
+            try out.appendSlice(this.allocator, try quoted(this.allocator, rest[0..end]));
+            rest = rest[end..];
         }
-    } else true;
-    var rows: std.ArrayList([]const u8) = .empty;
-    var i: usize = 0;
-    while (i < output_length) : (i += columns) {
-        const end = @min(i + columns, output_length);
-        var row: std.ArrayList(u8) = .empty;
-        for (i..end) |j| {
-            const last = j == end - 1;
-            const cell = if (last) output[j] else try std.fmt.allocPrint(allocator, "{s}, ", .{output[j]});
-            const width = if (last and pad_start) max_line_length[j - i] - separator_space else if (last) 0 else max_line_length[j - i];
-            const padding = width -| jsLength(cell);
-            if (pad_start) {
-                try row.appendNTimes(allocator, ' ', padding);
-                try row.appendSlice(allocator, cell);
-            } else {
-                try row.appendSlice(allocator, cell);
-                try row.appendNTimes(allocator, ' ', padding);
+        return out.items;
+    }
+
+    const Container = union(enum) {
+        array: *const Array,
+        object: *const Object,
+
+        fn ptr(this: Container) *const anyopaque {
+            return switch (this) {
+                inline else => |p| p,
+            };
+        }
+    };
+
+    /// `formatValue` and `formatRaw` for arrays and objects.
+    fn formatObject(this: *Inspector, container: Container, depth: usize) InspectError![]const u8 {
+        const ptr = container.ptr();
+        if (std.mem.indexOfScalar(*const anyopaque, this.seen.items, ptr) != null) {
+            const index = std.mem.indexOfScalar(*const anyopaque, this.circular.items, ptr) orelse blk: {
+                try this.circular.append(this.allocator, ptr);
+                break :blk this.circular.items.len - 1;
+            };
+            return std.fmt.allocPrint(this.allocator, "[Circular *{d}]", .{index + 1});
+        }
+        var open: []const u8 = "{";
+        var close: []const u8 = "}";
+        var keys: []const []const u8 = &.{};
+        switch (container) {
+            .array => |a| {
+                open = "[";
+                close = "]";
+                if (a.items().len == 0) {
+                    return "[]";
+                }
+            },
+            .object => |o| {
+                if (o.tag) |tag| {
+                    open = try std.fmt.allocPrint(this.allocator, "{s} {{", .{tag});
+                }
+                keys = try o.keys(this.allocator);
+                if (keys.len == 0) {
+                    return std.fmt.allocPrint(this.allocator, "{s}}}", .{open});
+                }
+            },
+        }
+        if (depth > max_depth) {
+            return if (container == .array) "[Array]" else "[Object]";
+        }
+        const inner = depth + 1;
+        try this.seen.append(this.allocator, ptr);
+        this.current_depth = inner;
+        var output: std.ArrayList([]const u8) = .empty;
+        switch (container) {
+            .array => |a| {
+                const shown = @min(a.items().len, max_array_length);
+                for (a.items()[0..shown]) |item| {
+                    try output.append(this.allocator, try this.entry(item, inner));
+                }
+                if (a.items().len > shown) {
+                    const more = a.items().len - shown;
+                    try output.append(this.allocator, try std.fmt.allocPrint(this.allocator, "... {d} more item{s}", .{ more, if (more > 1) "s" else "" }));
+                }
+            },
+            .object => |o| for (keys) |key| {
+                const name = if (isIdentifier(key)) key else try quoted(this.allocator, key);
+                try output.append(this.allocator, try std.fmt.allocPrint(this.allocator, "{s}: {s}", .{ name, try this.entry(o.get(key), inner) }));
+            },
+        }
+        var base: []const u8 = "";
+        if (std.mem.indexOfScalar(*const anyopaque, this.circular.items, ptr)) |index| {
+            base = try std.fmt.allocPrint(this.allocator, "<ref *{d}>", .{index + 1});
+        }
+        _ = this.seen.pop();
+        return this.reduceToSingleString(output.items, base, open, close, container, inner);
+    }
+
+    /// A property's value or an array's element, indented two more than its container.
+    fn entry(this: *Inspector, value: Value, depth: usize) InspectError![]const u8 {
+        this.indentation += 2;
+        defer this.indentation -= 2;
+        return this.format(value, depth);
+    }
+
+    /// Node's `reduceToSingleString`: the entries on one line if they fit and nothing in them is
+    /// nested too deeply, otherwise one per line (or in columns, for a long array).
+    fn reduceToSingleString(this: *Inspector, entries: []const []const u8, base: []const u8, open: []const u8, close: []const u8, container: Container, depth: usize) InspectError![]const u8 {
+        var output = entries;
+        if (container == .array and entries.len > 6) {
+            output = try this.groupArrayElements(entries, container.array);
+        }
+        if (this.current_depth -| depth < 3 and entries.len == output.len) {
+            const start = output.len + this.indentation + open.len + base.len + 10;
+            if (isBelowBreakLength(output, start, base)) {
+                const joined = try std.mem.join(this.allocator, ", ", output);
+                if (std.mem.indexOfScalar(u8, joined, '\n') == null) {
+                    return std.fmt.allocPrint(this.allocator, "{s}{s}{s} {s} {s}", .{ base, if (base.len > 0) " " else "", open, joined, close });
+                }
             }
         }
-        try rows.append(allocator, row.items);
+        var indentation: std.ArrayList(u8) = .empty;
+        try indentation.append(this.allocator, '\n');
+        try indentation.appendNTimes(this.allocator, ' ', this.indentation);
+        const separator = try std.fmt.allocPrint(this.allocator, ",{s}  ", .{indentation.items});
+        return std.fmt.allocPrint(this.allocator, "{s}{s}{s}{s}  {s}{s}{s}", .{
+            base, if (base.len > 0) " " else "", open, indentation.items, try std.mem.join(this.allocator, separator, output), indentation.items, close,
+        });
     }
-    if (has_more) {
-        try rows.append(allocator, output[output_length]);
+
+    fn isBelowBreakLength(output: []const []const u8, start: usize, base: []const u8) bool {
+        var total = output.len + start;
+        if (total + output.len > break_length) {
+            return false;
+        }
+        for (output) |entry_text| {
+            total += jsLength(entry_text);
+            if (total > break_length) {
+                return false;
+            }
+        }
+        return base.len == 0 or std.mem.indexOfScalar(u8, base, '\n') == null;
     }
-    return rows.items;
+
+    /// Node's `groupArrayElements`: lays short entries out in aligned columns, numbers padded on
+    /// the left and anything else on the right.
+    fn groupArrayElements(this: *Inspector, output: []const []const u8, array: *const Array) InspectError![]const []const u8 {
+        const separator_space = 2;
+        const has_more = array.items().len > max_array_length;
+        const output_length = if (has_more) output.len - 1 else output.len;
+        const data_len = try this.allocator.alloc(usize, output_length);
+        var total_length: usize = 0;
+        var max_length: usize = 0;
+        for (output[0..output_length], data_len) |entry_text, *len| {
+            len.* = jsLength(entry_text);
+            total_length += len.* + separator_space;
+            max_length = @max(max_length, len.*);
+        }
+        const actual_max = max_length + separator_space;
+        const total: f64 = @floatFromInt(total_length);
+        const actual: f64 = @floatFromInt(actual_max);
+        if (!(actual_max * 3 + this.indentation < break_length and (total / actual > 5 or max_length <= 6))) {
+            return output;
+        }
+        const average_bias = @sqrt(actual - total / @as(f64, @floatFromInt(output.len)));
+        const biased_max = @max(actual - 3 - average_bias, 1);
+        const columns: usize = @intFromFloat(@min(
+            @min(@round(@sqrt(2.5 * biased_max * @as(f64, @floatFromInt(output_length))) / biased_max), @floor(@as(f64, @floatFromInt(break_length -| this.indentation)) / actual)),
+            @min(3 * 4, 15),
+        ));
+        if (columns <= 1) {
+            return output;
+        }
+        const max_line_length = try this.allocator.alloc(usize, columns);
+        for (max_line_length, 0..) |*line_length, i| {
+            line_length.* = 0;
+            var j = i;
+            while (j < output_length) : (j += columns) {
+                line_length.* = @max(line_length.*, data_len[j]);
+            }
+            line_length.* += separator_space;
+        }
+        const pad_start = for (array.items()[0..@min(output.len, array.items().len)]) |v| {
+            if (v != .number) {
+                break false;
+            }
+        } else true;
+        var rows: std.ArrayList([]const u8) = .empty;
+        var i: usize = 0;
+        while (i < output_length) : (i += columns) {
+            const end = @min(i + columns, output_length);
+            var row: std.ArrayList(u8) = .empty;
+            for (i..end) |j| {
+                const last = j == end - 1;
+                const cell = if (last) output[j] else try std.fmt.allocPrint(this.allocator, "{s}, ", .{output[j]});
+                const width = if (last and pad_start) max_line_length[j - i] - separator_space else if (last) 0 else max_line_length[j - i];
+                const padding = width -| jsLength(cell);
+                if (pad_start) {
+                    try row.appendNTimes(this.allocator, ' ', padding);
+                    try row.appendSlice(this.allocator, cell);
+                } else {
+                    try row.appendSlice(this.allocator, cell);
+                    try row.appendNTimes(this.allocator, ' ', padding);
+                }
+            }
+            try rows.append(this.allocator, row.items);
+        }
+        if (has_more) {
+            try rows.append(this.allocator, output[output_length]);
+        }
+        return rows.items;
+    }
+};
+
+/// Whether node shows a property name without quotes (`keyStrRegExp`).
+fn isIdentifier(key: []const u8) bool {
+    if (key.len == 0 or std.ascii.isDigit(key[0])) {
+        return false;
+    }
+    for (key) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_') {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn quoted(allocator: std.mem.Allocator, s: []const u8) error{OutOfMemory}![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    quoteString(&out.writer, s) catch return error.OutOfMemory;
+    return out.written();
 }
 
 /// The length of a string in UTF-16 code units, which is what node measures.
@@ -554,6 +706,8 @@ test exponentiate {
 }
 
 test inspect {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
     var buffer: [128]u8 = undefined;
     const cases = [_]struct { Value, []const u8 }{
         .{ .{ .string = "hi" }, "'hi'" },
@@ -565,7 +719,7 @@ test inspect {
     };
     for (cases) |case| {
         var writer: std.Io.Writer = .fixed(&buffer);
-        try inspect(testing.allocator, &writer, case[0]);
+        try inspect(arena.allocator(), &writer, case[0]);
         try testing.expectEqualStrings(case[1], writer.buffered());
     }
 }
@@ -585,7 +739,7 @@ test "inspect arrays" {
         for (items, case[0]) |*item, n| {
             item.* = .{ .number = n };
         }
-        var array: Array = .{ .items = items };
+        var array: Array = .{ .elements = .fromOwnedSlice(items) };
         var out: std.Io.Writer.Allocating = .init(a);
         try inspect(a, &out.writer, .{ .array = &array });
         try testing.expectEqualStrings(case[1], out.written());

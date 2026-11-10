@@ -159,7 +159,7 @@ fn get(this: *Interpreter, id: ast.Identifier) Error!Value {
     return v;
 }
 
-/// The variable an assignment target writes to. The checker only lets variables through.
+/// A variable an assignment target writes to.
 const Target = struct {
     ref: Checker.Ref,
     slot: *Value,
@@ -173,7 +173,10 @@ const Target = struct {
 };
 
 fn target(this: *Interpreter, expr: *const Expr) Error!Target {
-    const id = ast.skipParens(expr).data.identifier;
+    return this.variableTarget(ast.skipParens(expr).data.identifier);
+}
+
+fn variableTarget(this: *Interpreter, id: ast.Identifier) Error!Target {
     const ref = this.refs[id.ref];
     const slot = this.location(ref).?;
     if (slot.* == .uninitialized) {
@@ -185,6 +188,92 @@ fn target(this: *Interpreter, expr: *const Expr) Error!Target {
 /// Gives a declared name its first value.
 fn initialize(this: *Interpreter, binding: u32, v: Value) void {
     this.location(this.bindings[binding]).?.* = v;
+}
+
+noinline fn destructure(this: *Interpreter, d: *const ast.Declarator, v: Value) Error!void {
+    return this.bindPattern(d.pattern.?, v);
+}
+
+/// Gives the names in a destructuring pattern their values (BindingInitialization, §8.6.2).
+noinline fn bindPattern(this: *Interpreter, pattern: *const ast.Pattern, v: Value) Error!void {
+    switch (pattern.data) {
+        .identifier => |b| this.initialize(b.binding, v),
+        .object => |o| {
+            if (v == .undefined or v == .null) {
+                return this.throw(.TypeError, "Cannot destructure '{t}' as it is {t}.", .{ v, v });
+            }
+            for (o.properties) |p| {
+                var property_value = try this.getNamed(v, p.key);
+                if (property_value == .undefined) {
+                    if (p.init) |default| {
+                        property_value = try this.evaluate(default);
+                    }
+                }
+                try this.bindPattern(p.value, property_value);
+            }
+            if (o.rest) |r| {
+                const rest = try this.arena.create(value.Object);
+                rest.* = .{};
+                for (try this.ownKeys(v)) |key| {
+                    const named = for (o.properties) |p| {
+                        if (std.mem.eql(u8, p.key, key)) {
+                            break true;
+                        }
+                    } else false;
+                    if (!named) {
+                        try rest.properties.put(this.arena, key, try this.getNamed(v, key));
+                    }
+                }
+                this.initialize(r.binding, .{ .object = rest });
+            }
+        },
+        .array => |a| {
+            const array = switch (v) {
+                .array => |x| x,
+                .string => return this.throw(.Unsupported, "Destructuring a string is not supported yet.", .{}),
+                else => return this.throw(.TypeError, "{s} is not iterable", .{try v.toString(this.arena)}),
+            };
+            for (a.elements, 0..) |element, i| {
+                const e = element orelse continue;
+                var item: Value = if (i < array.items().len) array.items()[i] else .undefined;
+                if (item == .undefined) {
+                    if (e.init) |default| {
+                        item = try this.evaluate(default);
+                    }
+                }
+                try this.bindPattern(e.pattern, item);
+            }
+            if (a.rest) |r| {
+                const from = @min(a.elements.len, array.items().len);
+                try this.bindPattern(r, try this.newArray(array.items()[from..]));
+            }
+        },
+    }
+}
+
+fn newArray(this: *Interpreter, items: []const Value) Error!Value {
+    const array = try this.arena.create(value.Array);
+    array.* = .{ .elements = .empty };
+    try array.elements.appendSlice(this.arena, items);
+    return .{ .array = array };
+}
+
+/// The names of a value's own enumerable properties, in the order `for...in` and spread visit
+/// them.
+fn ownKeys(this: *Interpreter, v: Value) Error![]const []const u8 {
+    switch (v) {
+        // A copy, since the loop body can add and delete properties.
+        .object => |o| return this.arena.dupe([]const u8, try o.keys(this.arena)),
+        .array => |a| {
+            const keys = try this.arena.alloc([]const u8, a.items().len);
+            for (keys, 0..) |*key, i| {
+                key.* = try std.fmt.allocPrint(this.arena, "{d}", .{i});
+            }
+            return keys;
+        },
+        .string => return this.throw(.Unsupported, "The properties of a string are not supported yet.", .{}),
+        else => return &.{},
+    }
 }
 
 /// Enters a scope, giving it an environment if closures capture any of its variables. The caller
@@ -284,12 +373,18 @@ fn statement(this: *Interpreter, stmt: *const Stmt, labels: []const []const u8) 
         .expression => |e| return .{ .normal = try this.evaluate(e) },
         .empty => return .{ .normal = null },
         .variable => |v| {
-            for (v.declarators) |d| {
+            for (v.declarators) |*d| {
                 const initial: Value = if (d.init) |e| try this.evaluate(e) else .undefined;
-                this.initialize(d.binding, initial);
+                if (d.pattern != null) {
+                    try this.destructure(d, initial);
+                } else {
+                    this.initialize(d.binding, initial);
+                }
             }
             return .{ .normal = null };
         },
+        // Types only.
+        .interface, .type_alias => return .{ .normal = null },
         // Created when its scope was entered.
         .function => return .{ .normal = null },
         .@"return" => |e| return .{ .@"return" = if (e) |v| try this.evaluate(v) else .undefined },
@@ -306,7 +401,7 @@ fn statement(this: *Interpreter, stmt: *const Stmt, labels: []const []const u8) 
             const branch = if ((try this.evaluate(i.condition)).toBoolean()) i.then else i.otherwise orelse return .{ .normal = .undefined };
             return (try this.statement(branch, &.{})).updateEmpty(.undefined);
         },
-        .@"while", .do_while, .@"for" => return breakable(try this.loop(stmt, labels)),
+        .@"while", .do_while, .@"for", .for_each => return breakable(try this.loop(stmt, labels)),
         .@"switch" => |sw| return breakable(try this.switchStatement(sw)),
         .@"break" => |j| return .{ .@"break" = .{ .label = j.label, .value = null } },
         .@"continue" => |j| return .{ .@"continue" = .{ .label = j.label, .value = null } },
@@ -388,9 +483,61 @@ fn loop(this: *Interpreter, stmt: *const Stmt, labels: []const []const u8) Error
                 }
             }
         },
+        .for_each => |f| return this.forEach(f, labels),
         else => unreachable,
     }
     return .{ .normal = v };
+}
+
+/// `for...of` and `for...in`.
+noinline fn forEach(this: *Interpreter, f: ast.ForEach, labels: []const []const u8) Error!Completion {
+    var v: Value = .undefined;
+    const saved = this.env;
+    defer this.env = saved;
+    // The head's names are in their temporal dead zone while the right side runs.
+    try this.enterScope(f.scope);
+    const right = try this.evaluate(f.right);
+    if (f.of) {
+        const array = switch (right) {
+            .array => |a| a,
+            .string => return this.throw(.Unsupported, "Iterating over a string is not supported yet.", .{}),
+            else => return this.throw(.TypeError, "{s} is not iterable", .{try right.toString(this.arena)}),
+        };
+        // Elements added during the loop are visited too.
+        var i: usize = 0;
+        while (i < array.items().len) : (i += 1) {
+            const result = try this.iteration(f, array.items()[i], saved);
+            if (!loopContinues(result, labels)) {
+                return result.updateEmpty(v);
+            }
+            v = result.value() orelse v;
+        }
+    } else {
+        const keys = try this.ownKeys(right);
+        for (keys) |key| {
+            // A property deleted before it's reached isn't visited.
+            if (right == .object and !right.object.properties.contains(key)) {
+                continue;
+            }
+            const result = try this.iteration(f, .{ .string = key }, saved);
+            if (!loopContinues(result, labels)) {
+                return result.updateEmpty(v);
+            }
+            v = result.value() orelse v;
+        }
+    }
+    return .{ .normal = v };
+}
+
+/// One pass of a `for...of` or `for...in`, with a fresh environment for the head's names.
+fn iteration(this: *Interpreter, f: ast.ForEach, item: Value, outer: ?*Env) Error!Completion {
+    this.env = outer;
+    try this.enterScope(f.scope);
+    switch (f.head) {
+        .declaration => |d| try this.bindPattern(d.pattern, item),
+        .target => |e| (try this.target(e)).slot.* = item,
+    }
+    return this.statement(f.body, &.{});
 }
 
 /// CaseBlockEvaluation (§14.12.4): runs from the first matching `case` (or the `default` if none
@@ -446,25 +593,153 @@ fn evaluate(this: *Interpreter, expr: *const Expr) Error!Value {
         .conditional => |c| if ((try this.evaluate(c.condition)).toBoolean()) this.evaluate(c.then) else this.evaluate(c.otherwise),
         .member => |m| this.member(m),
         .call => |c| this.call(c),
+        .index, .object, .array => this.evaluateObject(expr),
     };
 }
 
+/// Element access and object and array literals, kept out of `evaluate`'s hot path.
+noinline fn evaluateObject(this: *Interpreter, expr: *const Expr) Error!Value {
+    return switch (expr.data) {
+        .index => |i| this.index(i),
+        .object => |o| this.objectLiteral(o),
+        .array => |a| this.arrayLiteral(a),
+        else => unreachable,
+    };
+}
+
+fn member(this: *Interpreter, m: ast.Member) Error!Value {
+    return this.getNamed(try this.evaluate(m.object), m.property);
+}
+
+fn index(this: *Interpreter, i: ast.Index) Error!Value {
+    const object = try this.evaluate(i.object);
+    return this.getProperty(object, try this.evaluate(i.index));
+}
+
+noinline fn objectLiteral(this: *Interpreter, o: ast.ObjectLiteral) Error!Value {
+    const object = try this.arena.create(value.Object);
+    object.* = .{};
+    for (o.properties) |p| {
+        switch (p) {
+            .property => |prop| {
+                const key = switch (prop.key) {
+                    .name => |n| n,
+                    .computed => |e| try this.propertyKey(try this.evaluate(e)),
+                };
+                var v = try this.evaluate(prop.value);
+                // An anonymous function is named after its computed key.
+                if (prop.key == .computed and v == .function and v.function.name().len == 0) {
+                    const c = try this.arena.create(value.Closure);
+                    c.* = v.function.*;
+                    c.given_name = key;
+                    v = .{ .function = c };
+                }
+                try object.properties.put(this.arena, key, v);
+            },
+            .spread => |spread| {
+                const source = try this.evaluate(spread.expr);
+                for (try this.ownKeys(source)) |key| {
+                    try object.properties.put(this.arena, key, try this.getNamed(source, key));
+                }
+            },
+        }
+    }
+    return .{ .object = object };
+}
+
+noinline fn arrayLiteral(this: *Interpreter, a: ast.ArrayLiteral) Error!Value {
+    const array = try this.arena.create(value.Array);
+    array.* = .{ .elements = .empty };
+    try array.elements.ensureTotalCapacity(this.arena, a.elements.len);
+    for (a.elements) |element| {
+        switch (element) {
+            .expr => |e| try array.elements.append(this.arena, try this.evaluate(e)),
+            .spread => |e| switch (try this.evaluate(e)) {
+                .array => |source| try array.elements.appendSlice(this.arena, source.items()),
+                .string => return this.throw(.Unsupported, "Spreading a string is not supported yet.", .{}),
+                else => |v| return this.throw(.TypeError, "{s} is not iterable", .{try v.toString(this.arena)}),
+            },
+        }
+    }
+    return .{ .array = array };
+}
+
+/// ToPropertyKey (§7.1.19).
+fn propertyKey(this: *Interpreter, key: Value) Error![]const u8 {
+    return key.toString(this.arena);
+}
+
+/// What an assignment, `++`/`--` or `delete` acts on.
+const Reference = union(enum) {
+    variable: Target,
+    property: struct { object: Value, key: Value },
+};
+
+fn reference(this: *Interpreter, expr: *const Expr) Error!Reference {
+    const e = ast.skipParens(expr);
+    return switch (e.data) {
+        .identifier => |id| .{ .variable = try this.variableTarget(id) },
+        .member => |m| .{ .property = .{ .object = try this.evaluate(m.object), .key = .{ .string = m.property } } },
+        .index => |i| blk: {
+            const object = try this.evaluate(i.object);
+            break :blk .{ .property = .{ .object = object, .key = try this.evaluate(i.index) } };
+        },
+        else => unreachable,
+    };
+}
+
+fn getReference(this: *Interpreter, r: *Reference) Error!Value {
+    return switch (r.*) {
+        .variable => |t| t.slot.*,
+        .property => |p| this.getProperty(p.object, p.key),
+    };
+}
+
+fn setReference(this: *Interpreter, r: *Reference, v: Value) Error!void {
+    switch (r.*) {
+        .variable => |*t| {
+            // Evaluating something since the reference was made can move the stack.
+            t.refresh(this);
+            t.slot.* = v;
+        },
+        .property => |p| try this.setProperty(p.object, p.key, v),
+    }
+}
+
 fn update(this: *Interpreter, u: ast.Update) Error!Value {
-    const t = try this.target(u.operand);
+    const operand = ast.skipParens(u.operand);
+    if (operand.data != .identifier) {
+        return this.updateProperty(u);
+    }
+    const t = try this.variableTarget(operand.data.identifier);
     const old = t.slot.toNumber();
     const new = if (u.increment) old + 1 else old - 1;
     t.slot.* = .{ .number = new };
     return .{ .number = if (u.prefix) new else old };
 }
 
+/// `++o.p` and friends, kept apart from the common case of a variable.
+noinline fn updateProperty(this: *Interpreter, u: ast.Update) Error!Value {
+    var r = try this.reference(u.operand);
+    const old = (try this.getReference(&r)).toNumber();
+    const new = if (u.increment) old + 1 else old - 1;
+    try this.setReference(&r, .{ .number = new });
+    return .{ .number = if (u.prefix) new else old };
+}
+
 fn assign(this: *Interpreter, a: ast.Assign) Error!Value {
+    const target_expr = ast.skipParens(a.target);
+    if (target_expr.data != .identifier) {
+        return this.assignProperty(a);
+    }
+    const id = target_expr.data.identifier;
     const op = a.op orelse {
         // A variable still in its temporal dead zone throws only after the value is evaluated.
         const v = try this.evaluate(a.value);
-        (try this.target(a.target)).slot.* = v;
+        (try this.variableTarget(id)).slot.* = v;
         return v;
     };
-    var t = try this.target(a.target);
+    var t = try this.variableTarget(id);
     const current = t.slot.*;
     // The logical assignments only evaluate and assign the right side when they need it.
     const skip = switch (op) {
@@ -487,6 +762,33 @@ fn assign(this: *Interpreter, a: ast.Assign) Error!Value {
     return v;
 }
 
+/// An assignment to a property, kept apart from the common case of a variable.
+noinline fn assignProperty(this: *Interpreter, a: ast.Assign) Error!Value {
+    var r = try this.reference(a.target);
+    const op = a.op orelse {
+        const v = try this.evaluate(a.value);
+        try this.setReference(&r, v);
+        return v;
+    };
+    const current = try this.getReference(&r);
+    const skip = switch (op) {
+        .logical_and => !current.toBoolean(),
+        .logical_or => current.toBoolean(),
+        .nullish => current != .null and current != .undefined,
+        else => {
+            const result = try this.operate(op, current, try this.evaluate(a.value));
+            try this.setReference(&r, result);
+            return result;
+        },
+    };
+    if (skip) {
+        return current;
+    }
+    const v = try this.evaluate(a.value);
+    try this.setReference(&r, v);
+    return v;
+}
+
 fn template(this: *Interpreter, t: ast.Template) Error!Value {
     if (t.substitutions.len == 0) {
         return .{ .string = t.quasis[0] };
@@ -503,6 +805,9 @@ fn template(this: *Interpreter, t: ast.Template) Error!Value {
 }
 
 fn unary(this: *Interpreter, u: ast.Unary) Error!Value {
+    if (u.op == .delete) {
+        return this.delete(u.operand);
+    }
     const operand = try this.evaluate(u.operand);
     return switch (u.op) {
         .negate => .{ .number = -operand.toNumber() },
@@ -511,6 +816,42 @@ fn unary(this: *Interpreter, u: ast.Unary) Error!Value {
         .bitwise_not => .{ .number = @floatFromInt(~value.toInt32(operand.toNumber())) },
         .typeof => .{ .string = operand.typeOf() },
         .void => .undefined,
+        .delete => unreachable,
+    };
+}
+
+/// The `delete` operator (§13.5.1). The checker only lets property references through.
+noinline fn delete(this: *Interpreter, operand: *const Expr) Error!Value {
+    const r = try this.reference(operand);
+    const p = r.property;
+    switch (p.object) {
+        .object => |o| _ = o.properties.orderedRemove(try this.propertyKey(p.key)),
+        .array => |a| {
+            const key = try this.propertyKey(p.key);
+            if (value.arrayIndex(key)) |i| {
+                if (i < a.items().len) {
+                    return this.throw(.Unsupported, "Deleting an array's elements is not supported yet.", .{});
+                }
+            }
+        },
+        .undefined, .null => return this.throw(.TypeError, "Cannot convert undefined or null to object", .{}),
+        else => {},
+    }
+    return .{ .boolean = true };
+}
+
+/// The `in` operator (§13.10.1).
+noinline fn hasProperty(this: *Interpreter, key: Value, object: Value) Error!bool {
+    const name = try this.propertyKey(key);
+    return switch (object) {
+        .object => |o| o.properties.contains(name),
+        .array => |a| std.mem.eql(u8, name, "length") or if (value.arrayIndex(name)) |i| i < a.items().len else false,
+        .function => if (std.mem.eql(u8, name, "prototype"))
+            this.throw(.Unsupported, "Functions' 'prototype' is not supported yet.", .{})
+        else
+            std.mem.eql(u8, name, "name") or std.mem.eql(u8, name, "length"),
+        .native_function => std.mem.eql(u8, name, "name") or std.mem.eql(u8, name, "length"),
+        else => this.throw(.TypeError, "Cannot use 'in' operator to search for '{s}' in {s}", .{ name, try object.toString(this.arena) }),
     };
 }
 
@@ -563,6 +904,7 @@ fn operate(this: *Interpreter, op: ast.BinaryOp, left: Value, right: Value) Erro
         .not_equal => .{ .boolean = !try left.looseEquals(right, this.arena) },
         .strict_equal => .{ .boolean = left.strictEquals(right) },
         .strict_not_equal => .{ .boolean = !left.strictEquals(right) },
+        .in => .{ .boolean = try this.hasProperty(left, right) },
         .logical_and, .logical_or, .nullish => unreachable,
     };
 }
@@ -622,12 +964,21 @@ fn lessThan(this: *Interpreter, a: Value, b: Value) Error!?bool {
     return x < y;
 }
 
-fn member(this: *Interpreter, m: ast.Member) Error!Value {
-    return this.property(try this.evaluate(m.object), m);
+/// `object[key]`.
+fn getProperty(this: *Interpreter, object: Value, key: Value) Error!Value {
+    // The common case, an array element, without making the key a string.
+    if (object == .array and key == .number) {
+        const n = key.number;
+        const items = object.array.items();
+        if (n >= 0 and n == @trunc(n) and n < @as(f64, @floatFromInt(items.len))) {
+            return items[@intFromFloat(n)];
+        }
+    }
+    return this.getNamed(object, try this.propertyKey(key));
 }
 
-fn property(this: *Interpreter, object: Value, m: ast.Member) Error!Value {
-    const name = m.property;
+/// `object.name`.
+fn getNamed(this: *Interpreter, object: Value, name: []const u8) Error!Value {
     switch (object) {
         .object => |o| return o.get(name),
         .function => |f| {
@@ -643,8 +994,13 @@ fn property(this: *Interpreter, object: Value, m: ast.Member) Error!Value {
                 return .{ .string = f.name };
             }
         },
-        .array => |a| if (std.mem.eql(u8, name, "length")) {
-            return .{ .number = @floatFromInt(a.items.len) };
+        .array => |a| {
+            if (std.mem.eql(u8, name, "length")) {
+                return .{ .number = @floatFromInt(a.items().len) };
+            }
+            if (value.arrayIndex(name)) |i| {
+                return if (i < a.items().len) a.items()[i] else .undefined;
+            }
         },
         .undefined, .null => return this.throw(.TypeError, "Cannot read properties of {t} (reading '{s}')", .{ object, name }),
         else => {},
@@ -652,12 +1008,37 @@ fn property(this: *Interpreter, object: Value, m: ast.Member) Error!Value {
     return this.throw(.Unsupported, "Reading the property '{s}' of a {s} is not supported yet.", .{ name, object.typeOf() });
 }
 
+/// `object[key] = v`.
+fn setProperty(this: *Interpreter, object: Value, key: Value, v: Value) Error!void {
+    const name = try this.propertyKey(key);
+    switch (object) {
+        .object => |o| return o.properties.put(this.arena, name, v),
+        .array => |a| if (value.arrayIndex(name)) |i| {
+            if (i < a.items().len) {
+                a.items()[i] = v;
+                return;
+            }
+            if (i == a.items().len) {
+                return a.elements.append(this.arena, v);
+            }
+            return this.throw(.Unsupported, "Assigning past the end of an array, which leaves holes in it, is not supported yet.", .{});
+        },
+        .undefined, .null => return this.throw(.TypeError, "Cannot set properties of {t} (setting '{s}')", .{ object, name }),
+        else => {},
+    }
+    return this.throw(.Unsupported, "Setting the property '{s}' of a {s} is not supported yet.", .{ name, object.typeOf() });
+}
+
 fn call(this: *Interpreter, c: ast.Call) Error!Value {
     var receiver: Value = .undefined;
     const callee = switch (c.callee.data) {
         .member => |m| blk: {
             receiver = try this.evaluate(m.object);
-            break :blk try this.property(receiver, m);
+            break :blk try this.getNamed(receiver, m.property);
+        },
+        .index => |i| blk: {
+            receiver = try this.evaluate(i.object);
+            break :blk try this.getProperty(receiver, try this.evaluate(i.index));
         },
         else => try this.evaluate(c.callee),
     };
@@ -715,19 +1096,22 @@ pub fn callFunction(this: *Interpreter, c: *const value.Closure, args: []const V
         }
     }
     for (f.parameters, 0..) |p, i| {
+        var v: Value = undefined;
         if (p.rest) {
-            const array = try this.arena.create(value.Array);
-            array.* = .{ .items = try this.arena.dupe(Value, args[@min(i, args.len)..]) };
-            this.initialize(p.binding, .{ .array = array });
-            break;
-        }
-        var v: Value = if (i < args.len) args[i] else .undefined;
-        if (v == .undefined) {
-            if (p.init) |default| {
-                v = try this.evaluate(default);
+            v = try this.newArray(args[@min(i, args.len)..]);
+        } else {
+            v = if (i < args.len) args[i] else .undefined;
+            if (v == .undefined) {
+                if (p.init) |default| {
+                    v = try this.evaluate(default);
+                }
             }
         }
-        this.initialize(p.binding, v);
+        if (p.pattern) |pattern| {
+            try this.bindPattern(pattern, v);
+        } else {
+            this.initialize(p.binding, v);
+        }
     }
     switch (f.body) {
         .expression => |e| return this.evaluate(e),

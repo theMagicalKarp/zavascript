@@ -117,7 +117,7 @@ pub fn compile(this: *Runtime, path: []const u8, text: []const u8) Error!Program
 }
 
 /// Writes `value` the way node's REPL shows it.
-pub fn inspect(this: *Runtime, writer: *std.Io.Writer, value: Value) error{ WriteFailed, OutOfMemory, Unsupported }!void {
+pub fn inspect(this: *Runtime, writer: *std.Io.Writer, value: Value) error{ WriteFailed, OutOfMemory }!void {
     return @import("runtime/value.zig").inspect(this.arena.allocator(), writer, value);
 }
 
@@ -234,4 +234,31 @@ test "keeps functions between runs" {
     try testing.expectEqual(@as(f64, 120), (try runtime.run("repl", "fact(5)")).number);
     try testing.expectError(error.CompileError, runtime.run("repl", "fact('x')"));
     try testing.expectEqual(2345, runtime.diagnostics.items()[0].code.number);
+}
+
+test "keeps types and objects between runs" {
+    var stdout: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout.deinit();
+    var runtime: Runtime = try .init(testing.allocator, .{ .stdout = &stdout.writer, .stderr = &stdout.writer });
+    defer runtime.deinit();
+    _ = try runtime.run("repl", "interface P { x: number; y?: number }");
+    _ = try runtime.run("repl", "const p: P = { x: 1 }");
+    try testing.expectError(error.CompileError, runtime.run("repl", "const q: P = { z: 1 }"));
+    try testing.expectEqual(2353, runtime.diagnostics.items()[0].code.number);
+    _ = try runtime.run("repl", "p.y = 2; const { x, ...rest } = p");
+    try testing.expectEqual(@as(f64, 2), (try runtime.run("repl", "rest.y")).number);
+    // A line that doesn't compile declares no types either.
+    try testing.expectError(error.CompileError, runtime.run("repl", "type T = number; const t: T = 'x'"));
+    try testing.expectError(error.CompileError, runtime.run("repl", "let u: T"));
+    try testing.expectEqual(2304, runtime.diagnostics.items()[0].code.number);
+    _ = try runtime.run("repl", "type T = string");
+}
+
+test "runtime errors on objects" {
+    try expectThrows("const a: any = null; const { b } = a;", "Uncaught TypeError: Cannot destructure 'null' as it is null.");
+    try expectThrows("const a: any = undefined; a.b = 1", "Uncaught TypeError: Cannot set properties of undefined (setting 'b')");
+    try expectThrows("const a: any = 5; for (const x of a) {}", "Uncaught TypeError: 5 is not iterable");
+    try expectThrows("const a: any = 5; 'x' in a", "Uncaught TypeError: Cannot use 'in' operator to search for 'x' in 5");
+    try expectThrows("const a: number[] = []; a[2] = 1", "error ZV9001: Assigning past the end of an array, which leaves holes in it, is not supported yet.");
+    try expectThrows("const a = [1]; delete a[0]", "error ZV9001: Deleting an array's elements is not supported yet.");
 }

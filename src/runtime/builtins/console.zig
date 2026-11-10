@@ -25,10 +25,7 @@ fn writer(comptime to_stderr: bool) *const fn (*anyopaque, Value, []const Value)
         fn call(context: *anyopaque, _: Value, args: []const Value) anyerror!Value {
             const interpreter = Interpreter.fromContext(context);
             const out = if (to_stderr) interpreter.stderr else interpreter.stdout;
-            print(interpreter.arena, out, args) catch |err| switch (err) {
-                error.Unsupported => return interpreter.throw(.Unsupported, "Printing an array of arrays or objects, or of very long strings, is not supported yet.", .{}),
-                else => |e| return e,
-            };
+            try print(interpreter.arena, out, args);
             return .undefined;
         }
     }.call;

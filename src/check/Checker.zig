@@ -76,6 +76,22 @@ muted: u32 = 0,
 lazy: std.ArrayList(u32) = .empty,
 /// The comma expression in `(0, a.b)()`, which isn't reported as unused (TS2695).
 indirect_call: ?*const Expr = null,
+/// Interfaces and type aliases, by the statement that declares them, so each is resolved once
+/// however many times its scope is checked.
+type_decls: std.AutoHashMapUnmanaged(*const Stmt, *TypeDecl) = .empty,
+/// Type names this program added to the session's top level, removed again if it doesn't check.
+added_types: std.ArrayList([]const u8) = .empty,
+/// While above zero, a type declaration is being resolved. Its diagnostics are kept aside and
+/// reported at the end, since it's only resolved once, however many times the code around it is
+/// checked (or checked without reporting).
+declaring: u32 = 0,
+late: std.ArrayList(Late) = .empty,
+
+const Late = struct {
+    at: u32,
+    code: diagnostic.Code,
+    message: []const u8,
+};
 
 const Error = error{OutOfMemory};
 
@@ -133,6 +149,25 @@ pub const Session = struct {
     top_level: std.StringHashMapUnmanaged(u32) = .empty,
     /// The flow state at the end of the last program that checked cleanly.
     flow: []VarFlow = &.{},
+    /// Top-level interfaces and type aliases.
+    types: std.StringHashMapUnmanaged(*TypeDecl) = .empty,
+};
+
+/// An interface or type alias.
+const TypeDecl = struct {
+    name: []const u8,
+    start: u32,
+    node: Node,
+    /// The scope it's declared in, where the names it mentions are looked up.
+    scope: ?*Scope,
+    resolved: ?*const Type = null,
+    resolving: bool = false,
+    redeclared: bool = false,
+
+    const Node = union(enum) {
+        interface: *const ast.Interface,
+        alias: *const ast.TypeAlias,
+    };
 };
 
 const Variable = struct {
@@ -160,6 +195,8 @@ const Variable = struct {
     function: ?*const ast.Function = null,
     /// Where the last assignment to it is (see `lastAssignment`), once worked out.
     last_assignment: ?LastAssignment = null,
+    /// For a name in a destructuring declaration, the declarator, whose type it comes from.
+    destructured: ?*const ast.Declarator = null,
 
     const Kind = enum {
         let,
@@ -180,6 +217,8 @@ const LastAssignment = union(enum) {
 const Scope = struct {
     parent: ?*Scope,
     names: std.StringHashMapUnmanaged(u32) = .empty,
+    /// Interfaces and type aliases, which have names of their own.
+    types: std.StringHashMapUnmanaged(*TypeDecl) = .empty,
     kind: enum { block, parameters },
     /// The function this scope is part of; null at the top level.
     function: ?u32,
@@ -331,11 +370,17 @@ pub fn check(arena: std.mem.Allocator, source: *const Source, diagnostics: *diag
     for (program.statements) |stmt| {
         try checker.statement(stmt);
     }
+    for (checker.late.items) |late| {
+        try diagnostics.add(source, late.at, late.code, "{s}", .{late.message});
+    }
 
     if (diagnostics.items().len > errors_before) {
         session.variables.shrinkRetainingCapacity(slot_base);
         for (checker.added.items) |name| {
             _ = session.top_level.remove(name);
+        }
+        for (checker.added_types.items) |name| {
+            _ = session.types.remove(name);
         }
     } else if (checker.flow.reachable) {
         session.flow = checker.flow.vars;
@@ -401,6 +446,9 @@ fn layout(this: *Checker, program: ast.Program) Error!Resolved {
 }
 
 fn report(this: *Checker, at: u32, code: diagnostic.Code, comptime fmt: []const u8, args: anytype) Error!void {
+    if (this.declaring > 0) {
+        return this.late.append(this.arena, .{ .at = at, .code = code, .message = try std.fmt.allocPrint(this.arena, fmt, args) });
+    }
     if (this.muted > 0) {
         return;
     }
@@ -451,6 +499,7 @@ fn setVariable(this: *Checker, slot: u32, t: *const Type) void {
 /// parent is the current scope.
 fn pushScope(this: *Checker, id: ?u32, kind: @FieldType(Scope, "kind")) Error!void {
     var names: std.StringHashMapUnmanaged(u32) = .empty;
+    var type_names: std.StringHashMapUnmanaged(*TypeDecl) = .empty;
     const scope = blk: {
         if (id) |i| {
             if (this.scopes[i]) |existing| {
@@ -458,6 +507,8 @@ fn pushScope(this: *Checker, id: ?u32, kind: @FieldType(Scope, "kind")) Error!vo
                 // checked; its names start over.
                 names = existing.names;
                 names.clearRetainingCapacity();
+                type_names = existing.types;
+                type_names.clearRetainingCapacity();
                 break :blk existing;
             }
             this.scopes[i] = try this.arena.create(Scope);
@@ -465,7 +516,7 @@ fn pushScope(this: *Checker, id: ?u32, kind: @FieldType(Scope, "kind")) Error!vo
         }
         break :blk try this.arena.create(Scope);
     };
-    scope.* = .{ .parent = this.scope, .names = names, .kind = kind, .function = this.currentFunction() };
+    scope.* = .{ .parent = this.scope, .names = names, .types = type_names, .kind = kind, .function = this.currentFunction() };
     this.scope = scope;
 }
 
@@ -483,7 +534,11 @@ fn prescan(this: *Checker, statements: []const *const Stmt) Error!void {
             s = s.data.labeled.body;
         }
         switch (s.data) {
-            .variable => |v| for (v.declarators) |d| {
+            .variable => |v| for (v.declarators) |*d| {
+                if (d.pattern) |pattern| {
+                    try this.declarePattern(pattern, if (v.kind == .let) .let else .@"const", d.end, d);
+                    continue;
+                }
                 try this.declare(this.slot_base + d.binding, .{
                     .name = d.name,
                     .kind = if (v.kind == .let) .let else .@"const",
@@ -507,9 +562,238 @@ fn prescan(this: *Checker, statements: []const *const Stmt) Error!void {
                     .function = f,
                 });
             },
+            .interface, .type_alias => try this.declareType(s),
             else => {},
         }
     }
+}
+
+/// Declares every name in a destructuring pattern.
+fn declarePattern(this: *Checker, pattern: *const ast.Pattern, kind: Variable.Kind, end: u32, declarator: ?*const ast.Declarator) Error!void {
+    for (try pattern.bindings(this.arena)) |b| {
+        try this.declare(this.slot_base + b.binding, .{
+            .name = b.name,
+            .kind = kind,
+            .start = b.start,
+            .end = end,
+            .source = this.source,
+            .annotation = null,
+            .init = null,
+            .destructured = declarator,
+        });
+    }
+}
+
+/// Adds an interface or type alias to the current scope.
+fn declareType(this: *Checker, stmt: *const Stmt) Error!void {
+    const entry = try this.type_decls.getOrPut(this.arena, stmt);
+    if (!entry.found_existing) {
+        const decl = try this.arena.create(TypeDecl);
+        decl.* = switch (stmt.data) {
+            .interface => |i| .{ .name = i.name, .start = i.start, .node = .{ .interface = i }, .scope = this.scope },
+            .type_alias => |a| .{ .name = a.name, .start = a.start, .node = .{ .alias = a }, .scope = this.scope },
+            else => unreachable,
+        };
+        entry.value_ptr.* = decl;
+    }
+    const decl = entry.value_ptr.*;
+    decl.scope = this.scope;
+    const names = if (this.scope) |scope| &scope.types else &this.session.types;
+    const first = names.get(decl.name) orelse {
+        try names.put(this.arena, decl.name, decl);
+        if (this.scope == null) {
+            try this.added_types.append(this.arena, decl.name);
+        }
+        return;
+    };
+    if (first.node == .interface and decl.node == .interface) {
+        return this.unsupported(decl.start, "Merging interface declarations is not supported yet.", .{});
+    }
+    for ([_]*TypeDecl{ first, decl }) |d| {
+        if (!d.redeclared) {
+            d.redeclared = true;
+            try this.report(d.start, .ts(2300), "Duplicate identifier '{s}'.", .{d.name});
+        }
+    }
+}
+
+fn lookupType(this: *Checker, name: []const u8) ?*TypeDecl {
+    var scope = this.scope;
+    while (scope) |s| : (scope = s.parent) {
+        if (s.types.get(name)) |decl| {
+            return decl;
+        }
+    }
+    return this.session.types.get(name);
+}
+
+/// The type an interface or type alias names, resolved the first time it's needed.
+fn resolveDecl(this: *Checker, decl: *TypeDecl) Error!*const Type {
+    if (decl.resolved) |t| {
+        return t;
+    }
+    if (decl.resolving) {
+        // Only an alias can get here: an interface has its type before its members are resolved.
+        decl.resolved = types.any;
+        if (decl.node.alias.type.data == .reference) {
+            try this.report(decl.start, .ts(2456), "Type alias '{s}' circularly references itself.", .{decl.name});
+        } else {
+            // tsc allows `type T = T[]`, which needs types that are resolved lazily.
+            try this.unsupported(decl.start, "A type alias that refers to itself is not supported yet.", .{});
+        }
+        return types.any;
+    }
+    const saved_scope = this.scope;
+    this.scope = decl.scope;
+    this.declaring += 1;
+    decl.resolving = true;
+    defer {
+        this.scope = saved_scope;
+        this.declaring -= 1;
+        decl.resolving = false;
+    }
+    switch (decl.node) {
+        .interface => |i| {
+            // The type exists before its members, so they can refer to it.
+            const object = try this.arena.create(types.Object);
+            object.* = .{ .name = i.name, .properties = &.{} };
+            const t = try this.newType(.{ .object = object });
+            decl.resolved = t;
+            var properties: std.ArrayList(types.Property) = .empty;
+            var bases: std.ArrayList(*const types.Object) = .empty;
+            for (i.extends) |base| {
+                const bt = try this.resolveReference(base.start, base.name);
+                if (bt.* != .object) {
+                    if (bt.* != .any) {
+                        try this.report(base.start, .ts(2312), "An interface can only extend an object type or intersection of object types with statically known members.", .{});
+                    }
+                    continue;
+                }
+                try bases.append(this.arena, bt.object);
+                for (bt.object.properties) |p| {
+                    try putProperty(this.arena, &properties, p);
+                }
+            }
+            for (try this.members(i.members)) |p| {
+                for (bases.items) |base| {
+                    const inherited = base.find(p.name) orelse continue;
+                    if (!types.assignable(p.type, inherited.type)) {
+                        try this.report(i.start, .ts(2430), "Interface '{s}' incorrectly extends interface '{s}'.\n  Types of property '{s}' are incompatible.\n    Type '{f}' is not assignable to type '{f}'.", .{ i.name, base.name, p.name, p.type, inherited.type });
+                    }
+                }
+                try putProperty(this.arena, &properties, p);
+            }
+            object.properties = properties.items;
+            return t;
+        },
+        .alias => |a| {
+            if (a.type.data == .object) {
+                // Like an interface, so it can refer to itself. tsc shows it by the alias's name.
+                const object = try this.arena.create(types.Object);
+                object.* = .{ .name = a.name, .properties = &.{} };
+                const t = try this.newType(.{ .object = object });
+                decl.resolved = t;
+                object.properties = try this.members(a.type.data.object);
+                return t;
+            }
+            const t = try this.resolveType(a.type);
+            if (decl.resolved == null) {
+                decl.resolved = t;
+            }
+            return decl.resolved.?;
+        },
+    }
+}
+
+/// Adds a property, or replaces the one with the same name.
+fn putProperty(arena: std.mem.Allocator, properties: *std.ArrayList(types.Property), p: types.Property) Error!void {
+    for (properties.items) |*existing| {
+        if (std.mem.eql(u8, existing.name, p.name)) {
+            existing.* = p;
+            return;
+        }
+    }
+    try properties.append(arena, p);
+}
+
+/// The members of an interface or object type.
+fn members(this: *Checker, list: []const ast.TypeMember) Error![]const types.Property {
+    var properties: std.ArrayList(types.Property) = .empty;
+    // Where each property is declared, and whether a duplicate of it has been reported there.
+    var starts: std.ArrayList(struct { u32, bool }) = .empty;
+    for (list) |m| {
+        var t = types.any;
+        if (m.type) |node| {
+            if (m.method and node.data.function.returns == null) {
+                try this.report(m.start, .ts(7010), "'{s}', which lacks return-type annotation, implicitly has an 'any' return type.", .{m.name});
+            }
+            t = try this.resolveType(node);
+        } else {
+            try this.report(m.start, .ts(7008), "Member '{s}' implicitly has an 'any' type.", .{m.name});
+        }
+        if (m.optional) {
+            t = try types.unionOf(this.arena, &.{ t, types.undefined });
+        }
+        const duplicate = for (properties.items, 0..) |p, i| {
+            if (std.mem.eql(u8, p.name, m.name)) {
+                break i;
+            }
+        } else null;
+        if (duplicate) |i| {
+            const first = properties.items[i];
+            if (m.method and first.method) {
+                try this.unsupported(m.start, "Method overloads are not supported yet.", .{});
+                continue;
+            }
+            if (!starts.items[i][1]) {
+                starts.items[i][1] = true;
+                try this.report(starts.items[i][0], .ts(2300), "Duplicate identifier '{s}'.", .{m.name});
+            }
+            try this.report(m.start, .ts(2300), "Duplicate identifier '{s}'.", .{m.name});
+            if (!first.type.eql(t)) {
+                try this.report(m.start, .ts(2717), "Subsequent property declarations must have the same type.  Property '{s}' must be of type '{f}', but here has type '{f}'.", .{ m.name, first.type, t });
+            }
+            continue;
+        }
+        try properties.append(this.arena, .{ .name = m.name, .type = t, .optional = m.optional, .readonly = m.readonly, .method = m.method });
+        try starts.append(this.arena, .{ m.start, false });
+    }
+    return properties.items;
+}
+
+/// Names of types the standard library has, which aren't supported yet.
+const library_types = std.StaticStringMap(void).initComptime(.{
+    .{"Array"},       .{"ReadonlyArray"}, .{"Record"},      .{"Partial"},      .{"Required"},         .{"Readonly"},
+    .{"Pick"},        .{"Omit"},          .{"Exclude"},     .{"Extract"},      .{"NonNullable"},      .{"ReturnType"},
+    .{"Parameters"},  .{"InstanceType"},  .{"Awaited"},     .{"Number"},       .{"String"},           .{"Boolean"},
+    .{"Object"},      .{"Function"},      .{"Symbol"},      .{"BigInt"},       .{"Map"},              .{"Set"},
+    .{"WeakMap"},     .{"WeakSet"},       .{"Error"},       .{"TypeError"},    .{"RangeError"},       .{"ReferenceError"},
+    .{"SyntaxError"}, .{"Promise"},       .{"PromiseLike"}, .{"Date"},         .{"RegExp"},           .{"Math"},
+    .{"JSON"},        .{"Console"},       .{"Iterable"},    .{"Iterator"},     .{"IterableIterator"}, .{"ArrayLike"},
+    .{"PropertyKey"}, .{"Uppercase"},     .{"Lowercase"},   .{"Capitalize"},   .{"Uncapitalize"},     .{"ThisType"},
+    .{"NoInfer"},     .{"IArguments"},    .{"Generator"},   .{"ArrayBuffer"},  .{"object"},           .{"symbol"},
+    .{"bigint"},      .{"Int8Array"},     .{"Uint8Array"},  .{"Float64Array"}, .{"DataView"},         .{"TemplateStringsArray"},
+});
+
+/// A type name in an annotation.
+fn resolveReference(this: *Checker, at: u32, name: []const u8) Error!*const Type {
+    if (this.lookupType(name)) |decl| {
+        return this.resolveDecl(decl);
+    }
+    if (library_types.has(name)) {
+        try this.unsupported(at, "The type '{s}' is not supported yet.", .{name});
+    } else if (this.lookup(name) != null or global(name) != null) {
+        try this.report(at, .ts(2749), "'{s}' refers to a value, but is being used as a type here. Did you mean 'typeof {s}'?", .{ name, name });
+    } else {
+        try this.report(at, .ts(2304), "Cannot find name '{s}'.", .{name});
+    }
+    return types.any;
+}
+
+fn newType(this: *Checker, t: Type) Error!*const Type {
+    const p = try this.arena.create(Type);
+    p.* = t;
+    return p;
 }
 
 /// Adds a name to the current scope, reporting it if the scope already has it.
@@ -605,6 +889,19 @@ fn declaredType(this: *Checker, slot: u32) Error!*const Type {
     }
     this.muted += 1;
     defer this.muted -= 1;
+    if (v.destructured) |d| {
+        // Work out the whole pattern's types, as its declaration will.
+        const saved = this.flow;
+        defer this.flow = saved;
+        this.flow = try this.copyFlow(saved);
+        v.resolving = true;
+        defer v.resolving = false;
+        try this.lazy.append(this.arena, slot);
+        defer _ = this.lazy.pop();
+        const t = try this.declaratorType(d);
+        _ = try this.bindPattern(d.pattern.?, t, .{ .widen = v.kind == .let, .annotated = d.type != null });
+        return this.variable(slot).declared orelse types.any;
+    }
     if (v.annotation) |annotation| {
         return this.resolveType(annotation);
     }
@@ -644,14 +941,19 @@ fn resolveType(this: *Checker, node: *const ast.TypeNode) Error!*const Type {
             .number => types.number,
             .string => types.string,
         },
-        .reference => |name| blk: {
-            try this.unsupported(node.start, "The type '{s}' is not supported yet.", .{name});
-            break :blk types.any;
+        .reference => |name| this.resolveReference(node.start, name),
+        .array => |element| this.newType(.{ .array = try this.resolveType(element) }),
+        .tuple => |elements| blk: {
+            const resolved = try this.arena.alloc(*const Type, elements.len);
+            for (elements, resolved) |e, *t| {
+                t.* = try this.resolveType(e);
+            }
+            break :blk this.newType(.{ .tuple = resolved });
         },
-        .array => |element| blk: {
-            const t = try this.arena.create(Type);
-            t.* = .{ .array = try this.resolveType(element) };
-            break :blk t;
+        .object => |list| blk: {
+            const object = try this.arena.create(types.Object);
+            object.* = .{ .properties = try this.members(list) };
+            break :blk this.newType(.{ .object = object });
         },
         .function => |f| blk: {
             var parameters: std.ArrayList(types.Parameter) = .empty;
@@ -679,7 +981,7 @@ fn resolveType(this: *Checker, node: *const ast.TypeNode) Error!*const Type {
                 }
             }
             const function = try this.arena.create(types.Function);
-            function.* = .{ .parameters = parameters.items, .rest = rest, .returns = try this.resolveType(f.returns) };
+            function.* = .{ .parameters = parameters.items, .rest = rest, .returns = if (f.returns) |r| try this.resolveType(r) else types.any };
             const t = try this.arena.create(Type);
             t.* = .{ .function = function };
             break :blk t;
@@ -744,7 +1046,7 @@ fn statement(this: *Checker, stmt: *const Stmt) Error!void {
 /// `labels` are the labels directly on this statement, which `break` and `continue` can name.
 fn labeledStatement(this: *Checker, stmt: *const Stmt, labels: []const []const u8) Error!void {
     switch (stmt.data) {
-        .@"while", .do_while, .@"for" => return this.loop(stmt, labels),
+        .@"while", .do_while, .@"for", .for_each => return this.loop(stmt, labels),
         .@"switch" => |sw| return this.switchStatement(sw, labels),
         .labeled => |l| return this.labeled(stmt, l, labels),
         else => {},
@@ -769,7 +1071,10 @@ fn labeledStatement(this: *Checker, stmt: *const Stmt, labels: []const []const u
         .@"if" => |i| try this.ifStatement(i),
         .@"break" => |j| try this.jump(stmt, j, .@"break"),
         .@"continue" => |j| try this.jump(stmt, j, .@"continue"),
-        .@"while", .do_while, .@"for", .@"switch", .labeled => unreachable,
+        .interface, .type_alias => if (this.type_decls.get(stmt)) |decl| {
+            _ = try this.resolveDecl(decl);
+        },
+        .@"while", .do_while, .@"for", .for_each, .@"switch", .labeled => unreachable,
     }
     if (labels.len > 0) {
         const target = this.targets.pop().?;
@@ -794,7 +1099,19 @@ fn body(this: *Checker, stmt: *const Stmt) Error!void {
 }
 
 fn variableStatement(this: *Checker, v: ast.Variable) Error!void {
-    for (v.declarators) |d| {
+    for (v.declarators) |*d| {
+        if (d.pattern) |pattern| {
+            const bindings = try pattern.bindings(this.arena);
+            for (bindings) |b| {
+                this.variable(this.slot_base + b.binding).resolving = d.type == null;
+            }
+            const t = try this.declaratorType(d);
+            for (bindings) |b| {
+                this.variable(this.slot_base + b.binding).resolving = false;
+            }
+            _ = try this.bindPattern(pattern, t, .{ .widen = v.kind == .let, .annotated = d.type != null });
+            continue;
+        }
         const slot = this.slot_base + d.binding;
         const variable_ = this.variable(slot);
         var declared: *const Type = types.any;
@@ -808,13 +1125,13 @@ fn variableStatement(this: *Checker, v: ast.Variable) Error!void {
             variable_.resolving = false;
             if (annotated) |t| {
                 declared = t;
-                if (!types.assignable(init_type, declared)) {
-                    try this.reportNotAssignable(init, init_type, declared, d.start, .assignment);
-                }
+                try this.checkAssignable(init, init_type, declared, d.start, .assignment);
             } else if (variable_.circular) {
                 declared = types.any;
             } else if (v.kind == .let and isNullOrUndefined(init)) {
                 try this.unsupported(d.start, "A 'let' without a type annotation, initialized to 'null' or 'undefined', is not supported yet.", .{});
+            } else if (isEmptyArray(init)) {
+                try this.unsupported(d.start, "A variable without a type annotation, initialized to an empty array, is not supported yet.", .{});
             } else {
                 declared = if (v.kind == .let) try types.widenFresh(this.arena, init_type) else init_type;
             }
@@ -838,6 +1155,264 @@ fn variableStatement(this: *Checker, v: ast.Variable) Error!void {
             this.flow.vars[slot] = .{ .initialized = true, .type = assigned };
         }
     }
+}
+
+/// The type a destructuring declaration destructures: its annotation's, or its initializer's.
+fn declaratorType(this: *Checker, d: *const ast.Declarator) Error!*const Type {
+    const annotated = if (d.type) |annotation| try this.resolveType(annotation) else null;
+    const init = d.init orelse return annotated orelse types.any;
+    const t = annotated orelse return this.patternInitializer(init, d.pattern.?);
+    const init_type = try this.contextual(init, t);
+    try this.checkAssignable(init, init_type, t, d.start, .assignment);
+    return t;
+}
+
+/// The type a pattern gives the literal it destructures. An array pattern makes an array literal
+/// a tuple: `const [a, b] = [1, "x"]` makes `a` a number and `b` a string.
+fn patternContext(this: *Checker, pattern: *const ast.Pattern) Error!?*const Type {
+    switch (pattern.data) {
+        .identifier => return null,
+        .object => |o| {
+            // A rest element takes whatever else there is.
+            if (o.rest != null) {
+                return null;
+            }
+            var properties: std.ArrayList(types.Property) = .empty;
+            for (o.properties) |p| {
+                try putProperty(this.arena, &properties, .{ .name = p.key, .type = try this.patternContext(p.value) orelse types.any });
+            }
+            const object = try this.arena.create(types.Object);
+            object.* = .{ .properties = properties.items };
+            return try this.newType(.{ .object = object });
+        },
+        .array => |a| {
+            if (a.rest != null) {
+                return null;
+            }
+            const elements = try this.arena.alloc(*const Type, a.elements.len);
+            for (a.elements, elements) |element, *t| {
+                t.* = types.any;
+                if (element) |e| {
+                    t.* = try this.patternContext(e.pattern) orelse types.any;
+                }
+            }
+            return try this.newType(.{ .tuple = elements });
+        },
+    }
+}
+
+/// The type of the value a pattern without a type annotation destructures. Like tsc, an object
+/// literal there can't have properties the pattern doesn't name (TS2353).
+fn patternInitializer(this: *Checker, init: *const Expr, pattern: *const ast.Pattern) Error!*const Type {
+    const context = try this.patternContext(pattern);
+    const t = try this.contextual(init, context);
+    if (context) |c| {
+        _ = try this.excessProperty(init, c);
+    }
+    return t;
+}
+
+/// How a pattern's names get their types.
+const BindMode = struct {
+    /// Literal types are widened, as for `let` and parameters.
+    widen: bool,
+    /// The declaration has a type annotation, which default values are checked against.
+    annotated: bool,
+};
+
+/// Gives the names in a destructuring pattern their types, from a value of type `source`, and
+/// returns `source`. With no `source` (a parameter without a type), each name gets its default
+/// value's type, or else `any` (TS7031), and what's returned is the type the pattern implies.
+fn bindPattern(this: *Checker, pattern: *const ast.Pattern, source: ?*const Type, mode: BindMode) Error!*const Type {
+    switch (pattern.data) {
+        .identifier => |b| return this.bindName(b, source, mode),
+        .object => |o| {
+            var implied: std.ArrayList(types.Property) = .empty;
+            for (o.properties) |p| {
+                var t: ?*const Type = null;
+                if (source) |s| {
+                    t = types.any;
+                    if (try this.property(s, p.key, p.key_start)) |access| {
+                        t = access.type;
+                    } else if (p.init != null) {
+                        // A property with a default value can be missing.
+                        t = types.undefined;
+                    } else {
+                        try this.report(p.key_start, .ts(2339), "Property '{s}' does not exist on type '{f}'.", .{ p.key, s });
+                    }
+                }
+                t = try this.withDefault(p.init, t, mode, p.key_start);
+                const bound = try this.bindPattern(p.value, t, mode);
+                if (source == null) {
+                    const optional = p.init != null;
+                    try putProperty(this.arena, &implied, .{ .name = p.key, .type = if (optional) try types.unionOf(this.arena, &.{ bound, types.undefined }) else bound, .optional = optional });
+                }
+            }
+            if (o.rest) |r| {
+                _ = try this.bindName(r, if (source) |s| try this.objectRest(s, o, r.start) else types.any, mode);
+            }
+            if (source) |s| {
+                return s;
+            }
+            const object = try this.arena.create(types.Object);
+            object.* = .{ .properties = implied.items };
+            return this.newType(.{ .object = object });
+        },
+        .array => |a| {
+            var from = source;
+            if (source) |s| {
+                if (!try this.checkIterable(s, pattern.start, "Destructuring a string")) {
+                    from = types.any;
+                }
+            }
+            var implied: std.ArrayList(*const Type) = .empty;
+            for (a.elements, 0..) |element, i| {
+                const e = element orelse {
+                    try implied.append(this.arena, types.any);
+                    continue;
+                };
+                var t: ?*const Type = null;
+                if (from) |s| {
+                    t = try this.elementOf(s, i, e.pattern.start, e.init != null);
+                }
+                t = try this.withDefault(e.init, t, mode, e.pattern.start);
+                try implied.append(this.arena, try this.bindPattern(e.pattern, t, mode));
+            }
+            if (a.rest) |r| {
+                _ = try this.bindPattern(r, if (from) |s| try this.arrayRest(s, a.elements.len) else types.any_array, mode);
+            }
+            if (source) |s| {
+                return s;
+            }
+            if (a.rest != null) {
+                return types.any_array;
+            }
+            return this.newType(.{ .tuple = implied.items });
+        },
+    }
+}
+
+/// Gives one name in a pattern its type, and returns the type it's declared with.
+fn bindName(this: *Checker, b: ast.Binding, source: ?*const Type, mode: BindMode) Error!*const Type {
+    const t = source orelse blk: {
+        try this.report(b.start, .ts(7031), "Binding element '{s}' implicitly has an 'any' type.", .{b.name});
+        break :blk types.any;
+    };
+    const slot = this.slot_base + b.binding;
+    const v = this.variable(slot);
+    const declared = if (v.circular) types.any else if (mode.widen) try types.widenFresh(this.arena, t) else t;
+    v.declared = declared;
+    if (this.flow.reachable) {
+        this.flow.vars[slot] = .{ .initialized = true, .type = try this.assignmentReduced(declared, t) };
+    }
+    return declared;
+}
+
+/// tsc's `getBindingElementTypeFromParentType`: with a default value, a destructured value is
+/// never `undefined`. Under a type annotation the default has to match the annotation; without
+/// one it adds its own type. With no type to start from, it's the default's type.
+fn withDefault(this: *Checker, init: ?*const Expr, t: ?*const Type, mode: BindMode, at: u32) Error!?*const Type {
+    const e = init orelse return t;
+    const expected = if (t) |x| try this.removeUndefined(x) else null;
+    const default = try this.contextual(e, expected);
+    const target = expected orelse return try types.widenFresh(this.arena, default);
+    if (mode.annotated) {
+        try this.checkAssignable(e, default, target, at, .assignment);
+        return if (types.includesUndefined(default)) t else target;
+    }
+    return try types.unionOf(this.arena, &.{ target, default });
+}
+
+fn removeUndefined(this: *Checker, t: *const Type) Error!*const Type {
+    var kept: std.ArrayList(*const Type) = .empty;
+    var buffer: [1]*const Type = undefined;
+    for (t.members(&buffer)) |m| {
+        if (m.* != .undefined) {
+            try kept.append(this.arena, m);
+        }
+    }
+    return types.unionOf(this.arena, kept.items);
+}
+
+/// Whether `t` can be iterated (spread, destructured with `[...]` or looped over with
+/// `for...of`), reporting it if not. `what` names a use of a string, which isn't supported yet.
+fn checkIterable(this: *Checker, t: *const Type, at: u32, comptime what: []const u8) Error!bool {
+    var buffer: [1]*const Type = undefined;
+    for (t.members(&buffer)) |m| {
+        switch (m.*) {
+            .any, .never, .array, .tuple => {},
+            else => {
+                if (types.isStringLike(m)) {
+                    try this.unsupported(at, what ++ " is not supported yet.", .{});
+                } else {
+                    try this.report(at, .ts(2488), "Type '{f}' must have a '[Symbol.iterator]()' method that returns an iterator.", .{t});
+                }
+                return false;
+            },
+        }
+    }
+    return true;
+}
+
+/// The type of the element at `index` when a value of type `t` (an iterable) is destructured.
+/// An element with a default value can be past the end of a tuple.
+fn elementOf(this: *Checker, t: *const Type, index: usize, at: u32, has_default: bool) Error!*const Type {
+    var parts: std.ArrayList(*const Type) = .empty;
+    var buffer: [1]*const Type = undefined;
+    for (t.members(&buffer)) |m| {
+        try parts.append(this.arena, switch (m.*) {
+            .array => |e| e,
+            .tuple => |es| if (index < es.len) es[index] else if (has_default) types.undefined else blk: {
+                try this.report(at, .ts(2493), "Tuple type '{f}' of length '{d}' has no element at index '{d}'.", .{ m, es.len, index });
+                break :blk types.undefined;
+            },
+            else => m,
+        });
+    }
+    return types.unionOf(this.arena, parts.items);
+}
+
+/// The type of `...rest` in an array pattern, after `from` elements.
+fn arrayRest(this: *Checker, t: *const Type, from: usize) Error!*const Type {
+    return switch (t.*) {
+        .array => t,
+        .tuple => |es| this.newType(.{ .tuple = es[@min(from, es.len)..] }),
+        else => types.any,
+    };
+}
+
+/// The type of `...rest` in an object pattern: the properties the pattern doesn't name.
+fn objectRest(this: *Checker, t: *const Type, pattern: ast.ObjectPattern, at: u32) Error!*const Type {
+    switch (t.*) {
+        .any => return types.any,
+        .object => |o| {
+            var kept: std.ArrayList(types.Property) = .empty;
+            for (o.properties) |p| {
+                const named = for (pattern.properties) |q| {
+                    if (std.mem.eql(u8, q.key, p.name)) {
+                        break true;
+                    }
+                } else false;
+                if (!named) {
+                    var copy = p;
+                    copy.method = false;
+                    try kept.append(this.arena, copy);
+                }
+            }
+            const object = try this.arena.create(types.Object);
+            object.* = .{ .properties = kept.items };
+            return this.newType(.{ .object = object });
+        },
+        else => {
+            try this.unsupported(at, "A rest element destructuring '{f}' is not supported yet.", .{t});
+            return types.any;
+        },
+    }
+}
+
+fn isEmptyArray(expr: *const Expr) bool {
+    const e = ast.skipParens(expr);
+    return e.data == .array and e.data.array.elements.len == 0;
 }
 
 fn isNullOrUndefined(expr: *const Expr) bool {
@@ -871,6 +1446,22 @@ fn loop(this: *Checker, stmt: *const Stmt, labels: []const []const u8) Error!voi
             try this.prescan(&.{init});
             try this.statement(init);
         }
+    }
+    // What a `for...of` or `for...in` assigns on each pass.
+    var element = types.any;
+    if (stmt.data == .for_each) {
+        const fe = stmt.data.for_each;
+        try this.pushScope(fe.scope, .block);
+        scoped = true;
+        if (fe.head == .declaration) {
+            const d = fe.head.declaration;
+            if (!fe.of and d.pattern.data != .identifier) {
+                try this.report(d.pattern.start, .ts(2491), "The left-hand side of a 'for...in' statement cannot be a destructuring pattern.", .{});
+            }
+            try this.declarePattern(d.pattern, if (d.kind == .let) .let else .@"const", d.end, null);
+        }
+        const right = try this.expression(fe.right);
+        element = if (fe.of) try this.iterationType(fe.right, right) else try this.forInType(fe.right, right);
     }
     defer if (scoped) this.popScope();
 
@@ -909,6 +1500,13 @@ fn loop(this: *Checker, stmt: *const Stmt, labels: []const []const u8) Error!voi
                     _ = try this.expression(u);
                 }
             },
+            .for_each => |fe| {
+                // It finishes from the head, once there's nothing left.
+                exit = try this.copyFlow(this.flow);
+                try this.assignHead(fe, element);
+                try this.body(fe.body);
+                try this.mergeInto(&this.flow, this.targets.items[this.targets.items.len - 1].continues);
+            },
             else => unreachable,
         }
         const target = this.targets.pop().?;
@@ -921,6 +1519,72 @@ fn loop(this: *Checker, stmt: *const Stmt, labels: []const []const u8) Error!voi
         }
         this.diagnostics.truncate(mark);
         head = next;
+    }
+}
+
+/// The type of the values a `for...of` loops over.
+fn iterationType(this: *Checker, expr: *const Expr, t: *const Type) Error!*const Type {
+    const iterable = try this.checkNonNull(expr, t);
+    if (!try this.checkIterable(iterable, expr.start, "Iterating over a string")) {
+        return types.any;
+    }
+    var parts: std.ArrayList(*const Type) = .empty;
+    var buffer: [1]*const Type = undefined;
+    for (iterable.members(&buffer)) |m| {
+        switch (m.*) {
+            .array => |e| try parts.append(this.arena, e),
+            .tuple => |es| try parts.appendSlice(this.arena, es),
+            else => try parts.append(this.arena, m),
+        }
+    }
+    return types.unionOf(this.arena, parts.items);
+}
+
+/// A `for...in` loops over property names, so its right side has to be an object.
+fn forInType(this: *Checker, expr: *const Expr, t: *const Type) Error!*const Type {
+    if (!isObjectType(t)) {
+        try this.report(expr.start, .ts(2407), "The right-hand side of a 'for...in' statement must be of type 'any', an object type or a type parameter, but here has type '{f}'.", .{t});
+    }
+    return types.string;
+}
+
+/// Whether every member of `t` is an object (or `any`), as `in` and `for...in` require.
+fn isObjectType(t: *const Type) bool {
+    var buffer: [1]*const Type = undefined;
+    for (t.members(&buffer)) |m| {
+        switch (m.*) {
+            .any, .never, .object, .array, .tuple, .function => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+/// Assigns the value a `for...of` or `for...in` is at to the variables in its head.
+fn assignHead(this: *Checker, fe: ast.ForEach, element: *const Type) Error!void {
+    switch (fe.head) {
+        // A pattern in a `for...in` is already an error (TS2491).
+        .declaration => |d| _ = try this.bindPattern(d.pattern, if (fe.of or d.pattern.data == .identifier) element else types.any, .{ .widen = d.kind == .let, .annotated = false }),
+        .target => |e| {
+            const target = ast.skipParens(e);
+            switch (target.data) {
+                .identifier => |id| {
+                    const r = try this.resolve(target, id);
+                    const slot = try this.writeTarget(target, id, r) orelse return;
+                    const declared = try this.declaredType(slot);
+                    if (!types.assignable(element, declared)) {
+                        try this.notAssignable(target.start, element, declared);
+                    }
+                    this.setVariable(slot, try this.assignmentReduced(declared, element));
+                },
+                .array, .object => try this.unsupported(target.start, "Destructuring assignments are not supported yet.", .{}),
+                .member, .index => try this.unsupported(target.start, "A 'for...{s}' statement that assigns to a property is not supported yet.", .{if (fe.of) "of" else "in"}),
+                else => if (fe.of)
+                    try this.report(target.start, .ts(2487), "The left-hand side of a 'for...of' statement must be a variable or a property access.", .{})
+                else
+                    try this.report(target.start, .ts(2406), "The left-hand side of a 'for...in' statement must be a variable or a property access.", .{}),
+            }
+        },
     }
 }
 
@@ -1064,7 +1728,7 @@ fn hasCase(cases: []const *const Type, value: *const Type) bool {
 /// How tsc shows `source` in "not assignable"/"not comparable" messages: literals widened, unless
 /// the target could be a literal itself.
 fn shownSource(this: *Checker, source: *const Type, target: *const Type) Error!*const Type {
-    return if (types.couldHaveSingletons(target)) source else types.widen(this.arena, source);
+    return if (types.couldHaveSingletons(target) or !types.isLiteralType(source)) source else types.widen(this.arena, source);
 }
 
 fn notAssignable(this: *Checker, at: u32, source: *const Type, target: *const Type) Error!void {
@@ -1352,6 +2016,9 @@ const AssignmentScan = struct {
             if (p.init) |init| {
                 this.expr(init, null, nested);
             }
+            if (p.pattern) |destructured| {
+                this.pattern(destructured, null, nested);
+            }
         }
         switch (f.body) {
             .block => |b| this.statements(b.statements, null, nested),
@@ -1378,8 +2045,23 @@ const AssignmentScan = struct {
                 if (d.init) |init| {
                     this.expr(init, outer, nested);
                 }
+                if (d.pattern) |p| {
+                    this.pattern(p, outer, nested);
+                }
             },
             .function => |f| this.function(f, true),
+            .interface, .type_alias => {},
+            .for_each => |f| {
+                switch (f.head) {
+                    .declaration => |d| this.pattern(d.pattern, outer, nested),
+                    .target => |e| {
+                        this.target(e, outer, nested);
+                        this.expr(e, outer, nested);
+                    },
+                }
+                this.expr(f.right, outer, nested);
+                this.statement(f.body, outer, nested);
+            },
             .@"return" => |value| if (value) |e| this.expr(e, outer, nested),
             .block => |b| this.statements(b.statements, outer, nested),
             .@"if" => |i| {
@@ -1413,6 +2095,31 @@ const AssignmentScan = struct {
                         this.expr(e, outer, nested);
                     }
                     this.statements(clause.statements, outer, nested);
+                }
+            },
+        }
+    }
+
+    /// The default values in a pattern.
+    fn pattern(this: *AssignmentScan, p: *const ast.Pattern, outer: ?u32, nested: bool) void {
+        switch (p.data) {
+            .identifier => {},
+            .object => |o| for (o.properties) |prop| {
+                this.pattern(prop.value, outer, nested);
+                if (prop.init) |init| {
+                    this.expr(init, outer, nested);
+                }
+            },
+            .array => |a| {
+                for (a.elements) |element| {
+                    const e = element orelse continue;
+                    this.pattern(e.pattern, outer, nested);
+                    if (e.init) |init| {
+                        this.expr(init, outer, nested);
+                    }
+                }
+                if (a.rest) |r| {
+                    this.pattern(r, outer, nested);
                 }
             },
         }
@@ -1452,6 +2159,10 @@ const AssignmentScan = struct {
                 this.expr(c.otherwise, outer, nested);
             },
             .member => |m| this.expr(m.object, outer, nested),
+            .index => |i| {
+                this.expr(i.object, outer, nested);
+                this.expr(i.index, outer, nested);
+            },
             .call => |c| {
                 this.expr(c.callee, outer, nested);
                 for (c.arguments) |arg| {
@@ -1459,6 +2170,18 @@ const AssignmentScan = struct {
                 }
             },
             .function => |f| this.function(f, true),
+            .object => |o| for (o.properties) |p| switch (p) {
+                .property => |prop| {
+                    if (prop.key == .computed) {
+                        this.expr(prop.key.computed, outer, nested);
+                    }
+                    this.expr(prop.value, outer, nested);
+                },
+                .spread => |spread| this.expr(spread.expr, outer, nested),
+            },
+            .array => |a| for (a.elements) |element| switch (element) {
+                .expr, .spread => |x| this.expr(x, outer, nested),
+            },
         }
     }
 };
@@ -1494,8 +2217,11 @@ fn expression(this: *Checker, expr: *const Expr) Error!*const Type {
         } else this.binary(expr, b),
         .conditional => |c| this.conditional(c, null),
         .member => |m| this.member(m),
+        .index => |i| if (try this.indexAccess(expr, i)) |access| access.type else types.any,
         .call => |c| this.call(expr, c),
         .function => |f| this.checkFunction(f, null, .check),
+        .object => |o| this.objectLiteral(o, null),
+        .array => |a| this.arrayLiteral(a, null),
     };
 }
 
@@ -1507,8 +2233,523 @@ fn contextual(this: *Checker, expr: *const Expr, context: ?*const Type) Error!*c
         .paren => |inner| this.contextual(inner, ctx),
         .function => |f| this.checkFunction(f, ctx, .check),
         .conditional => |c| this.conditional(c, ctx),
+        .object => |o| this.objectLiteral(o, ctx),
+        .array => |a| this.arrayLiteral(a, ctx),
         else => this.expression(expr),
     };
+}
+
+// Object and array literals
+
+/// The object type a context gives an object literal: its only object type once `null` and
+/// `undefined` are left out.
+fn contextObject(context: ?*const Type) ?*const types.Object {
+    const t = context orelse return null;
+    var found: ?*const types.Object = null;
+    var buffer: [1]*const Type = undefined;
+    for (t.members(&buffer)) |m| {
+        switch (m.*) {
+            .object => |o| {
+                if (found != null) {
+                    return null;
+                }
+                found = o;
+            },
+            .null, .undefined => {},
+            else => return null,
+        }
+    }
+    return found;
+}
+
+const ArrayContext = union(enum) {
+    none,
+    element: *const Type,
+    tuple: []const *const Type,
+};
+
+/// What a context expects of an array literal.
+fn arrayContext(context: ?*const Type) ArrayContext {
+    const t = context orelse return .none;
+    var found: ArrayContext = .none;
+    var buffer: [1]*const Type = undefined;
+    for (t.members(&buffer)) |m| {
+        const this_one: ArrayContext = switch (m.*) {
+            .array => |e| .{ .element = e },
+            .tuple => |es| .{ .tuple = es },
+            .any, .unknown => .{ .element = m },
+            .null, .undefined => continue,
+            else => return .none,
+        };
+        if (found != .none) {
+            return .none;
+        }
+        found = this_one;
+    }
+    return found;
+}
+
+/// A literal's type as part of an object or array literal: widened, unless the context expects
+/// a literal type there.
+fn literalMember(this: *Checker, t: *const Type, context: ?*const Type) Error!*const Type {
+    if (context) |c| {
+        if (types.couldHaveSingletons(c)) {
+            return t;
+        }
+    }
+    return types.widenFresh(this.arena, t);
+}
+
+fn objectLiteral(this: *Checker, o: ast.ObjectLiteral, context: ?*const Type) Error!*const Type {
+    const ctx = contextObject(context);
+    var properties: std.ArrayList(types.Property) = .empty;
+    // The properties written out (not spread), for TS1117 and TS2783.
+    const Written = struct { name: []const u8, at: u32 };
+    var written: std.ArrayList(Written) = .empty;
+    var any_spread = false;
+    for (o.properties) |p| {
+        switch (p) {
+            .property => |prop| {
+                const name: ?[]const u8 = switch (prop.key) {
+                    .name => |n| n,
+                    .computed => |e| try this.computedName(e),
+                };
+                const property_context = if (ctx != null and name != null) ctx.?.property(name.?) else null;
+                const t = try this.literalMember(try this.contextual(prop.value, property_context), property_context);
+                const n = name orelse continue;
+                if (std.mem.eql(u8, n, "toString") or std.mem.eql(u8, n, "valueOf")) {
+                    // Converting the object to a primitive would have to call it.
+                    try this.unsupported(prop.key_start, "An object with its own '{s}' is not supported yet.", .{n});
+                }
+                for (written.items) |w| {
+                    if (std.mem.eql(u8, w.name, n)) {
+                        try this.report(prop.key_start, .ts(1117), "An object literal cannot have multiple properties with the same name.", .{});
+                        break;
+                    }
+                }
+                try written.append(this.arena, .{ .name = n, .at = prop.key_start });
+                try putProperty(this.arena, &properties, .{ .name = n, .type = t, .method = prop.method });
+            },
+            .spread => |spread| {
+                const e = spread.expr;
+                const t = try this.expression(e);
+                switch (t.*) {
+                    .any => any_spread = true,
+                    .object => |so| for (so.properties) |sp| {
+                        if (!sp.optional) {
+                            for (written.items) |w| {
+                                if (std.mem.eql(u8, w.name, sp.name)) {
+                                    try this.report(w.at, .ts(2783), "'{s}' is specified more than once, so this usage will be overwritten.", .{w.name});
+                                }
+                            }
+                        }
+                        var copy = sp;
+                        copy.readonly = false;
+                        try putProperty(this.arena, &properties, copy);
+                    },
+                    else => if (isObjectType(t) or isNullOrUndefined(e))
+                        try this.unsupported(e.start, "Spreading '{f}' into an object is not supported yet.", .{t})
+                    else
+                        try this.report(spread.start, .ts(2698), "Spread types may only be created from object types.", .{}),
+                }
+            },
+        }
+    }
+    if (any_spread) {
+        return types.any;
+    }
+    const object = try this.arena.create(types.Object);
+    object.* = .{ .properties = properties.items };
+    return this.newType(.{ .object = object });
+}
+
+/// The name a computed property key gives, when its type is a literal. Null when it isn't
+/// (which has been reported).
+fn computedName(this: *Checker, e: *const Expr) Error!?[]const u8 {
+    const t = try this.expression(e);
+    if (t.* == .literal) {
+        switch (t.literal.value) {
+            .string => |str| return str,
+            .number => |n| return try @import("../runtime/number.zig").toString(this.arena, n),
+            .boolean => {},
+        }
+    }
+    const widened = try types.widen(this.arena, t);
+    if (widened.* == .any or types.isStringLike(widened) or types.isNumberLike(widened)) {
+        try this.unsupported(e.start, "A computed property name of type '{f}' is not supported yet.", .{widened});
+    } else {
+        try this.report(e.start, .ts(2464), "A computed property name must be of type 'string', 'number', 'symbol', or 'any'.", .{});
+    }
+    return null;
+}
+
+fn arrayLiteral(this: *Checker, a: ast.ArrayLiteral, context: ?*const Type) Error!*const Type {
+    const ctx = arrayContext(context);
+    const has_spread = for (a.elements) |e| {
+        if (e == .spread) {
+            break true;
+        }
+    } else false;
+    if (ctx == .tuple and !has_spread) {
+        const elements = try this.arena.alloc(*const Type, a.elements.len);
+        for (a.elements, elements, 0..) |e, *t, i| {
+            const element_context = if (i < ctx.tuple.len) ctx.tuple[i] else null;
+            t.* = try this.literalMember(try this.contextual(e.expr, element_context), element_context);
+        }
+        return this.newType(.{ .tuple = elements });
+    }
+    const element_context: ?*const Type = switch (ctx) {
+        .element => |t| t,
+        else => null,
+    };
+    var parts: std.ArrayList(*const Type) = .empty;
+    for (a.elements) |e| {
+        switch (e) {
+            .expr => |x| try parts.append(this.arena, try this.contextual(x, element_context)),
+            .spread => |x| {
+                const t = try this.expression(x);
+                if (!try this.checkIterable(t, x.start, "Spreading a string")) {
+                    try parts.append(this.arena, types.any);
+                    continue;
+                }
+                var buffer: [1]*const Type = undefined;
+                for (t.members(&buffer)) |m| {
+                    switch (m.*) {
+                        .array => |element| try parts.append(this.arena, element),
+                        .tuple => |es| try parts.appendSlice(this.arena, es),
+                        else => try parts.append(this.arena, m),
+                    }
+                }
+            },
+        }
+    }
+    const element = try this.literalMember(try types.unionOf(this.arena, parts.items), element_context);
+    return this.newType(.{ .array = element });
+}
+
+// Assignability
+
+const Use = enum { assignment, argument };
+
+/// Checks that `expr`, of type `source`, can be used where a `target` is expected, reporting it
+/// if not. Like tsc, an object literal can't have properties the target doesn't know (TS2353),
+/// and a mismatch inside a literal is reported where it is.
+fn checkAssignable(this: *Checker, expr: *const Expr, source: *const Type, target: *const Type, at: u32, kind: Use) Error!void {
+    if (try this.excessProperty(expr, target)) {
+        return;
+    }
+    if (types.assignable(source, target)) {
+        return;
+    }
+    if (try this.elaborateLiteral(expr, source, target)) {
+        return;
+    }
+    try this.reportNotAssignable(expr, source, target, at, kind);
+}
+
+/// tsc's excess property check: reports the first property of an object literal (or one nested
+/// in it) that its target type doesn't have.
+fn excessProperty(this: *Checker, expr: *const Expr, target: *const Type) Error!bool {
+    const e = ast.skipParens(expr);
+    switch (e.data) {
+        .object => |o| {
+            const t = contextObject(target) orelse return false;
+            if (t.properties.len == 0) {
+                return false;
+            }
+            for (o.properties) |p| {
+                if (p != .property or p.property.key != .name) {
+                    continue;
+                }
+                const prop = p.property;
+                const found = t.find(prop.key.name) orelse {
+                    try this.report(prop.key_start, .ts(2353), "Object literal may only specify known properties, and '{s}' does not exist in type '{f}'.", .{ prop.key.name, target_shown(target, t) });
+                    return true;
+                };
+                if (try this.excessProperty(prop.value, found.type)) {
+                    return true;
+                }
+            }
+        },
+        .array => |a| switch (arrayContext(target)) {
+            .none => {},
+            .element => |t| for (a.elements) |element| {
+                if (element == .expr and try this.excessProperty(element.expr, t)) {
+                    return true;
+                }
+            },
+            .tuple => |ts| for (a.elements, 0..) |element, i| {
+                if (i < ts.len and element == .expr and try this.excessProperty(element.expr, ts[i])) {
+                    return true;
+                }
+            },
+        },
+        else => {},
+    }
+    return false;
+}
+
+/// How a target is named in TS2353: as the object type it is, without `undefined`.
+fn target_shown(target: *const Type, object: *const types.Object) *const Type {
+    if (target.* == .object) {
+        return target;
+    }
+    var buffer: [1]*const Type = undefined;
+    for (target.members(&buffer)) |m| {
+        if (m.* == .object and m.object == object) {
+            return m;
+        }
+    }
+    return target;
+}
+
+/// tsc's `elaborateError` for literals: when an object or array literal doesn't match its
+/// target, the mismatched properties or elements are reported where they are. False if there
+/// was nothing to report that way.
+fn elaborateLiteral(this: *Checker, expr: *const Expr, source: *const Type, target: *const Type) Error!bool {
+    const e = ast.skipParens(expr);
+    var reported = false;
+    switch (e.data) {
+        .object => |o| {
+            const t = contextObject(target) orelse return false;
+            if (source.* != .object) {
+                return false;
+            }
+            for (o.properties) |p| {
+                if (p != .property or p.property.key != .name) {
+                    continue;
+                }
+                const prop = p.property;
+                const expected = t.find(prop.key.name) orelse continue;
+                const actual = source.object.find(prop.key.name) orelse continue;
+                if (types.assignable(actual.type, expected.type)) {
+                    continue;
+                }
+                if (!try this.elaborateLiteral(prop.value, actual.type, expected.type)) {
+                    try this.reportNotAssignable(prop.value, actual.type, expected.type, prop.key_start, .assignment);
+                }
+                reported = true;
+            }
+        },
+        .array => |a| {
+            const ctx = arrayContext(target);
+            if (ctx == .none or (ctx == .tuple and (source.* != .tuple or source.tuple.len != ctx.tuple.len))) {
+                return false;
+            }
+            for (a.elements, 0..) |element, i| {
+                if (element != .expr) {
+                    continue;
+                }
+                const expected = switch (ctx) {
+                    .element => |t| t,
+                    .tuple => |ts| ts[i],
+                    .none => unreachable,
+                };
+                const actual = if (source.* == .tuple) source.tuple[i] else try this.literalMember(try this.typeOf(element.expr), expected);
+                if (types.assignable(actual, expected)) {
+                    continue;
+                }
+                if (!try this.elaborateLiteral(element.expr, actual, expected)) {
+                    try this.reportNotAssignable(element.expr, actual, expected, element.expr.start, .assignment);
+                }
+                reported = true;
+            }
+        },
+        else => {},
+    }
+    return reported;
+}
+
+// Properties
+
+/// A property that was found: its type, and whether it can be assigned or deleted.
+const Access = struct {
+    type: *const Type,
+    /// The property's name, for messages.
+    name: []const u8 = "",
+    readonly: bool = false,
+    /// A declared property rather than an element, which `delete` requires to be optional
+    /// (TS2790).
+    named: bool = true,
+    /// An array's `length`, which can't be assigned yet.
+    array_length: bool = false,
+};
+
+/// Looks up the property `name` on a value of type `object`, which isn't null or undefined. Null
+/// when there's no such property; the caller reports that.
+fn property(this: *Checker, object: *const Type, name: []const u8, at: u32) Error!?Access {
+    switch (object.*) {
+        .any => return .{ .type = types.any, .name = name, .named = false },
+        .never => return .{ .type = types.never, .name = name, .named = false },
+        .object => |o| {
+            const p = o.find(name) orelse return null;
+            return .{ .type = p.type, .name = name, .readonly = p.readonly };
+        },
+        .function => {
+            if (std.mem.eql(u8, name, "name")) {
+                return .{ .type = types.string, .name = name, .readonly = true };
+            }
+            if (std.mem.eql(u8, name, "length")) {
+                return .{ .type = types.number, .name = name, .readonly = true };
+            }
+            return this.unsupportedProperty(name, at, object, &.{ "apply", "bind", "call", "toString", "prototype", "arguments", "caller" });
+        },
+        .array, .tuple => {
+            if (std.mem.eql(u8, name, "length")) {
+                if (object.* == .tuple) {
+                    return .{ .type = try types.literal(this.arena, .{ .number = @floatFromInt(object.tuple.len) }), .name = name };
+                }
+                return .{ .type = types.number, .name = name, .array_length = true };
+            }
+            if (arrayIndex(name)) |i| {
+                return switch (object.*) {
+                    .array => |e| .{ .type = e, .name = name, .named = false },
+                    .tuple => |es| if (i < es.len) .{ .type = es[i], .name = name, .named = false } else null,
+                    else => unreachable,
+                };
+            }
+            return this.unsupportedProperty(name, at, object, &.{
+                "toString",   "toLocaleString", "pop",        "push",     "concat",      "join",        "reverse",   "shift",
+                "slice",      "sort",           "splice",     "unshift",  "indexOf",     "lastIndexOf", "every",     "some",
+                "forEach",    "map",            "filter",     "reduce",   "reduceRight", "find",        "findIndex", "fill",
+                "copyWithin", "entries",        "keys",       "values",   "includes",    "flatMap",     "flat",      "at",
+                "findLast",   "findLastIndex",  "toReversed", "toSorted", "toSpliced",   "with",
+            });
+        },
+        else => {
+            try this.unsupported(at, "Properties of '{f}' are not supported yet.", .{try types.widen(this.arena, object)});
+            return .{ .type = types.any, .name = name, .named = false };
+        },
+    }
+}
+
+/// `name` as an array index, if it's one in canonical form (`"0"`, `"12"`, not `"01"`).
+fn arrayIndex(name: []const u8) ?usize {
+    if (name.len == 0 or (name.len > 1 and name[0] == '0')) {
+        return null;
+    }
+    return std.fmt.parseInt(u32, name, 10) catch null;
+}
+
+/// `o.name`, with `o` already checked.
+fn memberAccess(this: *Checker, m: ast.Member, object: *const Type) Error!?Access {
+    return try this.property(object, m.property, m.property_start) orelse {
+        try this.report(m.property_start, .ts(2339), "Property '{s}' does not exist on type '{f}'.", .{ m.property, object });
+        return null;
+    };
+}
+
+/// `o[k]`. Null when that's an error, which has been reported.
+fn indexAccess(this: *Checker, expr: *const Expr, i: ast.Index) Error!?Access {
+    const object = try this.checkNonNull(i.object, try this.expression(i.object));
+    const key = try this.expression(i.index);
+    if (object.* == .any or object.* == .never) {
+        return .{ .type = object, .named = false };
+    }
+    // A literal key names a property.
+    if (key.* == .literal and key.literal.value != .boolean) {
+        const name = switch (key.literal.value) {
+            .string => |str| str,
+            .number => |n| try @import("../runtime/number.zig").toString(this.arena, n),
+            .boolean => unreachable,
+        };
+        if (object.* == .tuple and key.literal.value == .number) {
+            const n = key.literal.value.number;
+            if (n < 0) {
+                try this.report(i.index.start, .ts(2514), "A tuple type cannot be indexed with a negative value.", .{});
+                return null;
+            }
+            if (n != @trunc(n) or n >= @as(f64, @floatFromInt(object.tuple.len))) {
+                try this.report(i.index.start, .ts(2493), "Tuple type '{f}' of length '{d}' has no element at index '{s}'.", .{ object, object.tuple.len, name });
+                return null;
+            }
+            return .{ .type = object.tuple[@intFromFloat(n)], .name = name, .named = false };
+        }
+        if (object.* == .array and key.literal.value == .number) {
+            return .{ .type = object.array, .name = name, .named = false };
+        }
+        return try this.property(object, name, i.index.start) orelse {
+            if (object.* == .array or object.* == .tuple) {
+                try this.report(i.index.start, .ts(7015), "Element implicitly has an 'any' type because index expression is not of type 'number'.", .{});
+                return null;
+            }
+            try this.report(expr.start, .ts(7053), "Element implicitly has an 'any' type because expression of type '{f}' can't be used to index type '{f}'.\n  Property '{s}' does not exist on type '{f}'.", .{ key, object, name, object });
+            return null;
+        };
+    }
+    const k = try types.widen(this.arena, key);
+    if (k.* == .any) {
+        return switch (object.*) {
+            .array => |e| .{ .type = e, .named = false },
+            .tuple => |es| .{ .type = try types.unionOf(this.arena, es), .named = false },
+            else => .{ .type = types.any, .named = false },
+        };
+    }
+    if (types.isNumberLike(k)) {
+        switch (object.*) {
+            .array => |e| return .{ .type = e, .named = false },
+            .tuple => |es| return .{ .type = try types.unionOf(this.arena, es), .named = false },
+            else => {},
+        }
+    }
+    if (!types.isStringLike(k) and !types.isNumberLike(k)) {
+        try this.report(i.index.start, .ts(2538), "Type '{f}' cannot be used as an index type.", .{key});
+        return null;
+    }
+    switch (object.*) {
+        .array, .tuple => try this.report(i.index.start, .ts(7015), "Element implicitly has an 'any' type because index expression is not of type 'number'.", .{}),
+        .object => try this.report(expr.start, .ts(7053), "Element implicitly has an 'any' type because expression of type '{f}' can't be used to index type '{f}'.\n  No index signature with a parameter of type '{f}' was found on type '{f}'.", .{ k, object, k, object }),
+        else => {
+            try this.unsupported(expr.start, "Indexing '{f}' is not supported yet.", .{try types.widen(this.arena, object)});
+            return .{ .type = types.any, .named = false };
+        },
+    }
+    return null;
+}
+
+/// The property an assignment, `++`/`--` or `delete` writes to, `o.p` or `o[k]`. Null when it
+/// can't be found, which has been reported.
+fn propertyAccess(this: *Checker, target: *const Expr) Error!?Access {
+    return switch (target.data) {
+        .member => |m| this.memberAccess(m, try this.checkNonNull(m.object, try this.expression(m.object))),
+        .index => |i| this.indexAccess(target, i),
+        else => unreachable,
+    };
+}
+
+/// The type an assignment to the property `target` must have, after checking it can be
+/// assigned. Null when it can't, which has been reported.
+fn writableProperty(this: *Checker, target: *const Expr) Error!?*const Type {
+    const access = try this.propertyAccess(target) orelse return null;
+    if (access.readonly) {
+        const at = if (target.data == .member) target.data.member.property_start else target.data.index.index.start;
+        try this.report(at, .ts(2540), "Cannot assign to '{s}' because it is a read-only property.", .{access.name});
+        return null;
+    }
+    if (access.array_length) {
+        try this.unsupported(target.start, "Assigning to an array's 'length' is not supported yet.", .{});
+        return null;
+    }
+    return access.type;
+}
+
+fn deleteExpression(this: *Checker, operand: *const Expr) Error!*const Type {
+    const e = ast.skipParens(operand);
+    if (e.data != .member and e.data != .index) {
+        _ = try this.expression(operand);
+        if (e.data == .identifier) {
+            try this.report(operand.start, .ts(1102), "'delete' cannot be called on an identifier in strict mode.", .{});
+        }
+        try this.report(operand.start, .ts(2703), "The operand of a 'delete' operator must be a property reference.", .{});
+        return types.boolean;
+    }
+    const access = try this.propertyAccess(e) orelse return types.boolean;
+    if (access.readonly) {
+        try this.report(operand.start, .ts(2704), "The operand of a 'delete' operator cannot be a read-only property.", .{});
+    } else if (access.named and !types.includesUndefined(access.type) and access.type.* != .never) {
+        try this.report(operand.start, .ts(2790), "The operand of a 'delete' operator must be optional.", .{});
+    }
+    return types.boolean;
 }
 
 /// An expression tested for truthiness, which follows the true and false paths separately
@@ -1637,6 +2878,9 @@ fn conditional(this: *Checker, c: ast.Conditional, context: ?*const Type) Error!
 }
 
 fn unary(this: *Checker, u: ast.Unary) Error!*const Type {
+    if (u.op == .delete) {
+        return this.deleteExpression(u.operand);
+    }
     const operand = try this.expression(u.operand);
     switch (u.op) {
         .not => {
@@ -1659,6 +2903,7 @@ fn unary(this: *Checker, u: ast.Unary) Error!*const Type {
             return types.unionOf(this.arena, &names);
         },
         .void => return types.undefined,
+        .delete => unreachable,
     }
 }
 
@@ -1677,12 +2922,17 @@ const arithmetic_operand = "must be of type 'any', 'number', 'bigint' or an enum
 
 fn update(this: *Checker, u: ast.Update) Error!*const Type {
     const operand = ast.skipParens(u.operand);
+    if (operand.data == .member or operand.data == .index) {
+        const t = try this.writableProperty(operand) orelse return types.number;
+        if (!isNumeric(try this.checkNonNull(u.operand, t))) {
+            try this.report(u.operand.start, .ts(2356), "An arithmetic operand " ++ arithmetic_operand, .{});
+        }
+        return types.number;
+    }
     if (operand.data != .identifier) {
         const t = try this.checkNonNull(u.operand, try this.expression(u.operand));
         if (!isNumeric(t)) {
             try this.report(u.operand.start, .ts(2356), "An arithmetic operand " ++ arithmetic_operand, .{});
-        } else if (operand.data == .member) {
-            try this.unsupported(u.operand.start, "Assigning to properties is not supported yet.", .{});
         } else {
             try this.report(u.operand.start, .ts(2357), "The operand of an increment or decrement operator must be a variable or a property access.", .{});
         }
@@ -1701,15 +2951,19 @@ fn update(this: *Checker, u: ast.Update) Error!*const Type {
 
 fn assign(this: *Checker, a: ast.Assign) Error!*const Type {
     const target = ast.skipParens(a.target);
-    if (target.data != .identifier) {
-        _ = try this.expression(a.target);
-        const value = try this.expression(a.value);
-        if (target.data == .member) {
-            try this.unsupported(a.target.start, "Assigning to properties is not supported yet.", .{});
-        } else {
+    switch (target.data) {
+        .identifier => {},
+        .member, .index => return this.assignProperty(a, target),
+        .object, .array => {
+            try this.unsupported(a.target.start, "Destructuring assignments are not supported yet.", .{});
+            return this.expression(a.value);
+        },
+        else => {
+            _ = try this.expression(a.target);
+            const value = try this.expression(a.value);
             try this.report(a.target.start, .ts(2364), "The left-hand side of an assignment expression must be a variable or a property access.", .{});
-        }
-        return value;
+            return value;
+        },
     }
     const id = target.data.identifier;
     const r = try this.resolve(target, id);
@@ -1721,9 +2975,7 @@ fn assign(this: *Checker, a: ast.Assign) Error!*const Type {
     const op = a.op orelse {
         const declared = try this.declaredType(slot);
         const value = try this.contextual(a.value, declared);
-        if (!types.assignable(value, declared)) {
-            try this.reportNotAssignable(a.value, value, declared, a.target.start, .assignment);
-        }
+        try this.checkAssignable(a.value, value, declared, a.target.start, .assignment);
         this.setVariable(slot, try this.assignmentReduced(declared, value));
         return value;
     };
@@ -1765,6 +3017,36 @@ fn assign(this: *Checker, a: ast.Assign) Error!*const Type {
     return result.type;
 }
 
+/// `o.p = v`, `o[k] += v` and so on.
+fn assignProperty(this: *Checker, a: ast.Assign, target: *const Expr) Error!*const Type {
+    const declared = try this.writableProperty(target);
+    const op = a.op orelse {
+        const value = try this.contextual(a.value, declared);
+        if (declared) |t| {
+            try this.checkAssignable(a.value, value, t, a.target.start, .assignment);
+        }
+        return value;
+    };
+    const current = declared orelse types.any;
+    const left = try types.widen(this.arena, current);
+    const value = try this.expression(a.value);
+    if (op.isLogical()) {
+        if (declared != null and !types.assignable(value, left)) {
+            try this.notAssignable(a.target.start, value, left);
+        }
+        return switch (op) {
+            .logical_and => if (!try this.canBeTruthy(current)) current else types.unionOf(this.arena, &.{ try this.definitelyFalsy(current), value }),
+            .logical_or => if (!try this.canBeFalsy(current)) current else types.unionOf(this.arena, &.{ try this.removeDefinitelyFalsy(current), value }),
+            else => types.unionOf(this.arena, &.{ try this.removeNullish(current), value }),
+        };
+    }
+    const result = try this.operator(op, a.target, a.value, left, value, true);
+    if (declared != null and result.ok and !types.assignable(result.type, left)) {
+        try this.notAssignable(a.target.start, result.type, left);
+    }
+    return result.type;
+}
+
 fn binary(this: *Checker, expr: *const Expr, b: ast.Binary) Error!*const Type {
     const left = try this.expression(b.left);
     if (b.op == .comma and this.indirect_call != expr and isSideEffectFree(b.left)) {
@@ -1785,6 +3067,19 @@ const Operation = struct {
 fn operator(this: *Checker, op: ast.BinaryOp, left_expr: *const Expr, right_expr: *const Expr, left: *const Type, right: *const Type, compound: bool) Error!Operation {
     switch (op) {
         .comma => return .{ .type = right },
+        .in => {
+            var ok = true;
+            if (!isAny(left) and !types.isStringLike(left) and !types.isNumberLike(left)) {
+                try this.report(left_expr.start, .ts(2322), "Type '{f}' is not assignable to type 'string | number | symbol'.", .{try types.widen(this.arena, left)});
+                ok = false;
+            }
+            const r = try this.checkNonNull(right_expr, right);
+            if (!isObjectType(r)) {
+                try this.report(right_expr.start, .ts(2322), "Type '{f}' is not assignable to type 'object'.", .{try types.widen(this.arena, r)});
+                ok = false;
+            }
+            return .{ .type = types.boolean, .ok = ok };
+        },
         .add => {
             var l = left;
             var r = right;
@@ -1819,6 +3114,10 @@ fn operator(this: *Checker, op: ast.BinaryOp, left_expr: *const Expr, right_expr
             return .{ .type = types.boolean, .ok = ok };
         },
         .equal, .not_equal, .strict_equal, .strict_not_equal => {
+            if (isObjectLiteral(left_expr) or isObjectLiteral(right_expr)) {
+                const always = if (op == .equal or op == .strict_equal) "false" else "true";
+                try this.report(left_expr.start, .ts(2839), "This condition will always return '{s}' since JavaScript compares objects by reference, not value.", .{always});
+            }
             for ([_]*const Expr{ left_expr, right_expr }) |operand| {
                 if (this.isGlobal(operand, "NaN")) {
                     const always = if (op == .equal or op == .strict_equal) "false" else "true";
@@ -1869,12 +3168,17 @@ fn operatorError(this: *Checker, op: ast.BinaryOp, compound: bool, left_expr: *c
 fn isSideEffectFree(expr: *const Expr) bool {
     const e = ast.skipParens(expr);
     return switch (e.data) {
-        .identifier, .string, .template, .number, .boolean, .null, .function => true,
-        .unary => |u| u.op != .void,
+        .identifier, .string, .template, .number, .boolean, .null, .function, .object, .array => true,
+        .unary => |u| u.op != .void and u.op != .delete,
         .conditional => |c| isSideEffectFree(c.then) and isSideEffectFree(c.otherwise),
         .binary => |b| isSideEffectFree(b.left) and isSideEffectFree(b.right),
         else => false,
     };
+}
+
+/// tsc's `isLiteralExpressionOfObject`: an expression that makes a new object each time.
+fn isObjectLiteral(expr: *const Expr) bool {
+    return expr.data == .object or expr.data == .array or expr.data == .function;
 }
 
 fn isAny(t: *const Type) bool {
@@ -1887,50 +3191,19 @@ fn isNumeric(t: *const Type) bool {
 
 fn member(this: *Checker, m: ast.Member) Error!*const Type {
     const object = try this.checkNonNull(m.object, try this.expression(m.object));
-    switch (object.*) {
-        .any => return types.any,
-        .object => |o| return o.property(m.property) orelse {
-            try this.report(m.property_start, .ts(2339), "Property '{s}' does not exist on type '{f}'.", .{ m.property, object });
-            return types.any;
-        },
-        .function => {
-            if (std.mem.eql(u8, m.property, "name")) {
-                return types.string;
-            }
-            if (std.mem.eql(u8, m.property, "length")) {
-                return types.number;
-            }
-            return this.unsupportedProperty(m, object, &.{ "apply", "bind", "call", "toString", "prototype", "arguments", "caller" });
-        },
-        .array => {
-            if (std.mem.eql(u8, m.property, "length")) {
-                return types.number;
-            }
-            return this.unsupportedProperty(m, object, &.{
-                "toString",   "toLocaleString", "pop",    "push",    "concat",      "join",        "reverse",   "shift",
-                "slice",      "sort",           "splice", "unshift", "indexOf",     "lastIndexOf", "every",     "some",
-                "forEach",    "map",            "filter", "reduce",  "reduceRight", "find",        "findIndex", "fill",
-                "copyWithin", "entries",        "keys",   "values",  "includes",    "flatMap",     "flat",      "at",
-            });
-        },
-        .never => return types.never,
-        else => {
-            try this.unsupported(m.property_start, "Properties of '{f}' are not supported yet.", .{try types.widen(this.arena, object)});
-            return types.any;
-        },
-    }
+    const access = try this.memberAccess(m, object) orelse return types.any;
+    return access.type;
 }
 
-/// A property that exists but isn't implemented yet (one of `known`), or TS2339.
-fn unsupportedProperty(this: *Checker, m: ast.Member, object: *const Type, known: []const []const u8) Error!*const Type {
-    for (known) |name| {
-        if (std.mem.eql(u8, name, m.property)) {
-            try this.unsupported(m.property_start, "The '{s}' property of '{f}' is not supported yet.", .{ m.property, object });
-            return types.any;
+/// A property that exists but isn't implemented yet (one of `known`), or null.
+fn unsupportedProperty(this: *Checker, name: []const u8, at: u32, object: *const Type, known: []const []const u8) Error!?Access {
+    for (known) |k| {
+        if (std.mem.eql(u8, k, name)) {
+            try this.unsupported(at, "The '{s}' property of '{f}' is not supported yet.", .{ name, object });
+            return .{ .type = types.any, .name = name, .named = false };
         }
     }
-    try this.report(m.property_start, .ts(2339), "Property '{s}' does not exist on type '{f}'.", .{ m.property, object });
-    return types.any;
+    return null;
 }
 
 fn call(this: *Checker, expr: *const Expr, c: ast.Call) Error!*const Type {
@@ -1991,9 +3264,10 @@ fn callFunction(this: *Checker, expr: *const Expr, c: ast.Call, f: *const types.
         if (i < f.parameters.len and f.parameters[i].optional) {
             param = try types.unionOf(this.arena, &.{ param, types.undefined });
         }
-        if (!types.assignable(arg_type, param)) {
-            try this.reportNotAssignable(arg, arg_type, f.parameterType(i).?, arg.start, .argument);
+        if (try this.excessProperty(arg, param) or types.assignable(arg_type, param) or try this.elaborateLiteral(arg, arg_type, param)) {
+            continue;
         }
+        try this.reportNotAssignable(arg, arg_type, f.parameterType(i).?, arg.start, .argument);
     }
     return f.returns;
 }
@@ -2128,11 +3402,16 @@ fn checkFunction(this: *Checker, f: *const ast.Function, context_type: ?*const T
     var seen_optional = false;
     // All of them first, so a default value that uses a later one finds it (TS2373).
     for (f.parameters) |*p| {
-        try this.declare(this.slot_base + p.binding, .{ .name = p.name, .kind = .parameter, .start = p.start, .end = p.end, .source = this.source, .annotation = p.type, .init = p.init });
+        if (p.pattern) |pattern| {
+            try this.declarePattern(pattern, .parameter, p.end, null);
+        } else {
+            try this.declare(this.slot_base + p.binding, .{ .name = p.name, .kind = .parameter, .start = p.start, .end = p.end, .source = this.source, .annotation = p.type, .init = p.init });
+        }
     }
     for (f.parameters, 0..) |*p, i| {
         const slot = this.slot_base + p.binding;
-        const v = this.variable(slot);
+        // A destructured parameter has no variable of its own.
+        const v: ?*Variable = if (p.pattern == null) this.variable(slot) else null;
         var from_context: ?*const Type = null;
         if (context) |c| {
             if (!p.rest) {
@@ -2153,7 +3432,7 @@ fn checkFunction(this: *Checker, f: *const ast.Function, context_type: ?*const T
             }
         } else if (from_context) |c| {
             t = c;
-        } else if (p.init == null) {
+        } else if (p.init == null and p.pattern == null) {
             if (p.rest) {
                 try this.report(p.node_start, .ts(7019), "Rest parameter '{s}' implicitly has an 'any[]' type.", .{p.name});
                 t = types.any_array;
@@ -2161,18 +3440,25 @@ fn checkFunction(this: *Checker, f: *const ast.Function, context_type: ?*const T
                 try this.report(p.start, .ts(7006), "Parameter '{s}' implicitly has an 'any' type.", .{p.name});
             }
         }
+        const typed = p.type != null or from_context != null;
         if (p.init) |init| {
-            const typed = p.type != null or from_context != null;
             this.parameter = p.name;
-            v.resolving = !typed;
-            const init_type = try this.contextual(init, if (typed) t else null);
-            v.resolving = false;
+            if (v) |x| {
+                x.resolving = !typed;
+            }
+            const init_type = if (!typed and p.pattern != null) try this.patternInitializer(init, p.pattern.?) else try this.contextual(init, if (typed) t else null);
+            if (v) |x| {
+                x.resolving = false;
+            }
             this.parameter = null;
             if (!typed) {
-                t = if (v.circular) types.any else try types.widenFresh(this.arena, init_type);
-            } else if (!types.assignable(init_type, t)) {
-                try this.reportNotAssignable(init, init_type, t, p.start, .assignment);
+                t = if (v != null and v.?.circular) types.any else try types.widenFresh(this.arena, init_type);
+            } else {
+                try this.checkAssignable(init, init_type, t, p.start, .assignment);
             }
+        }
+        if (p.pattern) |pattern| {
+            t = try this.bindPattern(pattern, if (typed or p.init != null) t else null, .{ .widen = true, .annotated = p.type != null });
         }
         if (!p.optional and p.init == null and !p.rest and seen_optional) {
             try this.report(p.start, .ts(1016), "A required parameter cannot follow an optional parameter.", .{});
@@ -2181,8 +3467,10 @@ fn checkFunction(this: *Checker, f: *const ast.Function, context_type: ?*const T
         if (p.optional) {
             t = try types.unionOf(this.arena, &.{ t, types.undefined });
         }
-        v.declared = t;
-        this.flow.vars[slot] = .{ .initialized = true, .type = t };
+        if (v) |x| {
+            x.declared = t;
+            this.flow.vars[slot] = .{ .initialized = true, .type = t };
+        }
         if (p.rest) {
             signature.rest = .{ .name = p.name, .type = t };
         } else {
@@ -2224,9 +3512,7 @@ fn checkFunction(this: *Checker, f: *const ast.Function, context_type: ?*const T
         .expression => |e| {
             const t = try this.contextual(e, declared_return orelse ctx.contextual_return);
             if (declared_return) |r| {
-                if (!types.assignable(t, r)) {
-                    try this.reportNotAssignable(e, t, r, e.start, .assignment);
-                }
+                try this.checkAssignable(e, t, r, e.start, .assignment);
             }
             try ctx.returns.append(this.arena, t);
             this.flow = .unreachable_flow;
@@ -2348,6 +3634,17 @@ fn refersTo(t: *const Type, target: *const Type) bool {
             }
         } else false,
         .array => |e| refersTo(e, target),
+        .tuple => |es| for (es) |e| {
+            if (refersTo(e, target)) {
+                break true;
+            }
+        } else false,
+        // A named object type can refer to itself, so it isn't looked into.
+        .object => |o| o.name.len == 0 and for (o.properties) |p| {
+            if (refersTo(p.type, target)) {
+                break true;
+            }
+        } else false,
         .function => |f| refersTo(f.returns, target) or for (f.parameters) |p| {
             if (refersTo(p.type, target)) {
                 break true;
@@ -2369,9 +3666,7 @@ fn returnStatement(this: *Checker, stmt: *const Stmt, value: ?*const Expr) Error
     if (value) |v| {
         const t = try this.contextual(v, ctx.declared_return orelse ctx.contextual_return);
         if (ctx.declared_return) |r| {
-            if (!types.assignable(t, r)) {
-                try this.reportNotAssignable(v, t, r, stmt.start, .assignment);
-            }
+            try this.checkAssignable(v, t, r, stmt.start, .assignment);
         }
         try ctx.returns.append(this.arena, t);
     } else {
@@ -2388,7 +3683,7 @@ fn returnStatement(this: *Checker, stmt: *const Stmt, value: ?*const Expr) Error
 /// Reports that `expr`, of type `source`, can't be used as a `target`, as an assignment (TS2322)
 /// or an argument (TS2345). Like tsc, a mismatched return type of an arrow function with an
 /// expression body is reported at that expression.
-fn reportNotAssignable(this: *Checker, expr: *const Expr, source: *const Type, target: *const Type, at: u32, kind: enum { assignment, argument }) Error!void {
+fn reportNotAssignable(this: *Checker, expr: *const Expr, source: *const Type, target: *const Type, at: u32, kind: Use) Error!void {
     const e = ast.skipParens(expr);
     if (e.data == .function and source.* == .function) {
         const f = e.data.function;
@@ -2401,6 +3696,19 @@ fn reportNotAssignable(this: *Checker, expr: *const Expr, source: *const Type, t
             const mismatch = types.functionMismatch(source.function, t);
             if (f.kind == .arrow and f.body == .expression and !annotated and mismatch != null and mismatch.? == .returns) {
                 return this.report(f.body.expression.start, .ts(2322), "Type '{f}' is not assignable to type '{f}'.", .{ try this.shownSource(source.function.returns, t.returns), t.returns });
+            }
+        }
+    }
+    // A missing property is the whole message for an assignment, and the elaboration for an
+    // argument.
+    if (contextObject(target)) |object| {
+        if (types.objectMismatch(source, object, null)) |mismatch| {
+            if (mismatch == .missing) {
+                const missing = try this.missingMessage(source, object, target);
+                switch (kind) {
+                    .assignment => return this.report(at, missing.code, "{s}", .{missing.text}),
+                    .argument => return this.report(at, .ts(2345), "Argument of type '{f}' is not assignable to parameter of type '{f}'.\n  {s}", .{ try this.shownSource(source, target), target, missing.text }),
+                }
             }
         }
     }
@@ -2420,8 +3728,55 @@ fn reportNotAssignable(this: *Checker, expr: *const Expr, source: *const Type, t
     }
 }
 
-/// The lines tsc adds to say why one function type isn't assignable to another.
+const Message = struct {
+    code: diagnostic.Code,
+    text: []const u8,
+};
+
+/// TS2741, TS2739 or TS2740: the properties `source` lacks.
+fn missingMessage(this: *Checker, source: *const Type, object: *const types.Object, target: *const Type) Error!Message {
+    const missing = try types.missingProperties(this.arena, source, object);
+    const shown = target_shown(target, object);
+    if (missing.len == 1) {
+        return .{ .code = .ts(2741), .text = try std.fmt.allocPrint(this.arena, "Property '{s}' is missing in type '{f}' but required in type '{f}'.", .{ missing[0], source, shown }) };
+    }
+    const listed = missing[0..@min(missing.len, 4)];
+    const names = try std.mem.join(this.arena, ", ", listed);
+    if (missing.len > 4) {
+        return .{ .code = .ts(2740), .text = try std.fmt.allocPrint(this.arena, "Type '{f}' is missing the following properties from type '{f}': {s}, and {d} more.", .{ source, shown, names, missing.len - 4 }) };
+    }
+    return .{ .code = .ts(2739), .text = try std.fmt.allocPrint(this.arena, "Type '{f}' is missing the following properties from type '{f}': {s}", .{ source, shown, names }) };
+}
+
+/// The lines tsc adds to say why one type isn't assignable to another.
 fn elaborate(this: *Checker, source: *const Type, target: *const Type) Error![]const u8 {
+    if (contextObject(target)) |object| {
+        const mismatch = types.objectMismatch(source, object, null) orelse return "";
+        const shown = target_shown(target, object);
+        return switch (mismatch) {
+            .not_object, .missing => "",
+            .optional => |name| std.fmt.allocPrint(this.arena, "\n  Property '{s}' is optional in type '{f}' but required in type '{f}'.", .{ name, source, shown }),
+            .property => |name| blk: {
+                if (source.* != .object) {
+                    break :blk "";
+                }
+                const from = source.object.property(name).?;
+                const to = object.property(name).?;
+                break :blk std.fmt.allocPrint(this.arena, "\n  Types of property '{s}' are incompatible.\n    Type '{f}' is not assignable to type '{f}'.", .{ name, try this.shownSource(from, to), to });
+            },
+        };
+    }
+    if (target.* == .tuple) {
+        if (source.* == .tuple and source.tuple.len < target.tuple.len) {
+            return std.fmt.allocPrint(this.arena, "\n  Source has {d} element(s) but target requires {d}.", .{ source.tuple.len, target.tuple.len });
+        }
+        if (source.* == .tuple and source.tuple.len > target.tuple.len) {
+            return std.fmt.allocPrint(this.arena, "\n  Source has {d} element(s) but target allows only {d}.", .{ source.tuple.len, target.tuple.len });
+        }
+        if (source.* == .array) {
+            return std.fmt.allocPrint(this.arena, "\n  Target requires {d} element(s) but source may have fewer.", .{target.tuple.len});
+        }
+    }
     if (source.* != .function or target.* != .function) {
         return "";
     }
@@ -2554,7 +3909,7 @@ fn truthySemantics(this: *const Checker, expr: *const Expr) Semantics {
         .unary => |u| if (u.op == .void) .never else .sometimes,
         .identifier => if (this.isGlobal(e, "undefined")) .never else .sometimes,
         .conditional => |c| combine(this.truthySemantics(c.then), this.truthySemantics(c.otherwise)),
-        .function => .always,
+        .function, .object, .array => .always,
         else => .sometimes,
     };
 }
@@ -2565,7 +3920,7 @@ fn nullishSemantics(this: *const Checker, expr: *const Expr) Semantics {
     return switch (e.data) {
         .null => .always,
         .identifier => if (this.isGlobal(e, "undefined")) .always else .sometimes,
-        .member, .call => .sometimes,
+        .member, .index, .call => .sometimes,
         .binary => |b| switch (b.op) {
             .nullish, .logical_or, .logical_and => .sometimes,
             .comma => this.nullishSemantics(b.right),
@@ -2598,7 +3953,7 @@ fn canBeFalsy(this: *Checker, t: *const Type) Error!bool {
     for (t.members(&buffer)) |m| {
         switch (m.*) {
             .literal => if (isFalsyLiteral(m)) return true,
-            .object, .function, .array, .never => {},
+            .object, .function, .array, .tuple, .never => {},
             else => return true,
         }
     }
@@ -2741,12 +4096,27 @@ fn uses(this: *const Checker, expr: *const Expr, target: *const Expr) bool {
         .binary => |b| this.uses(b.left, target) or this.uses(b.right, target),
         .conditional => |c| this.uses(c.condition, target) or this.uses(c.then, target) or this.uses(c.otherwise, target),
         .member => |m| this.uses(m.object, target),
+        .index => |i| this.uses(i.object, target) or this.uses(i.index, target),
         .call => |c| this.uses(c.callee, target) or for (c.arguments) |arg| {
             if (this.uses(arg, target)) {
                 break true;
             }
         } else false,
         .function => |f| this.usesInFunction(f, target),
+        .object => |o| for (o.properties) |p| {
+            const used = switch (p) {
+                .property => |prop| (prop.key == .computed and this.uses(prop.key.computed, target)) or this.uses(prop.value, target),
+                .spread => |spread| this.uses(spread.expr, target),
+            };
+            if (used) {
+                break true;
+            }
+        } else false,
+        .array => |a| for (a.elements) |element| {
+            switch (element) {
+                .expr, .spread => |e| if (this.uses(e, target)) break true,
+            }
+        } else false,
     };
 }
 
@@ -2786,6 +4156,8 @@ fn usesInStatement(this: *const Checker, stmt: *const Stmt, target: *const Expr)
             (if (f.update) |u| this.uses(u, target) else false) or
             this.usesInStatement(f.body, target),
         .labeled => |l| this.usesInStatement(l.body, target),
+        .interface, .type_alias => false,
+        .for_each => |f| (f.head == .target and this.uses(f.head.target, target)) or this.uses(f.right, target) or this.usesInStatement(f.body, target),
         .@"switch" => |sw| this.uses(sw.discriminant, target) or for (sw.clauses) |clause| {
             if (clause.case) |c| {
                 if (this.uses(c, target)) {

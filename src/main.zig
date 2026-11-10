@@ -162,10 +162,7 @@ fn repl(io: std.Io, runtime: *zavascript.Runtime, stdin: std.Io.File, stdout: *s
             continue;
         }
         if (runtime.run("repl", input)) |value| {
-            runtime.inspect(stdout, value) catch |err| switch (err) {
-                error.Unsupported => try stdout.writeAll("(can't show this value yet)"),
-                else => |e| return e,
-            };
+            try runtime.inspect(stdout, value);
             try stdout.writeByte('\n');
         } else |err| {
             switch (err) {
