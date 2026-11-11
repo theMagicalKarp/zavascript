@@ -1,0 +1,11 @@
+const a = "a" as number; //! TS2352
+const b = { x: 1 } as { y: number }; //! TS2352
+const c = 1 as unknown as string;
+const d = 1 satisfies string; //! TS1360
+const e = { x: 1, y: 2 } satisfies { x: number }; //! TS2353
+const f = { x: "1" } satisfies { x: number }; //! TS2322
+let g = (1 + 1) as const; //! TS1355
+const h = { k: "v" } as const;
+h.k = "w"; //! TS2540
+let i = "i" as const;
+i = "j"; //! TS2322

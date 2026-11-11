@@ -6,9 +6,11 @@
 //! all reported but one mistake doesn't cascade.
 //!
 //! Alongside types, the checker follows control flow the way tsc's flow analysis does: which
-//! variables are definitely assigned (TS2454), and what an assignment narrows a variable to
-//! (`let b = true` is `true` until something assigns `false`). A loop is checked repeatedly until
-//! the state at its head stops changing; only the last pass's diagnostics are kept.
+//! variables are definitely assigned (TS2454), and what assignments and tests narrow a variable or
+//! a property of one to (`let b = true` is `true` until something assigns `false`; after
+//! `if (typeof x === "string") return;`, `x` isn't a string). What a test does to a type is in
+//! `narrowing.zig`. A loop is checked repeatedly until the state at its head stops changing; only
+//! the last pass's diagnostics are kept.
 //!
 //! Functions are checked where they appear. A function declaration that's used before that (it's
 //! hoisted) has its return type inferred early, without reporting anything, and its body is still
@@ -26,6 +28,7 @@ const Source = @import("../Source.zig");
 const diagnostic = @import("../diagnostic.zig");
 const ast = @import("../syntax/ast.zig");
 const types = @import("types.zig");
+const narrowing = @import("narrowing.zig");
 const Type = types.Type;
 const Expr = ast.Expr;
 const Stmt = ast.Stmt;
@@ -71,6 +74,9 @@ parameter: ?[]const u8 = null,
 program: []const *const Stmt,
 /// While above zero, diagnostics are dropped; for checking an expression a second time.
 muted: u32 = 0,
+/// How many aliased conditions (`const isString = typeof x === "string"; if (isString)`) are
+/// being narrowed by, through their initializers. Only constant references narrow then.
+aliased: u32 = 0,
 /// Variables whose types are being worked out early, for a use before their declaration; each
 /// was reached from the one before it.
 lazy: std.ArrayList(u32) = .empty,
@@ -86,6 +92,9 @@ added_types: std.ArrayList([]const u8) = .empty,
 /// checked (or checked without reporting).
 declaring: u32 = 0,
 late: std.ArrayList(Late) = .empty,
+/// Inside the operand of `as const`, where literals keep their types and properties are
+/// `readonly`.
+const_context: bool = false,
 
 const Late = struct {
     at: u32,
@@ -265,13 +274,64 @@ pub const VarFlow = struct {
     type: ?*const Type = null,
 };
 
+/// What flow analysis knows about a property of a variable, like `o.a.b`, which a test or an
+/// assignment has narrowed.
+const PathFlow = struct {
+    reference: Reference,
+    type: *const Type,
+};
+
+/// Something narrowing can apply to: a variable, or a chain of properties of one.
+const Reference = struct {
+    slot: u32,
+    /// Empty for the variable itself.
+    path: []const []const u8 = &.{},
+
+    fn eql(a: Reference, b: Reference) bool {
+        if (a.slot != b.slot or a.path.len != b.path.len) {
+            return false;
+        }
+        for (a.path, b.path) |x, y| {
+            if (!std.mem.eql(u8, x, y)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Whether `this` is `prefix` or a property (of a property...) of it.
+    fn startsWith(this: Reference, prefix: Reference) bool {
+        if (this.slot != prefix.slot or this.path.len < prefix.path.len) {
+            return false;
+        }
+        for (prefix.path, this.path[0..prefix.path.len]) |x, y| {
+            if (!std.mem.eql(u8, x, y)) {
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
 /// The state at one point in the program. Every reachable flow has one entry per slot. Each
-/// `Flow` value owns its `vars`; splitting the flow copies them.
+/// `Flow` value owns its `vars`; splitting the flow copies them. `paths` is never changed in
+/// place, so flows can share it.
 const Flow = struct {
     reachable: bool,
     vars: []VarFlow,
+    /// Narrowed properties. One that isn't here has its declared type.
+    paths: []const PathFlow = &.{},
 
     const unreachable_flow: Flow = .{ .reachable = false, .vars = &.{} };
+
+    fn path(this: Flow, reference: Reference) ?*const Type {
+        for (this.paths) |p| {
+            if (p.reference.eql(reference)) {
+                return p.type;
+            }
+        }
+        return null;
+    }
 
     fn eql(a: Flow, b: Flow) bool {
         if (a.reachable != b.reachable) {
@@ -279,6 +339,15 @@ const Flow = struct {
         }
         if (!a.reachable) {
             return true;
+        }
+        if (a.paths.len != b.paths.len) {
+            return false;
+        }
+        for (a.paths) |p| {
+            const t = b.path(p.reference) orelse return false;
+            if (!t.eql(p.type)) {
+                return false;
+            }
         }
         for (a.vars, b.vars) |x, y| {
             if (x.initialized != y.initialized) {
@@ -465,7 +534,7 @@ fn copyFlow(this: *Checker, flow: Flow) Error!Flow {
     if (!flow.reachable) {
         return .unreachable_flow;
     }
-    return .{ .reachable = true, .vars = try this.arena.dupe(VarFlow, flow.vars) };
+    return .{ .reachable = true, .vars = try this.arena.dupe(VarFlow, flow.vars), .paths = flow.paths };
 }
 
 /// Where two paths meet: a variable is assigned if it is on both, and holds either path's type.
@@ -477,20 +546,57 @@ fn mergeInto(this: *Checker, into: *Flow, other: Flow) Error!void {
         into.* = try this.copyFlow(other);
         return;
     }
-    for (into.vars, other.vars) |*a, b| {
+    for (into.vars, other.vars, 0..) |*a, b, slot| {
         a.initialized = a.initialized and b.initialized;
         if (a.type == null or b.type == null) {
             a.type = null;
         } else if (!a.type.?.eql(b.type.?)) {
             a.type = try types.unionOf(this.arena, &.{ a.type.?, b.type.? });
+            if (this.session.variables.items[slot].declared) |declared| {
+                a.type = try types.orderLike(this.arena, a.type.?, declared);
+            }
         }
+    }
+    // A property narrowed on only one path has its declared type here.
+    var paths: std.ArrayList(PathFlow) = .empty;
+    for (into.paths) |p| {
+        const t = other.path(p.reference) orelse continue;
+        try paths.append(this.arena, .{ .reference = p.reference, .type = if (t.eql(p.type)) t else try types.unionOf(this.arena, &.{ p.type, t }) });
+    }
+    into.paths = paths.items;
+}
+
+fn setVariable(this: *Checker, slot: u32, t: *const Type) Error!void {
+    if (this.flow.reachable) {
+        this.flow.vars[slot] = .{ .initialized = true, .type = t };
+        try this.forgetPaths(.{ .slot = slot });
     }
 }
 
-fn setVariable(this: *Checker, slot: u32, t: *const Type) void {
-    if (this.flow.reachable) {
-        this.flow.vars[slot] = .{ .initialized = true, .type = t };
+/// Forgets what's known about the properties of `reference` (and `reference` itself, for a
+/// property), since it's been assigned.
+fn forgetPaths(this: *Checker, reference: Reference) Error!void {
+    var kept: std.ArrayList(PathFlow) = .empty;
+    for (this.flow.paths) |p| {
+        if (!p.reference.startsWith(reference)) {
+            try kept.append(this.arena, p);
+        }
     }
+    if (kept.items.len < this.flow.paths.len) {
+        this.flow.paths = kept.items;
+    }
+}
+
+/// Records what a property holds: what's been assigned to it, or what a test narrowed it to.
+fn setPath(this: *Checker, reference: Reference, t: *const Type) Error!void {
+    if (!this.flow.reachable) {
+        return;
+    }
+    try this.forgetPaths(reference);
+    var paths: std.ArrayList(PathFlow) = .empty;
+    try paths.appendSlice(this.arena, this.flow.paths);
+    try paths.append(this.arena, .{ .reference = reference, .type = t });
+    this.flow.paths = paths.items;
 }
 
 // Scopes and declarations
@@ -942,6 +1048,18 @@ fn resolveType(this: *Checker, node: *const ast.TypeNode) Error!*const Type {
             .string => types.string,
         },
         .reference => |name| this.resolveReference(node.start, name),
+        .literal => |l| types.literal(this.arena, switch (l) {
+            .number => |n| .{ .number = n },
+            .string => |str| .{ .string = str },
+            .boolean => |b| .{ .boolean = b },
+        }),
+        .@"union" => |ms| blk: {
+            const resolved = try this.arena.alloc(*const Type, ms.len);
+            for (ms, resolved) |m, *t| {
+                t.* = try this.resolveType(m);
+            }
+            break :blk types.unionOf(this.arena, resolved);
+        },
         .array => |element| this.newType(.{ .array = try this.resolveType(element) }),
         .tuple => |elements| blk: {
             const resolved = try this.arena.alloc(*const Type, elements.len);
@@ -1012,31 +1130,6 @@ fn assignmentReduced(this: *Checker, declared: *const Type, assigned: *const Typ
     return if (types.assignable(assigned, reduced)) reduced else declared;
 }
 
-/// Narrows a variable's type to the members that can pass (or fail) a truthiness or nullishness
-/// test, for the branch of a logical assignment that doesn't assign.
-fn narrowVariable(this: *Checker, slot: u32, at: u32, comptime keep: enum { truthy, falsy, non_nullish }) Error!void {
-    if (!this.flow.reachable or !types.isUnion(try this.declaredType(slot))) {
-        return;
-    }
-    const current = this.flow.vars[slot].type orelse if (this.isOuter(slot)) blk: {
-        this.muted += 1;
-        defer this.muted -= 1;
-        break :blk try this.outerType(slot, at, try this.declaredType(slot));
-    } else return;
-    var kept: std.ArrayList(*const Type) = .empty;
-    for (try types.expandedMembers(this.arena, current)) |m| {
-        const ok = switch (keep) {
-            .truthy => !isFalsyLiteral(m),
-            .falsy => try this.canBeFalsy(m),
-            .non_nullish => m.* != .null and m.* != .undefined,
-        };
-        if (ok) {
-            try kept.append(this.arena, m);
-        }
-    }
-    this.flow.vars[slot].type = try types.unionOf(this.arena, kept.items);
-}
-
 // Statements
 
 fn statement(this: *Checker, stmt: *const Stmt) Error!void {
@@ -1055,7 +1148,16 @@ fn labeledStatement(this: *Checker, stmt: *const Stmt, labels: []const []const u
         try this.targets.append(this.arena, .{ .kind = .label, .labels = labels });
     }
     switch (stmt.data) {
-        .expression => |e| _ = try this.expression(e),
+        .expression => |e| {
+            _ = try this.expression(e);
+            if (this.isNeverCall(e)) {
+                this.flow = .unreachable_flow;
+            }
+        },
+        .throw => |e| {
+            _ = try this.expression(e);
+            this.flow = .unreachable_flow;
+        },
         .empty => {},
         .variable => |v| try this.variableStatement(v),
         .function => |f| _ = try this.checkFunction(f, null, .check),
@@ -1080,6 +1182,32 @@ fn labeledStatement(this: *Checker, stmt: *const Stmt, labels: []const []const u
         const target = this.targets.pop().?;
         try this.mergeInto(&this.flow, target.breaks);
     }
+}
+
+/// tsc's rule for calls that never return: a call of a function whose declared (not inferred) type
+/// returns `never` ends the code path, as a `throw` would.
+fn isNeverCall(this: *const Checker, expr: *const Expr) bool {
+    const e = ast.skipParens(expr);
+    if (e.data != .call) {
+        return false;
+    }
+    const callee = ast.skipParens(e.data.call.callee);
+    if (callee.data != .identifier) {
+        return false;
+    }
+    const ref = this.refs[callee.data.identifier.ref];
+    if (ref != .slot) {
+        return false;
+    }
+    const v = this.session.variables.items[ref.slot];
+    const t = v.declared orelse return false;
+    if (t.* != .function or t.function.returns.* != .never) {
+        return false;
+    }
+    return switch (v.kind) {
+        .function => v.function.?.returns != null,
+        .let, .@"const", .parameter => v.annotation != null,
+    };
 }
 
 /// The body of an `if`, a loop or a label, where a declaration needs a block around it.
@@ -1153,6 +1281,7 @@ fn variableStatement(this: *Checker, v: ast.Variable) Error!void {
         variable_.declared = declared;
         if (this.flow.reachable) {
             this.flow.vars[slot] = .{ .initialized = true, .type = assigned };
+            try this.forgetPaths(.{ .slot = slot });
         }
     }
 }
@@ -1304,6 +1433,7 @@ fn bindName(this: *Checker, b: ast.Binding, source: ?*const Type, mode: BindMode
     v.declared = declared;
     if (this.flow.reachable) {
         this.flow.vars[slot] = .{ .initialized = true, .type = try this.assignmentReduced(declared, t) };
+        try this.forgetPaths(.{ .slot = slot });
     }
     return declared;
 }
@@ -1575,7 +1705,7 @@ fn assignHead(this: *Checker, fe: ast.ForEach, element: *const Type) Error!void 
                     if (!types.assignable(element, declared)) {
                         try this.notAssignable(target.start, element, declared);
                     }
-                    this.setVariable(slot, try this.assignmentReduced(declared, element));
+                    try this.setVariable(slot, try this.assignmentReduced(declared, element));
                 },
                 .array, .object => try this.unsupported(target.start, "Destructuring assignments are not supported yet.", .{}),
                 .member, .index => try this.unsupported(target.start, "A 'for...{s}' statement that assigns to a property is not supported yet.", .{if (fe.of) "of" else "in"}),
@@ -1663,26 +1793,37 @@ fn switchStatement(this: *Checker, sw: ast.Switch, labels: []const []const u8) E
     for (sw.clauses) |clause| {
         try this.prescan(clause.statements);
     }
+    // The case values, for each clause; null for `default`.
+    var clause_types: std.ArrayList(?*const Type) = .empty;
+    var case_types: std.ArrayList(*const Type) = .empty;
+    var has_default = false;
+    for (sw.clauses) |clause| {
+        const case = clause.case orelse {
+            if (has_default) {
+                try this.report(clause.start, .ts(1113), "A 'default' clause cannot appear more than once in a 'switch' statement.", .{});
+            }
+            has_default = true;
+            try clause_types.append(this.arena, null);
+            continue;
+        };
+        const t = try this.expression(case);
+        try clause_types.append(this.arena, t);
+        try case_types.append(this.arena, t);
+        if (!types.comparable(discriminant, t)) {
+            try this.report(case.start, .ts(2678), "Type '{f}' is not comparable to type '{f}'.", .{ try this.shownSource(t, discriminant), discriminant });
+        }
+    }
     const entry = try this.copyFlow(this.flow);
+    // When no case matches, the switch finishes from its head, unless the cases cover everything.
+    const falls_out = !has_default and !try this.exhaustive(sw.discriminant, discriminant, case_types.items);
     try this.targets.append(this.arena, .{ .kind = .@"switch", .labels = labels });
     var fallthrough: Flow = .unreachable_flow;
-    var has_default = false;
-    var case_types: std.ArrayList(*const Type) = .empty;
-    for (sw.clauses) |clause| {
-        // A clause is entered from the switch's head, or by falling through from the one before.
+    for (sw.clauses, clause_types.items) |clause, case_type| {
+        // A clause is entered from the switch's head, narrowed by its case, or by falling through
+        // from the one before.
         this.flow = try this.copyFlow(entry);
+        try this.narrowClause(sw.discriminant, case_type, case_types.items);
         try this.mergeInto(&this.flow, fallthrough);
-        if (clause.case) |case| {
-            const t = try this.expression(case);
-            try case_types.append(this.arena, t);
-            if (!types.comparable(discriminant, t)) {
-                try this.report(case.start, .ts(2678), "Type '{f}' is not comparable to type '{f}'.", .{ try this.shownSource(t, discriminant), discriminant });
-            }
-        } else if (has_default) {
-            try this.report(clause.start, .ts(1113), "A 'default' clause cannot appear more than once in a 'switch' statement.", .{});
-        } else {
-            has_default = true;
-        }
         for (clause.statements) |s| {
             try this.statement(s);
         }
@@ -1691,14 +1832,49 @@ fn switchStatement(this: *Checker, sw: ast.Switch, labels: []const []const u8) E
     const target = this.targets.pop().?;
     this.flow = fallthrough;
     try this.mergeInto(&this.flow, target.breaks);
-    if (!has_default and !try this.exhaustive(discriminant, case_types.items)) {
-        try this.mergeInto(&this.flow, entry);
+    if (falls_out) {
+        var rest = try this.copyFlow(entry);
+        std.mem.swap(Flow, &this.flow, &rest);
+        try this.narrowClause(sw.discriminant, null, case_types.items);
+        std.mem.swap(Flow, &this.flow, &rest);
+        try this.mergeInto(&this.flow, rest);
+    }
+}
+
+/// Narrows the switch's discriminant (or what `typeof` looks at, in `switch (typeof x)`) for a
+/// clause: to its case value, or for `default` (null) to what none of the cases match.
+fn narrowClause(this: *Checker, discriminant: *const Expr, case: ?*const Type, cases: []const *const Type) Error!void {
+    const d = ast.skipParens(discriminant);
+    const typeof_operand: ?*const Expr = if (d.data == .unary and d.data.unary.op == .typeof) d.data.unary.operand else null;
+    var one: [1]*const Type = undefined;
+    const tested: []const *const Type = if (case) |c| blk: {
+        one[0] = c;
+        break :blk &one;
+    } else cases;
+    for (tested) |c| {
+        if (typeof_operand) |operand| {
+            if (c.* == .literal and c.literal.value == .string) {
+                try this.narrowReference(operand, .{ .typeof = c.literal.value.string }, case != null);
+            }
+        } else {
+            try this.narrowReference(discriminant, .{ .equal = .{ .value = c } }, case != null);
+        }
     }
 }
 
 /// tsc's `isExhaustiveSwitchStatement`: the discriminant is a union of literals, and every one of
-/// them has a case.
-fn exhaustive(this: *Checker, discriminant: *const Type, cases: []const *const Type) Error!bool {
+/// them has a case; or it's `typeof x`, and every type `x` can have has a case.
+fn exhaustive(this: *Checker, expr: *const Expr, discriminant: *const Type, cases: []const *const Type) Error!bool {
+    const d = ast.skipParens(expr);
+    if (d.data == .unary and d.data.unary.op == .typeof) {
+        var t = try this.typeOf(d.data.unary.operand);
+        for (cases) |c| {
+            if (c.* == .literal and c.literal.value == .string) {
+                t = try narrowing.narrow(this.arena, t, .{ .typeof = c.literal.value.string }, false) orelse return false;
+            }
+        }
+        return t.* == .never;
+    }
     if (discriminant.* == .never) {
         return false;
     }
@@ -1794,6 +1970,12 @@ const Resolution = struct {
 };
 
 fn resolve(this: *Checker, expr: *const Expr, id: ast.Identifier) Error!Resolution {
+    if (this.aliased > 0) {
+        // An aliased condition's initializer, checked again where it's tested: its names still
+        // mean what they did where it's declared, which is also what the interpreter reads.
+        const ref = this.refs[id.ref];
+        return .{ .slot = if (ref == .slot) ref.slot else null };
+    }
     if (this.lookup(id.name)) |slot| {
         this.refs[id.ref] = .{ .slot = slot };
         this.ref_scopes[id.ref] = this.scope;
@@ -2051,6 +2233,7 @@ const AssignmentScan = struct {
             },
             .function => |f| this.function(f, true),
             .interface, .type_alias => {},
+            .throw => |e| this.expr(e, outer, nested),
             .for_each => |f| {
                 switch (f.head) {
                     .declaration => |d| this.pattern(d.pattern, outer, nested),
@@ -2138,7 +2321,8 @@ const AssignmentScan = struct {
             .template => |t| for (t.substitutions) |sub| {
                 this.expr(sub, outer, nested);
             },
-            .paren => |inner| this.expr(inner, outer, nested),
+            .paren, .chain, .non_null => |inner| this.expr(inner, outer, nested),
+            .assertion => |a| this.expr(a.expr, outer, nested),
             .unary => |u| this.expr(u.operand, outer, nested),
             .update => |u| {
                 this.target(u.operand, outer, nested);
@@ -2189,6 +2373,25 @@ const AssignmentScan = struct {
 // Expressions
 
 fn expression(this: *Checker, expr: *const Expr) Error!*const Type {
+    if (this.const_context and !keepsConstContext(expr)) {
+        // Only literals directly inside `as const` are in its context.
+        this.const_context = false;
+        defer this.const_context = true;
+        return this.expressionOf(expr);
+    }
+    return this.expressionOf(expr);
+}
+
+/// tsc's `isConstContext`: the expressions whose literals `as const` applies to through them.
+fn keepsConstContext(expr: *const Expr) bool {
+    return switch (expr.data) {
+        .number, .string, .template, .boolean, .null, .paren, .object, .array, .conditional => true,
+        .unary => |u| u.op == .negate,
+        else => false,
+    };
+}
+
+fn expressionOf(this: *Checker, expr: *const Expr) Error!*const Type {
     return switch (expr.data) {
         .number => |n| types.freshLiteral(this.arena, .{ .number = n }),
         .string => |s| types.freshLiteral(this.arena, .{ .string = s }),
@@ -2216,12 +2419,18 @@ fn expression(this: *Checker, expr: *const Expr) Error!*const Type {
             break :blk branches.type;
         } else this.binary(expr, b),
         .conditional => |c| this.conditional(c, null),
-        .member => |m| this.member(m),
-        .index => |i| if (try this.indexAccess(expr, i)) |access| access.type else types.any,
+        .member => |m| this.member(expr, m),
+        .index => |i| if (try this.indexAccess(expr, i)) |access| this.narrowedRead(expr, access.type) else types.any,
         .call => |c| this.call(expr, c),
+        .chain => |inner| blk: {
+            const link = try this.chainLink(inner);
+            break :blk if (link.short) types.unionOf(this.arena, &.{ link.type, types.undefined }) else link.type;
+        },
+        .non_null => |inner| this.nonNull(try this.expression(inner)),
+        .assertion => |a| this.assertion(expr, a),
         .function => |f| this.checkFunction(f, null, .check),
         .object => |o| this.objectLiteral(o, null),
-        .array => |a| this.arrayLiteral(a, null),
+        .array => |a| this.arrayLiteral(expr.start, a, null),
     };
 }
 
@@ -2234,9 +2443,123 @@ fn contextual(this: *Checker, expr: *const Expr, context: ?*const Type) Error!*c
         .function => |f| this.checkFunction(f, ctx, .check),
         .conditional => |c| this.conditional(c, ctx),
         .object => |o| this.objectLiteral(o, ctx),
-        .array => |a| this.arrayLiteral(a, ctx),
+        .array => |a| this.arrayLiteral(expr.start, a, ctx),
         else => this.expression(expr),
     };
+}
+
+// Optional chains and assertions
+
+/// The type of a link in an optional chain, and whether the chain can short-circuit before it.
+const Link = struct {
+    type: *const Type,
+    short: bool = false,
+};
+
+fn chainLink(this: *Checker, expr: *const Expr) Error!Link {
+    switch (expr.data) {
+        .member => |m| {
+            const object = try this.chainObject(m.object, m.optional);
+            const access = try this.memberAccess(m, object.type) orelse return .{ .type = types.any, .short = object.short };
+            return .{ .type = try this.narrowedRead(expr, access.type), .short = object.short };
+        },
+        .index => |i| {
+            const object = try this.chainObject(i.object, i.optional);
+            const access = try this.indexOn(expr, i, object.type) orelse return .{ .type = types.any, .short = object.short };
+            return .{ .type = try this.narrowedRead(expr, access.type), .short = object.short };
+        },
+        .call => |c| {
+            var callee = try this.chainLink(c.callee);
+            if (c.optional) {
+                callee.short = callee.short or includesNullish(callee.type) or callee.type.* == .unknown;
+                callee.type = try narrowing.nonNullish(this.arena, callee.type);
+            } else {
+                callee.type = try this.checkCallable(c.callee, callee.type);
+            }
+            return .{ .type = try this.callWith(expr, c, callee.type), .short = callee.short };
+        },
+        .non_null => |inner| {
+            const link = try this.chainLink(inner);
+            return .{ .type = try this.nonNull(link.type), .short = link.short };
+        },
+        else => return .{ .type = try this.expression(expr) },
+    }
+}
+
+/// What a link of a chain acts on. After `?.`, `null` and `undefined` short-circuit the chain;
+/// elsewhere they're errors.
+fn chainObject(this: *Checker, expr: *const Expr, optional: bool) Error!Link {
+    var link = try this.chainLink(expr);
+    if (optional) {
+        // `unknown` is `{}` once it isn't `null` or `undefined`.
+        link.short = link.short or includesNullish(link.type) or link.type.* == .unknown;
+        link.type = try narrowing.nonNullish(this.arena, link.type);
+    } else {
+        link.type = try this.checkNonNull(expr, link.type);
+    }
+    return link;
+}
+
+/// The type of `e!`.
+fn nonNull(this: *Checker, t: *const Type) Error!*const Type {
+    if (t.* == .any or t.* == .unknown) {
+        return t;
+    }
+    var kept: std.ArrayList(*const Type) = .empty;
+    var buffer: [1]*const Type = undefined;
+    for (t.members(&buffer)) |m| {
+        switch (m.*) {
+            .null, .undefined, .void => {},
+            else => try kept.append(this.arena, m),
+        }
+    }
+    return types.unionOf(this.arena, kept.items);
+}
+
+fn assertion(this: *Checker, expr: *const Expr, a: ast.Assertion) Error!*const Type {
+    const node = a.type orelse return this.constAssertion(a);
+    const target = try this.resolveType(node);
+    const t = try this.contextual(a.expr, target);
+    switch (a.kind) {
+        .as => {
+            // tsc's `checkAssertionDeferred`: either type has to be comparable to the other.
+            const source = try types.widen(this.arena, t);
+            if (!types.comparableTo(target, source) and !types.comparableTo(source, target)) {
+                try this.report(expr.start, .ts(2352), "Conversion of type '{f}' to type '{f}' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.", .{ source, target });
+            }
+            return target;
+        },
+        .satisfies => {
+            if (!try this.excessProperty(a.expr, target) and !types.assignable(t, target) and !try this.elaborateLiteral(a.expr, t, target)) {
+                try this.report(a.keyword_start, .ts(1360), "Type '{f}' does not satisfy the expected type '{f}'.", .{ try this.shownSource(t, target), target });
+            }
+            return t;
+        },
+    }
+}
+
+/// `e as const`: literals keep their literal types, and object literals' properties are
+/// `readonly`.
+fn constAssertion(this: *Checker, a: ast.Assertion) Error!*const Type {
+    const e = ast.skipParens(a.expr);
+    if (e.data == .template and e.data.template.substitutions.len > 0) {
+        // tsc gives it a template literal type.
+        try this.unsupported(a.expr.start, "'as const' on a template literal with substitutions is not supported yet.", .{});
+        return this.expression(a.expr);
+    }
+    const ok = switch (e.data) {
+        .number, .string, .boolean, .object, .array, .template => true,
+        .unary => |u| u.op == .negate and u.operand.data == .number,
+        else => false,
+    };
+    if (!ok) {
+        try this.report(a.expr.start, .ts(1355), "A 'const' assertion can only be applied to references to enum members, or string, number, boolean, array, or object literals.", .{});
+        return this.expression(a.expr);
+    }
+    const saved = this.const_context;
+    this.const_context = true;
+    defer this.const_context = saved;
+    return types.regular(this.arena, try this.expression(a.expr));
 }
 
 // Object and array literals
@@ -2260,6 +2583,85 @@ fn contextObject(context: ?*const Type) ?*const types.Object {
         }
     }
     return found;
+}
+
+/// The object types a context gives an object literal: the object members of `context`, narrowed
+/// by the discriminant properties the literal sets, as tsc's
+/// `discriminateContextualTypeByObjectMembers` does. Empty when there are none.
+fn contextObjects(this: *Checker, context: ?*const Type, literal: ast.ObjectLiteral) Error![]const *const Type {
+    const t = context orelse return &.{};
+    var objects: std.ArrayList(*const Type) = .empty;
+    var buffer: [1]*const Type = undefined;
+    for (t.members(&buffer)) |m| {
+        if (m.* == .object) {
+            try objects.append(this.arena, m);
+        }
+    }
+    if (objects.items.len < 2) {
+        return objects.items;
+    }
+    for (literal.properties) |p| {
+        if (p != .property or p.property.key != .name) {
+            continue;
+        }
+        const name = p.property.key.name;
+        const value = try this.discriminantValue(p.property.value) orelse continue;
+        if (!narrowing.isDiscriminant(t, name)) {
+            continue;
+        }
+        var kept: std.ArrayList(*const Type) = .empty;
+        for (objects.items) |o| {
+            const property_type = if (o.object.find(name)) |found| found.type else types.unknown;
+            if (types.overlap(value, property_type)) {
+                try kept.append(this.arena, o);
+            }
+        }
+        if (kept.items.len > 0) {
+            objects = kept;
+        }
+    }
+    return objects.items;
+}
+
+/// The type of a property value that can pick out a member of a discriminated union by its
+/// syntax alone: a literal, `null` or `undefined`.
+fn discriminantValue(this: *Checker, expr: *const Expr) Error!?*const Type {
+    const e = ast.skipParens(expr);
+    return switch (e.data) {
+        .string => |str| try types.literal(this.arena, .{ .string = str }),
+        .number => |n| try types.literal(this.arena, .{ .number = n }),
+        .boolean => |b| try types.literal(this.arena, .{ .boolean = b }),
+        .template => |t| if (t.substitutions.len == 0) try types.literal(this.arena, .{ .string = t.quasis[0] }) else null,
+        .unary => |u| if (u.op == .negate and u.operand.data == .number) try types.literal(this.arena, .{ .number = -u.operand.data.number }) else null,
+        .null => types.null,
+        .identifier => |id| if (std.mem.eql(u8, id.name, "undefined")) types.undefined else null,
+        else => null,
+    };
+}
+
+/// The type a property of an object literal gets from the object types of its context: the union
+/// of that property's types in those that have it.
+fn contextualProperty(this: *Checker, objects: []const *const Type, name: []const u8) Error!?*const Type {
+    var parts: std.ArrayList(*const Type) = .empty;
+    for (objects) |o| {
+        if (o.object.find(name)) |p| {
+            try parts.append(this.arena, p.type);
+        }
+    }
+    if (parts.items.len == 0) {
+        return null;
+    }
+    return try types.unionOf(this.arena, parts.items);
+}
+
+/// The type of a property every one of `objects` has, or null.
+fn commonProperty(this: *Checker, objects: []const *const Type, name: []const u8) Error!?*const Type {
+    for (objects) |o| {
+        if (o.object.find(name) == null) {
+            return null;
+        }
+    }
+    return this.contextualProperty(objects, name);
 }
 
 const ArrayContext = union(enum) {
@@ -2292,6 +2694,9 @@ fn arrayContext(context: ?*const Type) ArrayContext {
 /// A literal's type as part of an object or array literal: widened, unless the context expects
 /// a literal type there.
 fn literalMember(this: *Checker, t: *const Type, context: ?*const Type) Error!*const Type {
+    if (this.const_context) {
+        return types.regular(this.arena, t);
+    }
     if (context) |c| {
         if (types.couldHaveSingletons(c)) {
             return t;
@@ -2301,7 +2706,7 @@ fn literalMember(this: *Checker, t: *const Type, context: ?*const Type) Error!*c
 }
 
 fn objectLiteral(this: *Checker, o: ast.ObjectLiteral, context: ?*const Type) Error!*const Type {
-    const ctx = contextObject(context);
+    const ctx = try this.contextObjects(context, o);
     var properties: std.ArrayList(types.Property) = .empty;
     // The properties written out (not spread), for TS1117 and TS2783.
     const Written = struct { name: []const u8, at: u32 };
@@ -2314,7 +2719,7 @@ fn objectLiteral(this: *Checker, o: ast.ObjectLiteral, context: ?*const Type) Er
                     .name => |n| n,
                     .computed => |e| try this.computedName(e),
                 };
-                const property_context = if (ctx != null and name != null) ctx.?.property(name.?) else null;
+                const property_context = if (name) |n| try this.contextualProperty(ctx, n) else null;
                 const t = try this.literalMember(try this.contextual(prop.value, property_context), property_context);
                 const n = name orelse continue;
                 if (std.mem.eql(u8, n, "toString") or std.mem.eql(u8, n, "valueOf")) {
@@ -2328,7 +2733,7 @@ fn objectLiteral(this: *Checker, o: ast.ObjectLiteral, context: ?*const Type) Er
                     }
                 }
                 try written.append(this.arena, .{ .name = n, .at = prop.key_start });
-                try putProperty(this.arena, &properties, .{ .name = n, .type = t, .method = prop.method });
+                try putProperty(this.arena, &properties, .{ .name = n, .type = t, .method = prop.method, .readonly = this.const_context });
             },
             .spread => |spread| {
                 const e = spread.expr;
@@ -2383,7 +2788,11 @@ fn computedName(this: *Checker, e: *const Expr) Error!?[]const u8 {
     return null;
 }
 
-fn arrayLiteral(this: *Checker, a: ast.ArrayLiteral, context: ?*const Type) Error!*const Type {
+fn arrayLiteral(this: *Checker, start: u32, a: ast.ArrayLiteral, context: ?*const Type) Error!*const Type {
+    if (this.const_context) {
+        // That's a `readonly` tuple.
+        try this.unsupported(start, "'as const' on an array literal is not supported yet.", .{});
+    }
     const ctx = arrayContext(context);
     const has_spread = for (a.elements) |e| {
         if (e == .spread) {
@@ -2453,20 +2862,26 @@ fn excessProperty(this: *Checker, expr: *const Expr, target: *const Type) Error!
     const e = ast.skipParens(expr);
     switch (e.data) {
         .object => |o| {
-            const t = contextObject(target) orelse return false;
-            if (t.properties.len == 0) {
+            const objects = try this.contextObjects(target, o);
+            if (objects.len == 0) {
                 return false;
+            }
+            for (objects) |t| {
+                if (t.object.properties.len == 0) {
+                    return false;
+                }
             }
             for (o.properties) |p| {
                 if (p != .property or p.property.key != .name) {
                     continue;
                 }
                 const prop = p.property;
-                const found = t.find(prop.key.name) orelse {
-                    try this.report(prop.key_start, .ts(2353), "Object literal may only specify known properties, and '{s}' does not exist in type '{f}'.", .{ prop.key.name, target_shown(target, t) });
+                const found = try this.contextualProperty(objects, prop.key.name) orelse {
+                    const shown = if (objects.len == 1) objects[0] else try this.removeNullish(target);
+                    try this.report(prop.key_start, .ts(2353), "Object literal may only specify known properties, and '{s}' does not exist in type '{f}'.", .{ prop.key.name, shown });
                     return true;
                 };
-                if (try this.excessProperty(prop.value, found.type)) {
+                if (try this.excessProperty(prop.value, found)) {
                     return true;
                 }
             }
@@ -2511,8 +2926,8 @@ fn elaborateLiteral(this: *Checker, expr: *const Expr, source: *const Type, targ
     var reported = false;
     switch (e.data) {
         .object => |o| {
-            const t = contextObject(target) orelse return false;
-            if (source.* != .object) {
+            const objects = try this.contextObjects(target, o);
+            if (objects.len == 0 or source.* != .object) {
                 return false;
             }
             for (o.properties) |p| {
@@ -2520,13 +2935,13 @@ fn elaborateLiteral(this: *Checker, expr: *const Expr, source: *const Type, targ
                     continue;
                 }
                 const prop = p.property;
-                const expected = t.find(prop.key.name) orelse continue;
+                const expected = try this.commonProperty(objects, prop.key.name) orelse continue;
                 const actual = source.object.find(prop.key.name) orelse continue;
-                if (types.assignable(actual.type, expected.type)) {
+                if (types.assignable(actual.type, expected)) {
                     continue;
                 }
-                if (!try this.elaborateLiteral(prop.value, actual.type, expected.type)) {
-                    try this.reportNotAssignable(prop.value, actual.type, expected.type, prop.key_start, .assignment);
+                if (!try this.elaborateLiteral(prop.value, actual.type, expected)) {
+                    try this.reportNotAssignable(prop.value, actual.type, expected, prop.key_start, .assignment);
                 }
                 reported = true;
             }
@@ -2580,7 +2995,31 @@ const Access = struct {
 fn property(this: *Checker, object: *const Type, name: []const u8, at: u32) Error!?Access {
     switch (object.*) {
         .any => return .{ .type = types.any, .name = name, .named = false },
-        .never => return .{ .type = types.never, .name = name, .named = false },
+        // tsc reports reading a property of `never`, though indexing it is fine.
+        .never => return null,
+        .@"union" => |ms| {
+            for (ms) |m| {
+                switch (m.*) {
+                    .object, .function, .array, .tuple => {},
+                    else => {
+                        try this.unsupported(at, "Properties of '{f}' are not supported yet.", .{try types.widen(this.arena, object)});
+                        return .{ .type = types.any, .name = name, .named = false };
+                    },
+                }
+            }
+            // Every member has to have it.
+            var parts: std.ArrayList(*const Type) = .empty;
+            var access: Access = .{ .type = types.never, .name = name };
+            for (ms) |m| {
+                const a = try this.property(m, name, at) orelse return null;
+                try parts.append(this.arena, a.type);
+                access.readonly = access.readonly or a.readonly;
+                access.named = access.named and a.named;
+                access.array_length = access.array_length or a.array_length;
+            }
+            access.type = try types.unionOf(this.arena, parts.items);
+            return access;
+        },
         .object => |o| {
             const p = o.find(name) orelse return null;
             return .{ .type = p.type, .name = name, .readonly = p.readonly };
@@ -2642,7 +3081,29 @@ fn memberAccess(this: *Checker, m: ast.Member, object: *const Type) Error!?Acces
 /// `o[k]`. Null when that's an error, which has been reported.
 fn indexAccess(this: *Checker, expr: *const Expr, i: ast.Index) Error!?Access {
     const object = try this.checkNonNull(i.object, try this.expression(i.object));
-    const key = try this.expression(i.index);
+    return this.indexOn(expr, i, object);
+}
+
+/// `o[k]`, with `o` already checked.
+fn indexOn(this: *Checker, expr: *const Expr, i: ast.Index, object: *const Type) Error!?Access {
+    return this.indexWith(expr, i, object, try this.expression(i.index));
+}
+
+fn indexWith(this: *Checker, expr: *const Expr, i: ast.Index, object: *const Type, key: *const Type) Error!?Access {
+    if (object.* == .@"union") {
+        // Each member is indexed; the first that can't be is reported.
+        var parts: std.ArrayList(*const Type) = .empty;
+        var readonly = false;
+        for (object.@"union") |m| {
+            this.muted += 1;
+            const access = try this.indexWith(expr, i, m, key);
+            this.muted -= 1;
+            const a = access orelse return this.indexWith(expr, i, m, key);
+            try parts.append(this.arena, a.type);
+            readonly = readonly or a.readonly;
+        }
+        return .{ .type = try types.unionOf(this.arena, parts.items), .readonly = readonly, .named = false };
+    }
     if (object.* == .any or object.* == .never) {
         return .{ .type = object, .named = false };
     }
@@ -2735,6 +3196,11 @@ fn writableProperty(this: *Checker, target: *const Expr) Error!?*const Type {
 
 fn deleteExpression(this: *Checker, operand: *const Expr) Error!*const Type {
     const e = ast.skipParens(operand);
+    if (e.data == .chain) {
+        try this.unsupported(operand.start, "Deleting through an optional chain is not supported yet.", .{});
+        return types.boolean;
+    }
+
     if (e.data != .member and e.data != .index) {
         _ = try this.expression(operand);
         if (e.data == .identifier) {
@@ -2744,6 +3210,9 @@ fn deleteExpression(this: *Checker, operand: *const Expr) Error!*const Type {
         return types.boolean;
     }
     const access = try this.propertyAccess(e) orelse return types.boolean;
+    if (try this.referenceOf(e)) |r| {
+        try this.forgetPaths(r);
+    }
     if (access.readonly) {
         try this.report(operand.start, .ts(2704), "The operand of a 'delete' operator cannot be a read-only property.", .{});
     } else if (access.named and !types.includesUndefined(access.type) and access.type.* != .never) {
@@ -2771,27 +3240,371 @@ fn condition(this: *Checker, expr: *const Expr, if_body: ?*const Stmt, chain: ?*
             else
                 .{ .type = t, .when_true = .unreachable_flow, .when_false = this.flow };
         },
-        .binary => |b| if (b.op.isLogical()) {
-            return this.logical(b, if_body, chain);
+        .binary => |b| switch (b.op) {
+            .logical_and, .logical_or, .nullish => return this.logical(b, if_body, chain),
+            .equal, .not_equal, .strict_equal, .strict_not_equal => return this.equalityCondition(b),
+            .in => return this.inCondition(b),
+            else => {},
         },
         else => {},
     }
     const t = try this.expression(expr);
-    var branches: Branches = .{ .type = t, .when_true = this.flow, .when_false = try this.copyFlow(this.flow) };
-    // A variable tested on its own is narrowed to the members that can pass or fail the test:
-    // after `while (b) {}`, `b` is `false`. Narrowing by other tests comes later.
-    if (expr.data == .identifier) {
-        if (this.refs[expr.data.identifier.ref] == .slot) {
-            const slot = this.refs[expr.data.identifier.ref].slot;
-            this.flow = branches.when_true;
-            try this.narrowVariable(slot, expr.start, .truthy);
-            branches.when_true = this.flow;
-            this.flow = branches.when_false;
-            try this.narrowVariable(slot, expr.start, .falsy);
-            branches.when_false = this.flow;
+    if (try this.aliasedCondition(expr)) |init| {
+        // tsc narrows by what the constant was initialized to, as if it were written here.
+        this.muted += 1;
+        this.aliased += 1;
+        defer {
+            this.muted -= 1;
+            this.aliased -= 1;
         }
+        const branches = try this.condition(init, null, null);
+        return .{ .type = t, .when_true = branches.when_true, .when_false = branches.when_false };
+    }
+    var branches: Branches = .{ .type = t, .when_true = this.flow, .when_false = try this.copyFlow(this.flow) };
+    // What's tested is narrowed to what can pass or fail the test: after `while (b) {}`, `b` is
+    // `false`.
+    try this.narrowBranches(&branches, expr, .truthy, true);
+    return branches;
+}
+
+/// `a === b` and the other equality operators as a condition, which narrow either side by the
+/// other, and `typeof x === "name"`, which narrows `x`.
+fn equalityCondition(this: *Checker, b: ast.Binary) Error!Branches {
+    const left = try this.expression(b.left);
+    const right = try this.expression(b.right);
+    _ = try this.operator(b.op, b.left, b.right, left, right, false);
+    var branches: Branches = .{ .type = types.boolean, .when_true = this.flow, .when_false = try this.copyFlow(this.flow) };
+    const equal = b.op == .strict_equal or b.op == .equal;
+    const loose = b.op == .equal or b.op == .not_equal;
+    const sides = [_]struct { *const Expr, *const Type }{ .{ b.left, right }, .{ b.right, left } };
+    for (sides) |side| {
+        const e = ast.skipParens(side[0]);
+        if (e.data == .unary and e.data.unary.op == .typeof) {
+            const other = side[1];
+            if (other.* == .literal and other.literal.value == .string) {
+                try this.narrowBranches(&branches, e.data.unary.operand, .{ .typeof = other.literal.value.string }, equal);
+            }
+            continue;
+        }
+        try this.narrowBranches(&branches, side[0], .{ .equal = .{ .value = side[1], .loose = loose } }, equal);
     }
     return branches;
+}
+
+/// `"name" in x` as a condition, which narrows `x` to the members that have (or lack) it.
+fn inCondition(this: *Checker, b: ast.Binary) Error!Branches {
+    const left = try this.expression(b.left);
+    const right = try this.expression(b.right);
+    _ = try this.operator(.in, b.left, b.right, left, right, false);
+    var branches: Branches = .{ .type = types.boolean, .when_true = this.flow, .when_false = try this.copyFlow(this.flow) };
+    if (left.* == .literal) {
+        const name = switch (left.literal.value) {
+            .string => |str| str,
+            .number => |n| try @import("../runtime/number.zig").toString(this.arena, n),
+            .boolean => return branches,
+        };
+        try this.narrowBranches(&branches, b.right, .{ .in = name }, true);
+    }
+    return branches;
+}
+
+/// Narrows what `expr` refers to in both branches: by `test_` passing in `when_true` (or failing,
+/// when `passes` is false), and the other way round in `when_false`.
+fn narrowBranches(this: *Checker, branches: *Branches, expr: *const Expr, test_: narrowing.Test, passes: bool) Error!void {
+    this.flow = branches.when_true;
+    try this.narrowReference(expr, test_, passes);
+    branches.when_true = this.flow;
+    this.flow = branches.when_false;
+    try this.narrowReference(expr, test_, !passes);
+    branches.when_false = this.flow;
+}
+
+/// The expression a reference is, without what doesn't change which one it is.
+fn skipReference(expr: *const Expr) *const Expr {
+    var e = expr;
+    while (true) {
+        e = switch (e.data) {
+            .paren, .non_null, .chain => |inner| inner,
+            else => return e,
+        };
+    }
+}
+
+/// A property access, `o.name` or `o["name"]`.
+const AccessParts = struct {
+    object: *const Expr,
+    name: []const u8,
+    optional: bool,
+};
+
+fn accessParts(this: *Checker, expr: *const Expr) Error!?AccessParts {
+    return switch (expr.data) {
+        .member => |m| .{ .object = m.object, .name = m.property, .optional = m.optional },
+        .index => |i| switch (ast.skipParens(i.index).data) {
+            .string => |str| .{ .object = i.object, .name = str, .optional = i.optional },
+            .number => |n| .{ .object = i.object, .name = try @import("../runtime/number.zig").toString(this.arena, n), .optional = i.optional },
+            // tsc's `tryGetNameFromEntityNameExpression`: `o[k]` is `o.a` when `k` is a
+            // `const` of literal type `"a"`.
+            .identifier => |id| blk: {
+                const ref = this.refs[id.ref];
+                if (ref != .slot or this.variable(ref.slot).kind != .@"const") {
+                    break :blk null;
+                }
+                const t = this.variable(ref.slot).declared orelse break :blk null;
+                if (t.* != .literal) {
+                    break :blk null;
+                }
+                break :blk switch (t.literal.value) {
+                    .string => |str| .{ .object = i.object, .name = str, .optional = i.optional },
+                    .number => |n| .{ .object = i.object, .name = try @import("../runtime/number.zig").toString(this.arena, n), .optional = i.optional },
+                    .boolean => null,
+                };
+            },
+            else => null,
+        },
+        else => null,
+    };
+}
+
+/// What narrowing can apply to: a variable, or a chain of properties of one. Identifiers have to
+/// have been resolved.
+fn referenceOf(this: *Checker, expr: *const Expr) Error!?Reference {
+    const e = skipReference(expr);
+    switch (e.data) {
+        .identifier => |id| {
+            const ref = this.refs[id.ref];
+            if (ref != .slot or this.variable(ref.slot).kind == .function) {
+                return null;
+            }
+            return .{ .slot = ref.slot };
+        },
+        .member, .index => {
+            const parts = try this.accessParts(e) orelse return null;
+            const base = try this.referenceOf(parts.object) orelse return null;
+            const path = try this.arena.alloc([]const u8, base.path.len + 1);
+            @memcpy(path[0..base.path.len], base.path);
+            path[base.path.len] = parts.name;
+            return .{ .slot = base.slot, .path = path };
+        },
+        else => return null,
+    }
+}
+
+/// Narrows what `expr` refers to (a variable or a property of one) for when `test_` is `assume`.
+/// A test of a discriminant property narrows the union it belongs to as well, and a test that
+/// an optional chain found something narrows what the chain went through to non-nullish.
+fn narrowReference(this: *Checker, expr: *const Expr, test_: narrowing.Test, assume: bool) Error!void {
+    if (!this.flow.reachable) {
+        return;
+    }
+    const e = skipReference(expr);
+    if (try this.referenceOf(e)) |reference| {
+        try this.narrowTo(e, reference, test_, assume);
+    }
+    if (test_ != .in) {
+        if (try this.accessParts(e)) |parts| {
+            const object = try this.referenceOf(parts.object);
+            if (object != null and try this.canNarrow(object.?)) {
+                const reference = object.?;
+                const t = try this.typeOf(parts.object);
+                // A union that's been narrowed to one member is still discriminated by its
+                // declared type.
+                const declared = try this.declaredReferenceType(reference);
+                const union_type = if (declared.* == .@"union" and isSubset(t, declared)) declared else t;
+                if (narrowing.isDiscriminant(union_type, parts.name)) {
+                    const optional = parts.optional or ast.skipParens(parts.object).data == .non_null;
+                    const narrowed = try narrowing.byDiscriminant(this.arena, t, parts.name, test_, assume, optional) orelse
+                        return this.unsupported(expr.start, "Narrowing '{f}' by this test is not supported yet.", .{t});
+                    try this.setNarrowed(reference, narrowed);
+                }
+            }
+        }
+    }
+    if (ast.skipParens(expr).data == .chain and impliesPresent(test_, assume)) {
+        // Every link up to the first `?.` found something.
+        var link = e;
+        while (true) {
+            const object: *const Expr, const optional = switch (link.data) {
+                .member => |m| .{ m.object, m.optional },
+                .index => |i| .{ i.object, i.optional },
+                .call => |c| .{ c.callee, c.optional },
+                .non_null => |inner| .{ inner, false },
+                else => break,
+            };
+            const inner = skipReference(object);
+            if (try this.referenceOf(inner)) |reference| {
+                try this.narrowTo(inner, reference, .{ .equal = .{ .value = types.null, .loose = true } }, false);
+            }
+            if (optional) {
+                break;
+            }
+            link = object;
+        }
+    }
+}
+
+/// Whether passing (or failing) `test_` means the value isn't `undefined` (tsc's
+/// `narrowTypeByOptionalChainContainment`).
+fn impliesPresent(test_: narrowing.Test, assume: bool) bool {
+    return switch (test_) {
+        .truthy => assume,
+        .equal => |e| blk: {
+            var buffer: [1]*const Type = undefined;
+            const ms = e.value.members(&buffer);
+            if (assume) {
+                for (ms) |m| {
+                    switch (m.*) {
+                        .any, .unknown, .undefined, .void => break :blk false,
+                        .null => if (e.loose) break :blk false,
+                        else => {},
+                    }
+                }
+                break :blk true;
+            }
+            for (ms) |m| {
+                switch (m.*) {
+                    .undefined, .void => {},
+                    .null => if (!e.loose) break :blk false,
+                    else => break :blk false,
+                }
+            }
+            break :blk true;
+        },
+        .typeof => |name| assume != std.mem.eql(u8, name, "undefined"),
+        .in => false,
+    };
+}
+
+/// Narrows one reference by a test.
+fn narrowTo(this: *Checker, expr: *const Expr, reference: Reference, test_: narrowing.Test, assume: bool) Error!void {
+    if (!try this.canNarrow(reference)) {
+        return;
+    }
+    const current = try this.typeOf(expr);
+    const narrowed = try narrowing.narrow(this.arena, current, test_, assume) orelse
+        return this.unsupported(expr.start, "Narrowing '{f}' by this test is not supported yet.", .{current});
+    try this.setNarrowed(reference, narrowed);
+}
+
+/// The type a reference has where nothing narrows it.
+fn declaredReferenceType(this: *Checker, reference: Reference) Error!*const Type {
+    var t = try this.declaredType(reference.slot);
+    this.muted += 1;
+    defer this.muted -= 1;
+    for (reference.path) |name| {
+        const access = try this.property(try this.removeNullish(t), name, 0) orelse return types.any;
+        t = access.type;
+    }
+    return t;
+}
+
+/// Whether every member of `t` is one of `of`'s.
+fn isSubset(t: *const Type, of: *const Type) bool {
+    var buffer: [1]*const Type = undefined;
+    var of_buffer: [1]*const Type = undefined;
+    for (t.members(&buffer)) |m| {
+        const found = for (of.members(&of_buffer)) |o| {
+            if (m.eql(o)) {
+                break true;
+            }
+        } else false;
+        if (!found) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// A variable that may not be assigned yet has nothing to narrow. Through an aliased condition,
+/// only a constant reference narrows.
+fn canNarrow(this: *Checker, reference: Reference) Error!bool {
+    if (reference.path.len == 0 and this.flow.vars[reference.slot].type == null and !this.isOuter(reference.slot)) {
+        return false;
+    }
+    return this.aliased == 0 or try this.isConstantReference(reference);
+}
+
+/// tsc's `isConstantReference`: a `const`, or a parameter nothing assigns, and `readonly`
+/// properties of one.
+fn isConstantReference(this: *Checker, reference: Reference) Error!bool {
+    const v = this.variable(reference.slot);
+    const constant = switch (v.kind) {
+        .@"const" => true,
+        .parameter => try this.lastAssignment(reference.slot) == .never,
+        .let, .function => false,
+    };
+    if (!constant) {
+        return false;
+    }
+    var t = try this.declaredType(reference.slot);
+    this.muted += 1;
+    defer this.muted -= 1;
+    for (reference.path) |name| {
+        const access = try this.property(try this.removeNullish(t), name, 0) orelse return false;
+        if (!access.readonly) {
+            return false;
+        }
+        t = access.type;
+    }
+    return true;
+}
+
+/// The initializer of a condition that's a `const` without a type annotation (tsc's aliased
+/// conditions), when it's made only of tests, so checking it again changes nothing. tsc follows
+/// at most five of them in a row.
+fn aliasedCondition(this: *Checker, expr: *const Expr) Error!?*const Expr {
+    if (expr.data != .identifier or this.aliased >= 5) {
+        return null;
+    }
+    const ref = this.refs[expr.data.identifier.ref];
+    if (ref != .slot) {
+        return null;
+    }
+    const v = this.variable(ref.slot);
+    if (v.kind != .@"const" or v.annotation != null or v.destructured != null) {
+        return null;
+    }
+    // Its names have to have been resolved, by this program.
+    if (v.declared == null or v.source != this.source) {
+        return null;
+    }
+    const init = v.init orelse return null;
+    return if (isPureTest(init)) init else null;
+}
+
+/// Whether an expression only reads and compares: literals, names, property accesses and the
+/// operators narrowing understands.
+fn isPureTest(expr: *const Expr) bool {
+    return switch (expr.data) {
+        .number, .string, .boolean, .null, .identifier => true,
+        .template => |t| t.substitutions.len == 0,
+        .paren, .chain, .non_null => |inner| isPureTest(inner),
+        .member => |m| isPureTest(m.object),
+        .index => |i| isPureTest(i.object) and isPureTest(i.index),
+        .unary => |u| u.op != .delete and isPureTest(u.operand),
+        .binary => |b| switch (b.op) {
+            .logical_and, .logical_or, .nullish, .equal, .not_equal, .strict_equal, .strict_not_equal, .in => isPureTest(b.left) and isPureTest(b.right),
+            else => false,
+        },
+        else => false,
+    };
+}
+
+/// Records what a test narrowed a reference to. Unlike an assignment, what's known about its
+/// properties stays.
+fn setNarrowed(this: *Checker, reference: Reference, t: *const Type) Error!void {
+    if (reference.path.len == 0) {
+        this.flow.vars[reference.slot].type = t;
+        return;
+    }
+    var paths: std.ArrayList(PathFlow) = .empty;
+    for (this.flow.paths) |p| {
+        if (!p.reference.eql(reference)) {
+            try paths.append(this.arena, p);
+        }
+    }
+    try paths.append(this.arena, .{ .reference = reference, .type = t });
+    this.flow.paths = paths.items;
 }
 
 fn logical(this: *Checker, b: ast.Binary, if_body: ?*const Stmt, chain: ?*const AndChain) Error!Branches {
@@ -2843,7 +3656,7 @@ fn logical(this: *Checker, b: ast.Binary, if_body: ?*const Stmt, chain: ?*const 
             break :blk try types.unionOf(this.arena, &.{ try this.removeDefinitelyFalsy(left.type), right });
         },
         .nullish => blk: {
-            const inner = ast.skipParens(b.left);
+            const inner = ast.skipOuter(b.left);
             switch (this.nullishSemantics(inner)) {
                 .never => try this.report(inner.start, .ts(2869), "Right operand of ?? is unreachable because the left operand is never nullish.", .{}),
                 .always => try this.report(inner.start, .ts(2871), "This expression is always nullish.", .{}),
@@ -2922,8 +3735,24 @@ const arithmetic_operand = "must be of type 'any', 'number', 'bigint' or an enum
 
 fn update(this: *Checker, u: ast.Update) Error!*const Type {
     const operand = ast.skipParens(u.operand);
+    if (operand.data == .chain) {
+        // Like tsc, it's only reported if the operand is a number.
+        if (!isNumeric(try this.checkNonNull(u.operand, try this.expression(u.operand)))) {
+            try this.report(u.operand.start, .ts(2356), "An arithmetic operand " ++ arithmetic_operand, .{});
+        } else {
+            try this.report(u.operand.start, .ts(2777), "The operand of an increment or decrement operator may not be an optional property access.", .{});
+        }
+        return types.number;
+    }
+    if (operand.data == .non_null or operand.data == .assertion) {
+        try this.unsupported(u.operand.start, "Incrementing a type assertion is not supported yet.", .{});
+        return types.number;
+    }
     if (operand.data == .member or operand.data == .index) {
         const t = try this.writableProperty(operand) orelse return types.number;
+        if (try this.referenceOf(operand)) |r| {
+            try this.forgetPaths(r);
+        }
         if (!isNumeric(try this.checkNonNull(u.operand, t))) {
             try this.report(u.operand.start, .ts(2356), "An arithmetic operand " ++ arithmetic_operand, .{});
         }
@@ -2945,7 +3774,7 @@ fn update(this: *Checker, u: ast.Update) Error!*const Type {
     if (!isNumeric(t)) {
         try this.report(u.operand.start, .ts(2356), "An arithmetic operand " ++ arithmetic_operand, .{});
     }
-    this.setVariable(slot, try this.assignmentReduced(try this.declaredType(slot), types.number));
+    try this.setVariable(slot, try this.assignmentReduced(try this.declaredType(slot), types.number));
     return types.number;
 }
 
@@ -2956,6 +3785,16 @@ fn assign(this: *Checker, a: ast.Assign) Error!*const Type {
         .member, .index => return this.assignProperty(a, target),
         .object, .array => {
             try this.unsupported(a.target.start, "Destructuring assignments are not supported yet.", .{});
+            return this.expression(a.value);
+        },
+        .chain => {
+            _ = try this.expression(a.target);
+            const value = try this.expression(a.value);
+            try this.report(a.target.start, .ts(2779), "The left-hand side of an assignment expression may not be an optional property access.", .{});
+            return value;
+        },
+        .non_null, .assertion => {
+            try this.unsupported(a.target.start, "Assigning to a type assertion is not supported yet.", .{});
             return this.expression(a.value);
         },
         else => {
@@ -2976,7 +3815,7 @@ fn assign(this: *Checker, a: ast.Assign) Error!*const Type {
         const declared = try this.declaredType(slot);
         const value = try this.contextual(a.value, declared);
         try this.checkAssignable(a.value, value, declared, a.target.start, .assignment);
-        this.setVariable(slot, try this.assignmentReduced(declared, value));
+        try this.setVariable(slot, try this.assignmentReduced(declared, value));
         return value;
     };
 
@@ -2989,16 +3828,16 @@ fn assign(this: *Checker, a: ast.Assign) Error!*const Type {
         var skipped = try this.copyFlow(this.flow);
         std.mem.swap(Flow, &this.flow, &skipped);
         switch (op) {
-            .logical_and => try this.narrowVariable(slot, target.start, .falsy),
-            .logical_or => try this.narrowVariable(slot, target.start, .truthy),
-            else => try this.narrowVariable(slot, target.start, .non_nullish),
+            .logical_and => try this.narrowReference(target, .truthy, false),
+            .logical_or => try this.narrowReference(target, .truthy, true),
+            else => try this.narrowReference(target, .{ .equal = .{ .value = types.null, .loose = true } }, false),
         }
         std.mem.swap(Flow, &this.flow, &skipped);
         const value = try this.expression(a.value);
         if (!types.assignable(value, left)) {
             try this.notAssignable(a.target.start, value, left);
         }
-        this.setVariable(slot, try this.assignmentReduced(try this.declaredType(slot), value));
+        try this.setVariable(slot, try this.assignmentReduced(try this.declaredType(slot), value));
         try this.mergeInto(&this.flow, skipped);
         return switch (op) {
             .logical_and => if (!try this.canBeTruthy(current)) current else types.unionOf(this.arena, &.{ try this.definitelyFalsy(current), value }),
@@ -3013,20 +3852,28 @@ fn assign(this: *Checker, a: ast.Assign) Error!*const Type {
     if (result.ok and !types.assignable(result.type, left)) {
         try this.notAssignable(a.target.start, result.type, left);
     }
-    this.setVariable(slot, try this.assignmentReduced(try this.declaredType(slot), result.type));
+    try this.setVariable(slot, try this.assignmentReduced(try this.declaredType(slot), result.type));
     return result.type;
 }
 
 /// `o.p = v`, `o[k] += v` and so on.
 fn assignProperty(this: *Checker, a: ast.Assign, target: *const Expr) Error!*const Type {
     const declared = try this.writableProperty(target);
+    const reference = try this.referenceOf(target);
     const op = a.op orelse {
         const value = try this.contextual(a.value, declared);
         if (declared) |t| {
             try this.checkAssignable(a.value, value, t, a.target.start, .assignment);
+            // Like a variable, the property holds what was assigned.
+            if (reference) |r| {
+                try this.setPath(r, try this.assignmentReduced(t, value));
+            }
         }
         return value;
     };
+    if (reference) |r| {
+        try this.forgetPaths(r);
+    }
     const current = declared orelse types.any;
     const left = try types.widen(this.arena, current);
     const value = try this.expression(a.value);
@@ -3105,9 +3952,10 @@ fn operator(this: *Checker, op: ast.BinaryOp, left_expr: *const Expr, right_expr
         .less, .greater, .less_equal, .greater_equal => {
             const l = try types.widen(this.arena, try this.checkNonNull(left_expr, left));
             const r = try types.widen(this.arena, try this.checkNonNull(right_expr, right));
+            // Numbers compare with numbers; anything else only with what it overlaps.
             const ok = isAny(l) or isAny(r) or
-                (types.isNumberLike(l) and types.isNumberLike(r)) or
-                types.comparable(l, r);
+                (isNumeric(l) and isNumeric(r)) or
+                (!isNumeric(l) and !isNumeric(r) and types.comparable(l, r));
             if (!ok) {
                 try this.operatorError(op, compound, left_expr, l, r);
             }
@@ -3172,6 +4020,7 @@ fn isSideEffectFree(expr: *const Expr) bool {
         .unary => |u| u.op != .void and u.op != .delete,
         .conditional => |c| isSideEffectFree(c.then) and isSideEffectFree(c.otherwise),
         .binary => |b| isSideEffectFree(b.left) and isSideEffectFree(b.right),
+        .assertion => |a| isSideEffectFree(a.expr),
         else => false,
     };
 }
@@ -3189,10 +4038,19 @@ fn isNumeric(t: *const Type) bool {
     return isAny(t) or types.isNumberLike(t) or types.isBigIntLike(t);
 }
 
-fn member(this: *Checker, m: ast.Member) Error!*const Type {
+fn member(this: *Checker, expr: *const Expr, m: ast.Member) Error!*const Type {
     const object = try this.checkNonNull(m.object, try this.expression(m.object));
     const access = try this.memberAccess(m, object) orelse return types.any;
-    return access.type;
+    return this.narrowedRead(expr, access.type);
+}
+
+/// The type a property read has: `declared`, unless flow analysis has narrowed the property.
+fn narrowedRead(this: *Checker, expr: *const Expr, declared: *const Type) Error!*const Type {
+    if (this.flow.paths.len == 0) {
+        return declared;
+    }
+    const reference = try this.referenceOf(expr) orelse return declared;
+    return this.flow.path(reference) orelse declared;
 }
 
 /// A property that exists but isn't implemented yet (one of `known`), or null.
@@ -3207,6 +4065,43 @@ fn unsupportedProperty(this: *Checker, name: []const u8, at: u32, object: *const
 }
 
 fn call(this: *Checker, expr: *const Expr, c: ast.Call) Error!*const Type {
+    return this.callWith(expr, c, try this.calleeType(c));
+}
+
+/// The type of what a call calls, which can't be `null` or `undefined`.
+fn calleeType(this: *Checker, c: ast.Call) Error!*const Type {
+    return this.checkCallable(c.callee, try this.calleeExpression(c));
+}
+
+/// tsc's `checkNonNullType` for what's called, which has messages of its own.
+fn checkCallable(this: *Checker, expr: *const Expr, t: *const Type) Error!*const Type {
+    const inner = ast.skipParens(expr);
+    if (t.* == .unknown or inner.data == .null or this.isGlobal(expr, "undefined")) {
+        return this.checkNonNull(expr, t);
+    }
+    const has_null = includesKind(t, .null);
+    const has_undefined = includesKind(t, .undefined);
+    if (!has_null and !has_undefined) {
+        return t;
+    }
+    const what = if (has_null and has_undefined) "'null' or 'undefined'" else if (has_null) "'null'" else "'undefined'";
+    const code: u16 = if (has_null and has_undefined) 2723 else if (has_null) 2721 else 2722;
+    try this.report(expr.start, .ts(code), "Cannot invoke an object which is possibly {s}.", .{what});
+    const rest = try this.removeNullish(t);
+    return if (rest.* == .never) types.any else rest;
+}
+
+fn includesKind(t: *const Type, comptime kind: std.meta.Tag(Type)) bool {
+    var buffer: [1]*const Type = undefined;
+    for (t.members(&buffer)) |m| {
+        if (m.* == kind) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn calleeExpression(this: *Checker, c: ast.Call) Error!*const Type {
     // `(0, a.b)()` calls `a.b` without `a` as `this`; the `0` isn't a mistake.
     if (c.callee.data == .paren) {
         const inner = c.callee.data.paren;
@@ -3217,18 +4112,31 @@ fn call(this: *Checker, expr: *const Expr, c: ast.Call) Error!*const Type {
             }
         }
     }
-    const callee = try this.checkNonNull(c.callee, try this.expression(c.callee));
-    if (callee.* == .function) {
-        return this.callFunction(expr, c, callee.function);
+    return this.expression(c.callee);
+}
+
+/// A call of something of type `callee`, which has been checked.
+fn callWith(this: *Checker, expr: *const Expr, c: ast.Call, callee_type: *const Type) Error!*const Type {
+    if (callee_type.* == .function) {
+        return this.callFunction(expr, c, callee_type.function);
     }
     for (c.arguments) |arg| {
         _ = try this.expression(arg);
     }
-    switch (callee.*) {
+    switch (callee_type.*) {
         .any => return types.any,
-        .never => return types.never,
+        .@"union" => |ms| {
+            for (ms) |m| {
+                if (m.* != .function) {
+                    try this.report(c.callee.start, .ts(2349), "This expression is not callable.\n  Not all constituents of type '{f}' are callable.", .{callee_type});
+                    return types.any;
+                }
+            }
+            try this.unsupported(c.callee.start, "Calling a union of function types is not supported yet.", .{});
+            return types.any;
+        },
         else => {
-            try this.report(c.callee.start, .ts(2349), "This expression is not callable.\n  Type '{s}' has no call signatures.", .{try this.apparentName(callee)});
+            try this.report(c.callee.start, .ts(2349), "This expression is not callable.\n  Type '{s}' has no call signatures.", .{try this.apparentName(callee_type)});
             return types.any;
         },
     }
@@ -3312,7 +4220,10 @@ fn checkFunction(this: *Checker, f: *const ast.Function, context_type: ?*const T
     const saved_indirect = this.indirect_call;
     const saved_parameter = this.parameter;
     const saved_lazy = this.lazy;
+    const saved_const = this.const_context;
+    this.const_context = false;
     defer {
+        this.const_context = saved_const;
         this.flow = saved_flow;
         this.scope = saved_scope;
         this.targets = saved_targets;
@@ -3865,6 +4776,7 @@ fn checkNonNull(this: *Checker, expr: *const Expr, t: *const Type) Error!*const 
 fn entityName(this: *Checker, expr: *const Expr) Error!?[]const u8 {
     return switch (expr.data) {
         .identifier => |id| id.name,
+        .chain => |inner| this.entityName(inner),
         .member => |m| if (try this.entityName(m.object)) |object|
             try std.fmt.allocPrint(this.arena, "{s}.{s}", .{ object, m.property })
         else
@@ -3899,7 +4811,7 @@ fn checkTruthiness(this: *Checker, expr: *const Expr) Error!void {
 }
 
 fn truthySemantics(this: *const Checker, expr: *const Expr) Semantics {
-    const e = ast.skipParens(expr);
+    const e = ast.skipOuter(expr);
     return switch (e.data) {
         // `while (0)` and `while (1)` are allowed idioms.
         .number => |n| if (n == 0 or n == 1) .sometimes else .always,
@@ -3916,11 +4828,11 @@ fn truthySemantics(this: *const Checker, expr: *const Expr) Semantics {
 
 /// tsc's syntactic nullishness check for the left side of `??` (TS2869/TS2871).
 fn nullishSemantics(this: *const Checker, expr: *const Expr) Semantics {
-    const e = ast.skipParens(expr);
+    const e = ast.skipOuter(expr);
     return switch (e.data) {
         .null => .always,
         .identifier => if (this.isGlobal(e, "undefined")) .always else .sometimes,
-        .member, .index, .call => .sometimes,
+        .member, .index, .call, .chain => .sometimes,
         .binary => |b| switch (b.op) {
             .nullish, .logical_or, .logical_and => .sometimes,
             .comma => this.nullishSemantics(b.right),
@@ -3936,17 +4848,7 @@ fn combine(a: Semantics, b: Semantics) Semantics {
     return if (a == b) a else .sometimes;
 }
 
-fn isFalsyLiteral(t: *const Type) bool {
-    return switch (t.*) {
-        .null, .undefined, .void => true,
-        .literal => |lit| switch (lit.value) {
-            .number => |n| n == 0 or std.math.isNan(n),
-            .string => |s| s.len == 0,
-            .boolean => |b| !b,
-        },
-        else => false,
-    };
-}
+const isFalsyLiteral = narrowing.isFalsyLiteral;
 
 fn canBeFalsy(this: *Checker, t: *const Type) Error!bool {
     var buffer: [1]*const Type = undefined;
@@ -4089,7 +4991,8 @@ fn uses(this: *const Checker, expr: *const Expr, target: *const Expr) bool {
                 break true;
             }
         } else false,
-        .paren => |inner| this.uses(inner, target),
+        .paren, .chain, .non_null => |inner| this.uses(inner, target),
+        .assertion => |a| this.uses(a.expr, target),
         .unary => |u| this.uses(u.operand, target),
         .update => |u| this.uses(u.operand, target),
         .assign => |a| this.uses(a.target, target) or this.uses(a.value, target),
@@ -4157,6 +5060,7 @@ fn usesInStatement(this: *const Checker, stmt: *const Stmt, target: *const Expr)
             this.usesInStatement(f.body, target),
         .labeled => |l| this.usesInStatement(l.body, target),
         .interface, .type_alias => false,
+        .throw => |e| this.uses(e, target),
         .for_each => |f| (f.head == .target and this.uses(f.head.target, target)) or this.uses(f.right, target) or this.usesInStatement(f.body, target),
         .@"switch" => |sw| this.uses(sw.discriminant, target) or for (sw.clauses) |clause| {
             if (clause.case) |c| {
