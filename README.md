@@ -33,8 +33,13 @@ $ echo 'console.log("a" * 2)' | zavascript
 > `as const`, `satisfies` and `!`, and tsc's narrowing: by assignment,
 > truthiness, `===`/`==`, `typeof`, `in`, discriminant properties, `switch`
 > and control flow (`return`, `throw` and calls of functions returning
-> `never`), for variables and their properties alike. Generics, classes and
-> the builtins are coming. Anything not supported yet is a compile error
+> `never`), for variables and their properties alike. Generic functions,
+> interfaces and type aliases work too, with constraints, defaults, explicit
+> type arguments and tsc's inference from arguments, callbacks and the
+> expected return type, as do `keyof`, indexed access types, `typeof` in
+> types, mapped types, `readonly` arrays, and `Partial`, `Required`,
+> `Readonly`, `Pick` and `Record` (declared in `lib.d.ts`). Classes and the
+> builtins are coming. Anything not supported yet is a compile error
 > (`ZV9001`), never a silent misbehavior.
 
 ## Usage

@@ -609,19 +609,15 @@ fn semicolon(this: *Parser) Error!void {
 fn interfaceDeclaration(this: *Parser) Error!*Stmt {
     const start = this.advance().start;
     const name = try this.declarationName("Interface");
-    if (this.current().tag == .less) {
-        return this.unsupported(this.current().start, "Generic interfaces are", .{});
-    }
+    const type_parameters = try this.genericParameters(false);
     var extends: std.ArrayList(ast.TypeReference) = .empty;
     if (this.eat(.kw_extends)) {
         while (true) {
             const tok = try this.expect(.identifier);
-            switch (this.current().tag) {
-                .less => return this.unsupported(this.current().start, "Generic types are", .{}),
-                .dot => return this.unsupported(this.current().start, "Qualified type names are", .{}),
-                else => {},
+            if (this.current().tag == .dot) {
+                return this.unsupported(this.current().start, "Qualified type names are", .{});
             }
-            try extends.append(this.arena, .{ .name = this.tokenText(tok), .start = tok.start });
+            try extends.append(this.arena, .{ .name = this.tokenText(tok), .start = tok.start, .arguments = try this.typeArguments() });
             if (!this.eat(.comma)) {
                 break;
             }
@@ -629,7 +625,7 @@ fn interfaceDeclaration(this: *Parser) Error!*Stmt {
     }
     const members = try this.typeMembers();
     const node = try this.arena.create(ast.Interface);
-    node.* = .{ .name = this.tokenText(name), .start = name.start, .extends = extends.items, .members = members };
+    node.* = .{ .name = this.tokenText(name), .start = name.start, .type_parameters = type_parameters, .extends = extends.items, .members = members };
     return this.newStmt(start, .{ .interface = node });
 }
 
@@ -637,14 +633,12 @@ fn interfaceDeclaration(this: *Parser) Error!*Stmt {
 fn typeAlias(this: *Parser) Error!*Stmt {
     const start = this.advance().start;
     const name = try this.declarationName("Type alias");
-    if (this.current().tag == .less) {
-        return this.unsupported(this.current().start, "Generic type aliases are", .{});
-    }
+    const type_parameters = try this.genericParameters(false);
     _ = try this.expect(.equal);
     const t = try this.typeNode();
     try this.semicolon();
     const node = try this.arena.create(ast.TypeAlias);
-    node.* = .{ .name = this.tokenText(name), .start = name.start, .type = t };
+    node.* = .{ .name = this.tokenText(name), .start = name.start, .type_parameters = type_parameters, .type = t };
     return this.newStmt(start, .{ .type_alias = node });
 }
 
@@ -694,13 +688,13 @@ fn typeMembers(this: *Parser) Error![]const ast.TypeMember {
         const optional = this.eat(.question);
         var member: ast.TypeMember = .{ .name = name, .start = tok.start, .optional = optional, .readonly = readonly, .method = false, .type = null };
         switch (this.current().tag) {
-            .less => return this.unsupported(this.current().start, "Generic methods are", .{}),
-            .l_paren => {
+            .l_paren, .less => {
                 const start = this.current().start;
+                const type_parameters = try this.genericParameters(false);
                 const parameters = try this.typeParameters();
                 const returns = if (this.eat(.colon)) try this.typeNode() else null;
                 member.method = true;
-                member.type = try this.newType(start, .{ .function = .{ .parameters = parameters, .returns = returns } });
+                member.type = try this.newType(start, .{ .function = .{ .type_parameters = type_parameters, .parameters = parameters, .returns = returns } });
             },
             .colon => {
                 _ = this.advance();
@@ -778,22 +772,39 @@ fn primaryType(this: *Parser) Error!*const ast.TypeNode {
         .identifier => blk: {
             for ([_][]const u8{ "keyof", "readonly", "unique", "infer" }) |word| {
                 const following = this.peekToken(1);
-                if (this.isContextual(tok, word) and !following.newline_before and (following.tag == .identifier or following.tag == .l_paren or following.tag == .l_bracket or following.tag == .l_brace or following.tag.isKeyword())) {
+                if (!this.isContextual(tok, word) or following.newline_before or !(following.tag == .identifier or following.tag == .l_paren or following.tag == .l_bracket or following.tag == .l_brace or following.tag.isKeyword())) {
+                    continue;
+                }
+                if (word[0] == 'u' or word[0] == 'i') {
                     return this.unsupported(tok.start, "'{s}' type operators are", .{word});
                 }
+                _ = this.advance();
+                const operand = try this.primaryType();
+                if (word[0] == 'k') {
+                    return this.newType(tok.start, .{ .keyof = operand });
+                }
+                switch (operand.data) {
+                    .array => {},
+                    .tuple => return this.unsupported(tok.start, "Readonly tuple types are", .{}),
+                    else => {
+                        try this.report(tok.start, .ts(1354), "'readonly' type modifier is only permitted on array and tuple literal types.", .{});
+                        return operand;
+                    },
+                }
+                return this.newType(tok.start, .{ .readonly = operand });
             }
             _ = this.advance();
             const text = this.tokenText(tok);
-            const next = this.current();
-            switch (next.tag) {
-                .less => return this.unsupported(next.start, "Generic types are", .{}),
-                .dot => return this.unsupported(next.start, "Qualified type names are", .{}),
-                else => {},
+            if (this.current().tag == .dot) {
+                return this.unsupported(this.current().start, "Qualified type names are", .{});
             }
-            break :blk try this.newType(tok.start, if (std.meta.stringToEnum(ast.TypeNode.Keyword, text)) |keyword|
-                .{ .keyword = keyword }
-            else
-                .{ .reference = text });
+            const type_arguments = try this.typeArguments();
+            if (type_arguments.len == 0) {
+                if (std.meta.stringToEnum(ast.TypeNode.Keyword, text)) |keyword| {
+                    break :blk try this.newType(tok.start, .{ .keyword = keyword });
+                }
+            }
+            break :blk try this.newType(tok.start, .{ .reference = .{ .name = text, .start = tok.start, .arguments = type_arguments } });
         },
         .kw_void, .kw_null => blk: {
             _ = this.advance();
@@ -831,10 +842,13 @@ fn primaryType(this: *Parser) Error!*const ast.TypeNode {
         .template_head => return this.unsupported(tok.start, "Template literal types are", .{}),
         .ampersand => return this.unsupported(tok.start, "Union and intersection types are", .{}),
         .kw_new => return this.unsupported(tok.start, "Constructor types are", .{}),
-        .less => return this.unsupported(tok.start, "Generic function types are", .{}),
-        .l_brace => try this.newType(tok.start, .{ .object = try this.typeMembers() }),
+        .less => try this.functionType(),
+        .l_brace => if (this.startsMappedType())
+            try this.mappedType()
+        else
+            try this.newType(tok.start, .{ .object = try this.typeMembers() }),
         .l_bracket => try this.tupleType(),
-        .kw_typeof => return this.unsupported(tok.start, "'typeof' types are", .{}),
+        .kw_typeof => try this.typeQuery(),
         .kw_this => return this.unsupported(tok.start, "'this' types are", .{}),
         else => return this.fail(tok.start, .ts(1110), "Type expected.", .{}),
     };
@@ -845,12 +859,14 @@ fn primaryType(this: *Parser) Error!*const ast.TypeNode {
                 if (next.newline_before) {
                     break;
                 }
-                if (this.peekToken(1).tag != .r_bracket) {
-                    return this.unsupported(next.start, "Indexed access types are", .{});
+                _ = this.advance();
+                if (this.eat(.r_bracket)) {
+                    node = try this.newType(node.start, .{ .array = node });
+                    continue;
                 }
-                _ = this.advance();
-                _ = this.advance();
-                node = try this.newType(node.start, .{ .array = node });
+                const index = try this.typeNode();
+                _ = try this.expect(.r_bracket);
+                node = try this.newType(node.start, .{ .indexed = .{ .object = node, .index = index } });
             },
             .ampersand => return this.unsupported(next.start, "Intersection types are", .{}),
             else => break,
@@ -902,10 +918,181 @@ fn tupleType(this: *Parser) Error!*const ast.TypeNode {
 
 fn functionType(this: *Parser) Error!*const ast.TypeNode {
     const start = this.current().start;
+    const type_parameters = try this.genericParameters(false);
     const parameters = try this.typeParameters();
     _ = try this.expect(.arrow);
     const returns = try this.typeNode();
-    return this.newType(start, .{ .function = .{ .parameters = parameters, .returns = returns } });
+    return this.newType(start, .{ .function = .{ .type_parameters = type_parameters, .parameters = parameters, .returns = returns } });
+}
+
+/// `typeof x` or `typeof x.y` in a type.
+fn typeQuery(this: *Parser) Error!*const ast.TypeNode {
+    const start = this.advance().start;
+    const name = this.current();
+    if (name.tag != .identifier) {
+        if (name.tag == .kw_this) {
+            return this.unsupported(name.start, "'typeof this' is", .{});
+        }
+        return this.fail(name.start, .ts(1003), "Identifier expected.", .{});
+    }
+    _ = this.advance();
+    var path: std.ArrayList([]const u8) = .empty;
+    while (this.eat(.dot)) {
+        const p = this.current();
+        if (p.tag != .identifier and !p.tag.isKeyword()) {
+            return this.fail(p.start, .ts(1003), "Identifier expected.", .{});
+        }
+        _ = this.advance();
+        try path.append(this.arena, this.tokenText(p));
+    }
+    if (this.current().tag == .less and !this.current().newline_before) {
+        return this.unsupported(this.current().start, "Instantiation expressions are", .{});
+    }
+    return this.newType(start, .{ .query = .{ .name = this.tokenText(name), .path = path.items } });
+}
+
+/// Whether the `{` at the current token starts a mapped type, `{ [P in K]: T }`.
+fn startsMappedType(this: *const Parser) bool {
+    var i: usize = 1;
+    const first = this.peekToken(i);
+    if (first.tag == .plus or first.tag == .minus) {
+        i += 1;
+        if (!this.isContextual(this.peekToken(i), "readonly")) {
+            return false;
+        }
+        i += 1;
+    } else if (this.isContextual(first, "readonly")) {
+        i += 1;
+    }
+    return this.peekToken(i).tag == .l_bracket and this.peekToken(i + 1).tag == .identifier and this.peekToken(i + 2).tag == .kw_in;
+}
+
+/// `{ readonly [P in K]?: T }`, with `+` or `-` on either modifier.
+fn mappedType(this: *Parser) Error!*const ast.TypeNode {
+    const start = this.advance().start;
+    var readonly: ast.TypeNode.Modifier = .none;
+    if (this.eat(.plus)) {
+        readonly = .add;
+    } else if (this.eat(.minus)) {
+        readonly = .remove;
+    }
+    if (this.isContextual(this.current(), "readonly")) {
+        _ = this.advance();
+        if (readonly == .none) {
+            readonly = .add;
+        }
+    }
+    _ = try this.expect(.l_bracket);
+    const name = try this.expect(.identifier);
+    _ = try this.expect(.kw_in);
+    const constraint = try this.typeNode();
+    if (this.isContextual(this.current(), "as")) {
+        return this.unsupported(this.current().start, "Key remapping in mapped types is", .{});
+    }
+    _ = try this.expect(.r_bracket);
+    var optional: ast.TypeNode.Modifier = .none;
+    if (this.eat(.plus)) {
+        optional = .add;
+        _ = try this.expect(.question);
+    } else if (this.eat(.minus)) {
+        optional = .remove;
+        _ = try this.expect(.question);
+    } else if (this.eat(.question)) {
+        optional = .add;
+    }
+    const t = if (this.eat(.colon)) try this.typeNode() else null;
+    _ = this.eat(.semicolon) or this.eat(.comma);
+    _ = try this.expect(.r_brace);
+    const mapped = try this.arena.create(ast.TypeNode.Mapped);
+    mapped.* = .{
+        .parameter = .{ .name = this.tokenText(name), .start = name.start },
+        .constraint = constraint,
+        .type = t,
+        .optional = optional,
+        .readonly = readonly,
+    };
+    return this.newType(start, .{ .mapped = mapped });
+}
+
+/// `<T extends C = D, U>`, if there is one. `span` records it for `Program.type_spans`, for the
+/// type parameters of a function, which node blanks out of its source.
+fn genericParameters(this: *Parser, span: bool) Error![]const ast.GenericParameter {
+    if (this.current().tag != .less) {
+        return &.{};
+    }
+    const start = this.advance().start;
+    var parameters: std.ArrayList(ast.GenericParameter) = .empty;
+    while (this.current().tag != .greater) {
+        const tok = this.current();
+        if (this.isContextual(tok, "const") or tok.tag == .kw_const or this.isContextual(tok, "in") or tok.tag == .kw_in or this.isContextual(tok, "out")) {
+            if (this.peekToken(1).tag == .identifier) {
+                return this.unsupported(tok.start, "Type parameter modifiers are", .{});
+            }
+        }
+        if (tok.tag != .identifier) {
+            return this.fail(tok.start, .ts(1139), "Type parameter declaration expected.", .{});
+        }
+        _ = this.advance();
+        var parameter: ast.GenericParameter = .{ .name = this.tokenText(tok), .start = tok.start };
+        if (this.eat(.kw_extends)) {
+            parameter.constraint = try this.typeNode();
+        }
+        if (this.eat(.equal)) {
+            parameter.default = try this.typeNode();
+        }
+        try parameters.append(this.arena, parameter);
+        if (!this.eat(.comma)) {
+            break;
+        }
+    }
+    _ = try this.expect(.greater);
+    if (parameters.items.len == 0) {
+        try this.report(start, .ts(1098), "Type parameter list cannot be empty.", .{});
+    }
+    if (span) {
+        try this.type_spans.append(this.arena, .{ .start = start, .end = this.previousEnd() });
+    }
+    return parameters.items;
+}
+
+/// `<A, B>` after a type's name, if there is one.
+fn typeArguments(this: *Parser) Error![]const *const ast.TypeNode {
+    if (this.current().tag != .less) {
+        return &.{};
+    }
+    const start = this.advance().start;
+    var list: std.ArrayList(*const ast.TypeNode) = .empty;
+    while (this.current().tag != .greater) {
+        try list.append(this.arena, try this.typeNode());
+        if (!this.eat(.comma)) {
+            break;
+        }
+    }
+    _ = try this.expect(.greater);
+    if (list.items.len == 0) {
+        try this.report(start, .ts(1099), "Type argument list cannot be empty.", .{});
+    }
+    return list.items;
+}
+
+/// `f<A, B>(...)`: type arguments where the `<` could also be a comparison. Only taken as type
+/// arguments when a `(` follows (tsc's `parseTypeArgumentsInExpression`); otherwise nothing is
+/// consumed and null is returned.
+fn callTypeArguments(this: *Parser) Error!?[]const *const ast.TypeNode {
+    const m = this.mark();
+    const list = this.typeArguments() catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Syntax => {
+            this.reset(m);
+            return null;
+        },
+    };
+    if (this.current().tag != .l_paren or this.diagnostics.items().len > m.diagnostics) {
+        this.reset(m);
+        return null;
+    }
+    try this.type_spans.append(this.arena, .{ .start = this.tokens[m.index].start, .end = this.previousEnd() });
+    return list;
 }
 
 /// The `( ... )` of a function type or method signature.
@@ -959,6 +1146,7 @@ fn function(this: *Parser, kind: ast.Function.Kind, start: u32) Error!*ast.Funct
     }
     const function_id = this.newFunction();
     const scope = this.newScope();
+    const type_parameters = try this.genericParameters(true);
     const parameters = try this.parameterList();
     var returns: ?*const ast.TypeNode = null;
     var returns_start: u32 = 0;
@@ -978,6 +1166,7 @@ fn function(this: *Parser, kind: ast.Function.Kind, start: u32) Error!*ast.Funct
         .start = start,
         .end = this.previousEnd(),
         .name = name,
+        .type_parameters = type_parameters,
         .inferred_name = if (name) |n| n.text else "",
         .parameters = parameters,
         .scope = scope,
@@ -1122,11 +1311,44 @@ fn arrowFunction(this: *Parser) Error!?*Expr {
             };
             return try this.arrowBody(tok.start, function_id, scope, head.parameters, head);
         },
+        .less => {
+            // `<T>(x: T) => x`, which in a `.ts` file can't be anything else.
+            const m = this.mark();
+            const function_id = this.newFunction();
+            const scope = this.newScope();
+            const head = this.genericArrowHead() catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Syntax => {
+                    this.reset(m);
+                    return null;
+                },
+            } orelse {
+                this.reset(m);
+                return null;
+            };
+            return try this.arrowBody(tok.start, function_id, scope, head.parameters, head);
+        },
         else => return null,
     }
 }
 
+fn genericArrowHead(this: *Parser) Error!?ArrowHead {
+    const type_parameters = try this.genericParameters(true);
+    if (this.current().tag != .l_paren) {
+        return null;
+    }
+    const start = this.current().start;
+    var head = try this.arrowHead() orelse return null;
+    head.type_parameters = type_parameters;
+    head.source_start = start;
+    return head;
+}
+
 const ArrowHead = struct {
+    type_parameters: []const ast.GenericParameter = &.{},
+    /// Where the function's source text starts, for a generic arrow, whose type parameters node
+    /// blanks out: its `(`.
+    source_start: ?u32 = null,
     parameters: []const ast.Parameter,
     returns: ?*const ast.TypeNode,
     returns_start: u32,
@@ -1181,9 +1403,10 @@ fn arrowBody(this: *Parser, start: u32, function_id: u32, scope: u32, parameters
     node.* = .{
         .kind = .arrow,
         .id = function_id,
-        .start = start,
+        .start = head.source_start orelse start,
         .end = this.previousEnd(),
         .name = null,
+        .type_parameters = head.type_parameters,
         .parameters = parameters,
         .scope = scope,
         .returns = head.returns,
@@ -1585,6 +1808,12 @@ fn postfix(this: *Parser) Error!*Expr {
                 const args = try this.arguments();
                 expr = try this.newExpr(expr.start, .{ .call = .{ .callee = expr, .arguments = args } });
             },
+            .less => {
+                const type_arguments = try this.callTypeArguments() orelse break;
+                _ = this.advance();
+                const args = try this.arguments();
+                expr = try this.newExpr(expr.start, .{ .call = .{ .callee = expr, .type_arguments = type_arguments, .arguments = args } });
+            },
             .l_bracket => {
                 _ = this.advance();
                 const saved_no_in = this.no_in;
@@ -1820,8 +2049,7 @@ fn objectProperty(this: *Parser) Error!ast.ObjectProperty {
             }
             return .{ .property = .{ .key = key, .key_start = tok.start, .value = value } };
         },
-        .less => return this.unsupported(this.current().start, "Generic methods are", .{}),
-        .l_paren => {
+        .l_paren, .less => {
             const f = try this.function(.expression, tok.start);
             if (key == .name) {
                 f.inferred_name = key.name;
@@ -2110,7 +2338,48 @@ fn renderFunction(writer: *std.Io.Writer, f: *const ast.Function) std.Io.Writer.
 fn renderType(writer: *std.Io.Writer, t: *const ast.TypeNode) std.Io.Writer.Error!void {
     switch (t.data) {
         .keyword => |k| try writer.print("{t}", .{k}),
-        .reference => |name| try writer.writeAll(name),
+        .reference => |r| {
+            try writer.writeAll(r.name);
+            if (r.arguments.len > 0) {
+                try writer.writeAll("<");
+                for (r.arguments, 0..) |a, i| {
+                    if (i > 0) {
+                        try writer.writeAll(", ");
+                    }
+                    try renderType(writer, a);
+                }
+                try writer.writeAll(">");
+            }
+        },
+        .keyof => |operand| {
+            try writer.writeAll("keyof ");
+            try renderType(writer, operand);
+        },
+        .readonly => |operand| {
+            try writer.writeAll("readonly ");
+            try renderType(writer, operand);
+        },
+        .indexed => |i| {
+            try renderType(writer, i.object);
+            try writer.writeAll("[");
+            try renderType(writer, i.index);
+            try writer.writeAll("]");
+        },
+        .query => |q| {
+            try writer.print("typeof {s}", .{q.name});
+            for (q.path) |p| {
+                try writer.print(".{s}", .{p});
+            }
+        },
+        .mapped => |m| {
+            try writer.print("{{ [{s} in ", .{m.parameter.name});
+            try renderType(writer, m.constraint);
+            try writer.writeAll("]: ");
+            if (m.type) |mt| {
+                try renderType(writer, mt);
+            }
+            try writer.writeAll(" }");
+        },
         .literal => |l| switch (l) {
             .number => |n| try number.format(writer, n),
             .string => |str| try writer.print("\"{s}\"", .{str}),
@@ -2489,7 +2758,7 @@ test "unsupported syntax is reported and skipped" {
     try expectErrors("var x = 1", &.{9001});
     try expectErrors("let a: number & string", &.{9001});
     try expectErrors("x instanceof y", &.{9001});
-    try expectErrors("type T<U> = U", &.{9001});
+    try expectErrors("let a: typeof this", &.{9001});
     try expectErrors("[1, , 2]", &.{9001});
     try expectErrors("({ get a() { return 1 } })", &.{9001});
     try expectErrors("let a: [number?]", &.{9001});
@@ -2586,7 +2855,6 @@ test "function errors" {
     try expectErrors("const f = async x => 1", &.{9001});
     try expectParse("async(1)", "(call async 1)\n");
     try expectErrors("let f: new () => void", &.{9001});
-    try expectErrors("let f: <T>() => T", &.{9001});
-    try expectErrors("let a: number[1]", &.{9001});
+    try expectErrors("let a: unique symbol", &.{9001});
     try expectErrors("(a, b)\n=> a", &.{1200});
 }

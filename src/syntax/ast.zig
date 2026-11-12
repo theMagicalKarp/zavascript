@@ -230,24 +230,36 @@ pub const Clause = struct {
     statements: []const *Stmt,
 };
 
-/// `interface Name extends A, B { members }`
+/// `interface Name<T> extends A, B<T> { members }`
 pub const Interface = struct {
     name: []const u8,
     start: u32,
+    type_parameters: []const GenericParameter = &.{},
     extends: []const TypeReference,
     members: []const TypeMember,
 };
 
-/// `type Name = T;`
+/// `type Name<T> = T;`
 pub const TypeAlias = struct {
     name: []const u8,
     start: u32,
+    type_parameters: []const GenericParameter = &.{},
     type: *const TypeNode,
 };
 
+/// A type's name, with its type arguments: `Box<number>`.
 pub const TypeReference = struct {
     name: []const u8,
     start: u32,
+    arguments: []const *const TypeNode = &.{},
+};
+
+/// `T extends C = D` in a list of type parameters.
+pub const GenericParameter = struct {
+    name: []const u8,
+    start: u32,
+    constraint: ?*const TypeNode = null,
+    default: ?*const TypeNode = null,
 };
 
 /// A property or method in an interface or an object type.
@@ -270,7 +282,7 @@ pub const TypeNode = struct {
 
     pub const Data = union(enum) {
         keyword: Keyword,
-        reference: []const u8,
+        reference: TypeReference,
         /// `1`, `-1`, `"a"`, `true`
         literal: Literal,
         /// `A | B`, with at least two members.
@@ -283,6 +295,41 @@ pub const TypeNode = struct {
         object: []const TypeMember,
         /// `(a: T, b?: U, ...c: V[]) => R`
         function: FunctionType,
+        /// `keyof T`
+        keyof: *const TypeNode,
+        /// `readonly T[]`
+        readonly: *const TypeNode,
+        /// `T[K]`
+        indexed: Indexed,
+        /// `typeof x` or `typeof x.y.z`.
+        query: Query,
+        /// `{ readonly [P in K]?: T }`
+        mapped: *const Mapped,
+    };
+
+    pub const Indexed = struct {
+        object: *const TypeNode,
+        index: *const TypeNode,
+    };
+
+    pub const Query = struct {
+        name: []const u8,
+        /// The properties after the name.
+        path: []const []const u8,
+    };
+
+    /// A `+` or `-` modifier of a mapped type, or neither.
+    pub const Modifier = enum { none, add, remove };
+
+    pub const Mapped = struct {
+        /// The `P` in `[P in K]`.
+        parameter: GenericParameter,
+        /// The `K`.
+        constraint: *const TypeNode,
+        /// Null when there's no `: T`, which is `any` (TS7008).
+        type: ?*const TypeNode,
+        optional: Modifier,
+        readonly: Modifier,
     };
 
     pub const Keyword = enum { any, unknown, never, void, undefined, null, boolean, number, string };
@@ -295,6 +342,7 @@ pub const TypeNode = struct {
 };
 
 pub const FunctionType = struct {
+    type_parameters: []const GenericParameter = &.{},
     parameters: []const TypeParameter,
     /// Null only for a method signature without a return type, which returns `any` (TS7010).
     returns: ?*const TypeNode,
@@ -320,6 +368,7 @@ pub const Function = struct {
     /// The declared name, if any. A declaration's name is bound in the enclosing scope; a function
     /// expression's only inside the function itself.
     name: ?Name,
+    type_parameters: []const GenericParameter = &.{},
     /// The name the function gets at runtime (its `.name`): its own, or the variable or parameter
     /// it's assigned to (ECMA-262 NamedEvaluation). Empty when there's none.
     inferred_name: []const u8 = "",
@@ -569,6 +618,8 @@ pub const Member = struct {
 
 pub const Call = struct {
     callee: *Expr,
+    /// `f<number>(x)`
+    type_arguments: []const *const TypeNode = &.{},
     arguments: []const *Expr,
     /// `callee?.(arguments)`, inside a `chain`.
     optional: bool = false,

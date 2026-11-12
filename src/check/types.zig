@@ -25,6 +25,21 @@ pub const Type = union(enum) {
     array: *const Type,
     /// `[T, U]`, with the element types.
     tuple: []const *const Type,
+    /// `readonly T[]` or `ReadonlyArray<T>`, with the element type.
+    readonly_array: *const Type,
+    /// A type parameter, like the `T` of `function f<T>(x: T)`. Each is only equal to itself.
+    param: *const Param,
+    /// `keyof T`, for a `T` that's generic, so its keys aren't known yet.
+    keyof: *const Type,
+    /// `T[K]`, when `T` or `K` is generic.
+    indexed: Indexed,
+    /// `{ [P in K]: X }`, when `K` is generic.
+    mapped: *const Mapped,
+
+    pub const Indexed = struct {
+        object: *const Type,
+        index: *const Type,
+    };
 
     pub const Literal = struct {
         value: Value,
@@ -54,6 +69,11 @@ pub const Type = union(enum) {
             .object => |o| b.* == .object and (b.object == o or o.eql(b.object)),
             .function => |f| b.* == .function and (b.function == f or f.eql(b.function)),
             .array => |e| b.* == .array and e.eql(b.array),
+            .readonly_array => |e| b.* == .readonly_array and e.eql(b.readonly_array),
+            .param => false,
+            .keyof => |e| b.* == .keyof and e.eql(b.keyof),
+            .indexed => |x| b.* == .indexed and x.object.eql(b.indexed.object) and x.index.eql(b.indexed.index),
+            .mapped => false,
             .tuple => |es| b.* == .tuple and es.len == b.tuple.len and for (es, b.tuple) |x, y| {
                 if (!x.eql(y)) {
                     break false;
@@ -100,9 +120,24 @@ pub const Type = union(enum) {
             .object => |o| try o.format(writer),
             .function => |f| try f.format(writer),
             .array => |e| {
-                try e.formatParenthesized(writer, e.* == .function or e.* == .@"union");
+                try e.formatParenthesized(writer, e.* == .function or e.* == .@"union" or e.* == .keyof);
                 try writer.writeAll("[]");
             },
+            .readonly_array => |e| {
+                try writer.writeAll("readonly ");
+                try e.formatParenthesized(writer, e.* == .function or e.* == .@"union" or e.* == .keyof);
+                try writer.writeAll("[]");
+            },
+            .param => |p| try writer.writeAll(p.name),
+            .keyof => |e| {
+                try writer.writeAll("keyof ");
+                try e.formatParenthesized(writer, e.* == .function or e.* == .@"union");
+            },
+            .indexed => |x| {
+                try x.object.formatParenthesized(writer, x.object.* == .function or x.object.* == .@"union" or x.object.* == .keyof);
+                try writer.print("[{f}]", .{x.index});
+            },
+            .mapped => |m| try m.format(writer),
             .tuple => |es| {
                 try writer.writeAll("[");
                 for (es, 0..) |e, i| {
@@ -131,6 +166,42 @@ fn literalEql(a: Type.Literal.Value, b: Type.Literal.Value) bool {
     };
 }
 
+pub const Param = struct {
+    name: []const u8,
+    /// `T extends C`
+    constraint: ?*const Type = null,
+    /// `T = D`
+    default: ?*const Type = null,
+};
+
+pub const Modifier = enum { none, add, remove };
+
+/// `{ readonly [P in K]?: X }`
+pub const Mapped = struct {
+    /// The `P`, a `param`.
+    parameter: *const Type,
+    constraint: *const Type,
+    template: *const Type,
+    optional: Modifier = .none,
+    readonly: Modifier = .none,
+    /// For a homomorphic mapped type, `[P in keyof T]`, the `T`, whose properties' modifiers it
+    /// keeps.
+    source: ?*const Type = null,
+
+    pub fn format(this: *const Mapped, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        const sign = [_][]const u8{ "", "+", "-" };
+        try writer.writeAll("{ ");
+        if (this.readonly != .none) {
+            try writer.print("{s}readonly ", .{if (this.readonly == .remove) "-" else ""});
+        }
+        try writer.print("[{s} in {f}]", .{ this.parameter.param.name, this.constraint });
+        if (this.optional != .none) {
+            try writer.print("{s}?", .{if (this.optional == .remove) sign[2] else ""});
+        }
+        try writer.print(": {f}; }}", .{this.template});
+    }
+};
+
 pub const Property = struct {
     name: []const u8,
     /// For an optional property, this includes `undefined`.
@@ -152,6 +223,12 @@ pub const Object = struct {
     /// by its members and compared structurally; a named one is only equal to itself.
     name: []const u8 = "",
     properties: []const Property,
+    /// For an instantiation of a generic interface or type alias (`Box<number>`), its type
+    /// arguments; for the generic declaration itself, its own type parameters.
+    type_arguments: []const *const Type = &.{},
+    /// The generic declaration this instantiates, which the checker knows how to instantiate
+    /// again with other type arguments. Null if it isn't generic.
+    generic: ?*const anyopaque = null,
 
     pub fn property(this: *const Object, name: []const u8) ?*const Type {
         const p = this.find(name) orelse return null;
@@ -182,7 +259,9 @@ pub const Object = struct {
 
     pub fn format(this: *const Object, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         if (this.name.len > 0) {
-            return writer.writeAll(this.name);
+            try writer.writeAll(this.name);
+            try formatArguments(writer, this.type_arguments);
+            return;
         }
         if (this.properties.len == 0) {
             return writer.writeAll("{}");
@@ -212,9 +291,23 @@ pub const Parameter = struct {
     optional: bool = false,
 };
 
+fn formatArguments(writer: *std.Io.Writer, arguments: []const *const Type) std.Io.Writer.Error!void {
+    if (arguments.len == 0) {
+        return;
+    }
+    try writer.writeAll("<");
+    for (arguments, 0..) |a, i| {
+        try writer.print("{s}{f}", .{ if (i > 0) ", " else "", a });
+    }
+    try writer.writeAll(">");
+}
+
 pub const Function = struct {
+    /// `<T, U>`, each a `param`.
+    type_parameters: []const *const Type = &.{},
     parameters: []const Parameter,
-    /// A `...rest` parameter, whose type is an array type.
+    /// A `...rest` parameter, whose type is an array type (or `any`, or not one, which was
+    /// reported).
     rest: ?Parameter = null,
     returns: *const Type,
     /// The return type is still being inferred from the body, and is `any` until it is. A call
@@ -238,12 +331,23 @@ pub const Function = struct {
             return this.parameters[index].type;
         }
         const rest = this.rest orelse return null;
-        return rest.type.array;
+        return switch (rest.type.*) {
+            .array, .readonly_array => |e| e,
+            else => any,
+        };
     }
 
     pub fn eql(a: *const Function, b: *const Function) bool {
         if (a.parameters.len != b.parameters.len or (a.rest == null) != (b.rest == null) or a.pending or b.pending) {
             return false;
+        }
+        if (a.type_parameters.len != b.type_parameters.len) {
+            return false;
+        }
+        for (a.type_parameters, b.type_parameters) |x, y| {
+            if (x != y) {
+                return false;
+            }
         }
         for (a.parameters, b.parameters) |x, y| {
             if (x.optional != y.optional or !std.mem.eql(u8, x.name, y.name) or !x.type.eql(y.type)) {
@@ -264,6 +368,19 @@ pub const Function = struct {
     }
 
     fn formatParameters(this: *const Function, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (this.type_parameters.len > 0) {
+            try writer.writeAll("<");
+            for (this.type_parameters, 0..) |t, i| {
+                try writer.print("{s}{s}", .{ if (i > 0) ", " else "", t.param.name });
+                if (t.param.constraint) |c| {
+                    try writer.print(" extends {f}", .{c});
+                }
+                if (t.param.default) |d| {
+                    try writer.print(" = {f}", .{d});
+                }
+            }
+            try writer.writeAll(">");
+        }
         try writer.writeAll("(");
         for (this.parameters, 0..) |p, i| {
             if (i > 0) {
@@ -489,7 +606,7 @@ fn printRank(t: *const Type) u8 {
             else => 5,
         },
         .void => 6,
-        .object, .function, .array, .tuple => 7,
+        .object, .function, .array, .tuple, .readonly_array, .param, .keyof, .indexed, .mapped => 7,
         .null => 8,
         .undefined => 9,
         .any, .unknown, .never, .@"union" => 10,
@@ -559,6 +676,15 @@ pub fn overlap(a: *const Type, b: *const Type) bool {
 }
 
 fn comparableWith(a: *const Type, b: *const Type, nullish_with_anything: bool) bool {
+    if (a.eql(b)) {
+        return true;
+    }
+    if (a.* != .@"union" and isGeneric(a) and baseConstraint(a) != a) {
+        return comparableWith(baseConstraint(a), b, nullish_with_anything);
+    }
+    if (b.* != .@"union" and isGeneric(b) and baseConstraint(b) != b) {
+        return comparableWith(a, baseConstraint(b), nullish_with_anything);
+    }
     if (a.* == .any or b.* == .any or a.* == .unknown or b.* == .unknown) {
         return true;
     }
@@ -590,8 +716,12 @@ fn overlaps(x: *const Type, y: *const Type, nullish_with_anything: bool) bool {
     if (x.* == .function and y.* == .function) {
         return true;
     }
-    if (x.* == .array and y.* == .array) {
-        return comparableWith(x.array, y.array, nullish_with_anything);
+    if (arrayElement(x)) |xe| {
+        if (arrayElement(y)) |ye| {
+            if (x.* != .tuple and y.* != .tuple) {
+                return comparableWith(xe, ye, nullish_with_anything);
+            }
+        }
     }
     if (isObjectLike(x) or isObjectLike(y)) {
         // tsc's comparable relation holds when either side is assignable to the other, as a
@@ -603,7 +733,7 @@ fn overlaps(x: *const Type, y: *const Type, nullish_with_anything: bool) bool {
 
 fn isObjectLike(t: *const Type) bool {
     return switch (t.*) {
-        .object, .function, .array, .tuple => true,
+        .object, .function, .array, .tuple, .readonly_array, .mapped => true,
         else => false,
     };
 }
@@ -662,6 +792,12 @@ fn comparableIn(source: *const Type, target: *const Type, depth: u32) bool {
     if (depth > 64 or source.eql(target)) {
         return true;
     }
+    if (source.* != .@"union" and isGeneric(source) and baseConstraint(source) != source) {
+        return comparableIn(baseConstraint(source), target, depth + 1);
+    }
+    if (target.* != .@"union" and isGeneric(target) and baseConstraint(target) != target) {
+        return comparableIn(source, baseConstraint(target), depth + 1);
+    }
     if (target.* == .any or target.* == .unknown or source.* == .any or source.* == .never or source.* == .unknown) {
         return true;
     }
@@ -684,8 +820,8 @@ fn comparableIn(source: *const Type, target: *const Type, depth: u32) bool {
         return false;
     }
     return switch (target.*) {
-        .array => |element| switch (source.*) {
-            .array => |e| comparableIn(e, element, depth + 1),
+        .array, .readonly_array => |element| switch (source.*) {
+            .array, .readonly_array => |e| comparableIn(e, element, depth + 1),
             .tuple => |es| for (es) |e| {
                 if (!comparableIn(e, element, depth + 1)) {
                     break false;
@@ -720,15 +856,32 @@ pub fn assignable(source: *const Type, target: *const Type) bool {
 /// types like `interface List { next?: List }` terminate (tsc's "maybe" stack).
 pub const Assumption = struct {
     source: *const Type,
-    target: *const Object,
+    target: ?*const Object,
     parent: ?*const Assumption,
     depth: u32,
+    /// For comparing two generic function types, `<T>(x: T) => T` and `<U>(x: U) => U`: their
+    /// type parameters, which correspond one to one.
+    source_parameters: []const *const Type = &.{},
+    target_parameters: []const *const Type = &.{},
 
     fn holds(this: ?*const Assumption, source: *const Type, target: *const Object) bool {
         var a = this;
         while (a) |x| : (a = x.parent) {
             if (x.source == source and x.target == target) {
                 return true;
+            }
+        }
+        return false;
+    }
+
+    /// Whether the type parameters `source` and `target` correspond.
+    fn corresponds(this: ?*const Assumption, source: *const Type, target: *const Type) bool {
+        var a = this;
+        while (a) |x| : (a = x.parent) {
+            for (x.source_parameters, x.target_parameters) |s, t| {
+                if ((s == source and t == target) or (s == target and t == source)) {
+                    return true;
+                }
             }
         }
         return false;
@@ -740,6 +893,65 @@ fn assignableIn(source: *const Type, target: *const Type, assumed: ?*const Assum
         return true;
     }
     if (target.* == .any or target.* == .unknown or source.* == .any or source.* == .never) {
+        return true;
+    }
+    if (source.* == .param and target.* == .param and Assumption.corresponds(assumed, source, target)) {
+        return true;
+    }
+    if (target.* == .mapped) {
+        const m = target.mapped;
+        // `{}` is assignable to a mapped type that makes every property optional, like `Partial<T>`.
+        if (m.optional == .add and isEmptyObject(source)) {
+            return true;
+        }
+        // `T` is assignable to `Partial<T>` and `Readonly<T>`.
+        const s = m.source orelse return false;
+        return s.eql(source) and m.optional != .remove and m.template.* == .indexed and m.template.indexed.object.eql(s) and m.template.indexed.index == m.parameter;
+    }
+    if (isGeneric(source)) {
+        // `T` is assignable to itself (in a union too), and to what its constraint is.
+        var buffer: [1]*const Type = undefined;
+        for (target.members(&buffer)) |m| {
+            if (source.eql(m) or (source.* == .param and m.* == .param and Assumption.corresponds(assumed, source, m))) {
+                return true;
+            }
+        }
+        if (source.* == .@"union") {
+            for (source.@"union") |m| {
+                if (!assignableIn(m, target, assumed)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        const next = immediateConstraint(source);
+        return next != source and assignableIn(next, target, assumed);
+    }
+    if (target.* == .keyof) {
+        // `"a"` is one of the keys of a `T extends { a: number }`.
+        const base = baseConstraint(target.keyof);
+        if (base.* != .object) {
+            return false;
+        }
+        var buffer: [1]*const Type = undefined;
+        for (source.members(&buffer)) |m| {
+            if (m.* != .literal or m.literal.value == .boolean) {
+                return false;
+            }
+            var name_buffer: [64]u8 = undefined;
+            const name = switch (m.literal.value) {
+                .string => |str| str,
+                .number => |n| blk: {
+                    var w: std.Io.Writer = .fixed(&name_buffer);
+                    @import("../runtime/number.zig").format(&w, n) catch return false;
+                    break :blk w.buffered();
+                },
+                .boolean => unreachable,
+            };
+            if (base.object.find(name) == null) {
+                return false;
+            }
+        }
         return true;
     }
     if (source.* == .@"union") {
@@ -766,8 +978,10 @@ fn assignableIn(source: *const Type, target: *const Type, assumed: ?*const Assum
         .string => isStringLike(source),
         .boolean => source.* == .literal and source.literal.value == .boolean,
         .void => source.* == .undefined,
-        .array => |element| switch (source.*) {
+        .array, .readonly_array => |element| switch (source.*) {
             .array => |e| assignableIn(e, element, assumed),
+            // A readonly array can't be used as a mutable one (TS4104).
+            .readonly_array => |e| target.* == .readonly_array and assignableIn(e, element, assumed),
             .tuple => |es| for (es) |e| {
                 if (!assignableIn(e, element, assumed)) {
                     break false;
@@ -837,7 +1051,7 @@ pub fn objectMismatch(source: *const Type, target: *const Object, assumed: ?*con
                 if (p.optional) {
                     continue;
                 }
-                const has_length = source.* == .array or source.* == .tuple or source.* == .function;
+                const has_length = source.* == .array or source.* == .readonly_array or source.* == .tuple or source.* == .function;
                 if (!has_length or !std.mem.eql(u8, p.name, "length")) {
                     return .missing;
                 }
@@ -860,7 +1074,7 @@ pub fn missingProperties(arena: std.mem.Allocator, source: *const Type, target: 
         }
         const has = switch (source.*) {
             .object => |s| s.find(p.name) != null,
-            .array, .tuple, .function => std.mem.eql(u8, p.name, "length"),
+            .array, .readonly_array, .tuple, .function => std.mem.eql(u8, p.name, "length"),
             else => false,
         };
         if (!has) {
@@ -890,7 +1104,19 @@ pub fn functionMismatch(source: *const Function, target: *const Function) ?Funct
     return functionMismatchIn(source, target, null);
 }
 
-fn functionMismatchIn(source: *const Function, target: *const Function, assumed: ?*const Assumption) ?FunctionMismatch {
+fn functionMismatchIn(source: *const Function, target: *const Function, outer: ?*const Assumption) ?FunctionMismatch {
+    // Two generic functions with as many type parameters are compared with each type parameter of
+    // one standing for the other's.
+    const link: Assumption = .{
+        .source = any,
+        .target = null,
+        .parent = outer,
+        .depth = if (outer) |o| o.depth else 0,
+        .source_parameters = source.type_parameters,
+        .target_parameters = target.type_parameters,
+    };
+    const paired = source.type_parameters.len > 0 and source.type_parameters.len == target.type_parameters.len;
+    const assumed: ?*const Assumption = if (paired) &link else outer;
     if (target.rest == null and source.minArguments() > target.parameters.len) {
         return .{ .arity = source.minArguments() };
     }
@@ -936,6 +1162,11 @@ pub fn isLiteralType(t: *const Type) bool {
 /// tsc's `typeCouldHaveTopLevelSingletonTypes`: when it's false, a literal source type is shown
 /// widened in "not assignable" messages (`Type 'string'` rather than `Type '"a"'`).
 pub fn couldHaveSingletons(t: *const Type) bool {
+    if (t.* == .param) {
+        // A type parameter with a literal constraint can be a literal.
+        const c = t.param.constraint orelse return false;
+        return couldHaveSingletons(c);
+    }
     // `boolean` alone doesn't count, but as part of a union its `true` and `false` do.
     if (t.* != .@"union") {
         return t.* == .literal or t.* == .null or t.* == .undefined;
@@ -943,10 +1174,448 @@ pub fn couldHaveSingletons(t: *const Type) bool {
     for (t.@"union") |m| {
         switch (m.*) {
             .literal, .null, .undefined, .boolean => return true,
+            .param => if (couldHaveSingletons(m)) return true,
             else => {},
         }
     }
     return false;
+}
+
+// Generics
+
+/// Whether `t` is generic at its top level: a type parameter, or something made of one whose
+/// value isn't known until it's instantiated, like `keyof T`. `{ a: T }` isn't, since what it is
+/// (an object with an `a`) is known.
+pub fn isGeneric(t: *const Type) bool {
+    return switch (t.*) {
+        .param, .keyof, .indexed, .mapped => true,
+        .@"union" => |ms| for (ms) |m| {
+            if (isGeneric(m)) {
+                break true;
+            }
+        } else false,
+        else => false,
+    };
+}
+
+/// Whether `t` mentions a type parameter anywhere (which a generic function's own don't count
+/// as, and nor do the members of named types other than their type arguments).
+pub fn mentionsParameters(t: *const Type) bool {
+    return switch (t.*) {
+        .param, .keyof, .indexed, .mapped => true,
+        .@"union", .tuple => |ms| for (ms) |m| {
+            if (mentionsParameters(m)) {
+                break true;
+            }
+        } else false,
+        .array, .readonly_array => |e| mentionsParameters(e),
+        .object => |o| if (o.name.len > 0) for (o.type_arguments) |a| {
+            if (mentionsParameters(a)) {
+                break true;
+            }
+        } else false else for (o.properties) |p| {
+            if (mentionsParameters(p.type)) {
+                break true;
+            }
+        } else false,
+        .function => |f| mentionsParameters(f.returns) or (if (f.rest) |r| mentionsParameters(r.type) else false) or for (f.parameters) |p| {
+            if (mentionsParameters(p.type)) {
+                break true;
+            }
+        } else false,
+        else => false,
+    };
+}
+
+/// What a generic type is known to be, whatever it's instantiated with (tsc's
+/// `getBaseConstraintOfType`): a type parameter's constraint, or `unknown` if it has none.
+pub fn baseConstraint(t: *const Type) *const Type {
+    return switch (t.*) {
+        .param => |p| if (p.constraint) |c| baseConstraint(c) else unknown,
+        .keyof => string_or_number,
+        .indexed => |x| blk: {
+            // `T["a"]` where `T extends { a: number }` is a `number`.
+            const o = baseConstraint(x.object);
+            const k = baseConstraint(x.index);
+            if (o.* == .object and k.* == .literal and k.literal.value == .string) {
+                if (o.object.find(k.literal.value.string)) |p| {
+                    break :blk p.type;
+                }
+            }
+            if (k.* == .number or (k.* == .literal and k.literal.value == .number)) {
+                if (arrayElement(o)) |e| {
+                    if (o.* != .tuple) {
+                        break :blk e;
+                    }
+                }
+            }
+            break :blk unknown;
+        },
+        else => t,
+    };
+}
+
+/// What a generic type is constrained to, one step at a time: `K extends keyof T` is a
+/// `keyof T`, which is a `string | number`.
+fn immediateConstraint(t: *const Type) *const Type {
+    return switch (t.*) {
+        .param => |p| p.constraint orelse unknown,
+        .keyof => string_or_number,
+        .indexed => baseConstraint(t),
+        .mapped => unknown,
+        else => t,
+    };
+}
+
+/// tsc's `keyof any`, without `symbol`.
+pub const string_or_number: *const Type = &.{ .@"union" = &.{ string, number } };
+
+/// The element type of an array, a readonly array, or a tuple with a single element type.
+pub fn arrayElement(t: *const Type) ?*const Type {
+    return switch (t.*) {
+        .array, .readonly_array => |e| e,
+        .tuple => |es| if (es.len == 1) es[0] else null,
+        else => null,
+    };
+}
+
+/// Type arguments for type parameters, to substitute one for the other.
+pub const Mapper = struct {
+    from: []const *const Type = &.{},
+    to: []const *const Type = &.{},
+    /// Instantiates a generic interface or type alias (an object with `generic` set) with other
+    /// type arguments. Only the checker knows how, since that takes resolving its declaration.
+    named: *const fn (context: *anyopaque, object: *const Object, arguments: []const *const Type) Error!*const Type,
+    context: *anyopaque,
+
+    fn lookup(this: *const Mapper, t: *const Type) ?*const Type {
+        for (this.from, this.to) |f, to| {
+            if (f == t) {
+                return to;
+            }
+        }
+        return null;
+    }
+
+    /// The same, but substituting `to` for `from` instead.
+    pub fn with(this: *const Mapper, from: []const *const Type, to: []const *const Type) Mapper {
+        return .{ .from = from, .to = to, .named = this.named, .context = this.context };
+    }
+};
+
+const Error = error{OutOfMemory};
+
+/// `t` with the type parameters `mapper` maps replaced by their type arguments.
+pub fn instantiate(arena: std.mem.Allocator, t: *const Type, mapper: *const Mapper) Error!*const Type {
+    if (mapper.from.len == 0) {
+        return t;
+    }
+    return switch (t.*) {
+        .param => mapper.lookup(t) orelse t,
+        .@"union" => |ms| blk: {
+            var changed = false;
+            const list = try arena.alloc(*const Type, ms.len);
+            for (ms, list) |m, *x| {
+                x.* = try instantiate(arena, m, mapper);
+                changed = changed or x.* != m;
+            }
+            break :blk if (changed) unionOf(arena, list) else t;
+        },
+        .array => |e| blk: {
+            const x = try instantiate(arena, e, mapper);
+            break :blk if (x == e) t else asPtr(.{ .array = x }, arena);
+        },
+        .readonly_array => |e| blk: {
+            const x = try instantiate(arena, e, mapper);
+            break :blk if (x == e) t else asPtr(.{ .readonly_array = x }, arena);
+        },
+        .tuple => |es| blk: {
+            var changed = false;
+            const list = try arena.alloc(*const Type, es.len);
+            for (es, list) |e, *x| {
+                x.* = try instantiate(arena, e, mapper);
+                changed = changed or x.* != e;
+            }
+            break :blk if (changed) asPtr(.{ .tuple = list }, arena) else t;
+        },
+        .object => |o| blk: {
+            if (o.generic != null) {
+                var changed = false;
+                const list = try arena.alloc(*const Type, o.type_arguments.len);
+                for (o.type_arguments, list) |a, *x| {
+                    x.* = try instantiate(arena, a, mapper);
+                    changed = changed or x.* != a;
+                }
+                break :blk if (changed) mapper.named(mapper.context, o, list) else t;
+            }
+            if (o.name.len > 0) {
+                break :blk t;
+            }
+            var changed = false;
+            const properties = try arena.alloc(Property, o.properties.len);
+            for (o.properties, properties) |p, *x| {
+                x.* = p;
+                x.type = try instantiate(arena, p.type, mapper);
+                changed = changed or x.type != p.type;
+            }
+            if (!changed) {
+                break :blk t;
+            }
+            const object = try arena.create(Object);
+            object.* = .{ .properties = properties };
+            break :blk asPtr(.{ .object = object }, arena);
+        },
+        .function => |f| blk: {
+            var changed = false;
+            const parameters = try arena.alloc(Parameter, f.parameters.len);
+            for (f.parameters, parameters) |p, *x| {
+                x.* = p;
+                x.type = try instantiate(arena, p.type, mapper);
+                changed = changed or x.type != p.type;
+            }
+            var rest = f.rest;
+            if (rest) |*r| {
+                const x = try instantiate(arena, r.type, mapper);
+                changed = changed or x != r.type;
+                r.type = x;
+            }
+            const returns = try instantiate(arena, f.returns, mapper);
+            changed = changed or returns != f.returns;
+            if (!changed) {
+                break :blk t;
+            }
+            const function = try arena.create(Function);
+            function.* = .{ .type_parameters = f.type_parameters, .parameters = parameters, .rest = rest, .returns = returns };
+            break :blk asPtr(.{ .function = function }, arena);
+        },
+        .keyof => |e| blk: {
+            const x = try instantiate(arena, e, mapper);
+            break :blk if (x == e) t else try keyOf(arena, x) orelse try asPtr(.{ .keyof = x }, arena);
+        },
+        .indexed => |i| blk: {
+            const o = try instantiate(arena, i.object, mapper);
+            const k = try instantiate(arena, i.index, mapper);
+            if (o == i.object and k == i.index) {
+                break :blk t;
+            }
+            break :blk try indexedAccess(arena, o, k, mapper) orelse unknown;
+        },
+        .mapped => |m| blk: {
+            const source = if (m.source) |x| try instantiate(arena, x, mapper) else null;
+            if (m.source != null and m.source.?.* == .param and source.?.* == .@"union") {
+                // A homomorphic mapped type of a union is the union of it for each member:
+                // `Partial<A | B>` is `Partial<A> | Partial<B>`.
+                const index = std.mem.indexOfScalar(*const Type, mapper.from, m.source.?).?;
+                const list = try arena.alloc(*const Type, source.?.@"union".len);
+                for (source.?.@"union", list) |member, *x| {
+                    const to = try arena.dupe(*const Type, mapper.to);
+                    to[index] = member;
+                    x.* = try instantiate(arena, t, &mapper.with(mapper.from, to));
+                }
+                break :blk unionOf(arena, list);
+            }
+            const constraint = try instantiate(arena, m.constraint, mapper);
+            const template = try instantiate(arena, m.template, mapper);
+            if (constraint == m.constraint and template == m.template and source == m.source) {
+                break :blk t;
+            }
+            const mapped = try arena.create(Mapped);
+            mapped.* = m.*;
+            mapped.constraint = constraint;
+            mapped.template = template;
+            mapped.source = source;
+            break :blk resolveMapped(arena, mapped, mapper);
+        },
+        else => t,
+    };
+}
+
+/// `keyof t`, deferred when `t` is generic. Null when it isn't supported yet: the keys of
+/// primitives and arrays are their methods.
+pub fn keyOf(arena: std.mem.Allocator, t: *const Type) Error!?*const Type {
+    switch (t.*) {
+        .any => return string_or_number,
+        .never => return string_or_number,
+        .param, .keyof, .indexed => return try asPtr(.{ .keyof = t }, arena),
+        // The keys of `{ [P in K]: X }` are `K`.
+        .mapped => |m| return m.constraint,
+        .object => |o| {
+            var keys: std.ArrayList(*const Type) = .empty;
+            for (o.properties) |p| {
+                try keys.append(arena, try keyLiteral(arena, p.name));
+            }
+            return try unionOf(arena, keys.items);
+        },
+        .@"union" => |ms| {
+            if (isGeneric(t)) {
+                return try asPtr(.{ .keyof = t }, arena);
+            }
+            // Only the keys every member has.
+            var common: std.ArrayList(*const Type) = .empty;
+            const first = try keyOf(arena, ms[0]) orelse return null;
+            var buffer: [1]*const Type = undefined;
+            outer: for (first.members(&buffer)) |k| {
+                for (ms[1..]) |m| {
+                    const keys = try keyOf(arena, m) orelse return null;
+                    if (!assignable(k, keys)) {
+                        continue :outer;
+                    }
+                }
+                try common.append(arena, k);
+            }
+            return try unionOf(arena, common.items);
+        },
+        else => return null,
+    }
+}
+
+/// The literal type of a property name: a number for a canonical numeric name like `0`, and a
+/// string otherwise.
+fn keyLiteral(arena: std.mem.Allocator, name: []const u8) Error!*const Type {
+    const number_module = @import("../runtime/number.zig");
+    const n = std.fmt.parseFloat(f64, name) catch return literal(arena, .{ .string = name });
+    const canonical = try number_module.toString(arena, n);
+    if (std.mem.eql(u8, canonical, name)) {
+        return literal(arena, .{ .number = n });
+    }
+    return literal(arena, .{ .string = name });
+}
+
+/// The name a literal key gives, or null if it isn't one.
+pub fn keyName(arena: std.mem.Allocator, key: *const Type) Error!?[]const u8 {
+    if (key.* != .literal) {
+        return null;
+    }
+    return switch (key.literal.value) {
+        .string => |str| str,
+        .number => |n| try @import("../runtime/number.zig").toString(arena, n),
+        .boolean => null,
+    };
+}
+
+/// `object[index]`, deferred when either is generic. Null when `index` can't index `object`.
+pub fn indexedAccess(arena: std.mem.Allocator, object: *const Type, index: *const Type, mapper: *const Mapper) Error!?*const Type {
+    if (isGeneric(object) or isGeneric(index)) {
+        return try asPtr(.{ .indexed = .{ .object = object, .index = index } }, arena);
+    }
+    if (object.* == .any) {
+        return any;
+    }
+    if (index.* == .@"union") {
+        var parts: std.ArrayList(*const Type) = .empty;
+        for (index.@"union") |k| {
+            try parts.append(arena, try indexedAccess(arena, object, k, mapper) orelse return null);
+        }
+        return try unionOf(arena, parts.items);
+    }
+    if (object.* == .@"union") {
+        var parts: std.ArrayList(*const Type) = .empty;
+        for (object.@"union") |o| {
+            try parts.append(arena, try indexedAccess(arena, o, index, mapper) orelse return null);
+        }
+        return try unionOf(arena, parts.items);
+    }
+    switch (object.*) {
+        .array, .readonly_array => |e| if (isNumberLike(index)) return e,
+        .tuple => |es| {
+            if (index.* == .number) {
+                return try unionOf(arena, es);
+            }
+            if (index.* == .literal and index.literal.value == .number) {
+                const n = index.literal.value.number;
+                if (n >= 0 and n == @trunc(n) and n < @as(f64, @floatFromInt(es.len))) {
+                    return es[@intFromFloat(n)];
+                }
+                return null;
+            }
+        },
+        .object => |o| {
+            const name = try keyName(arena, index) orelse return null;
+            const p = o.find(name) orelse return null;
+            return p.type;
+        },
+        else => {},
+    }
+    if (std.mem.eql(u8, (try keyName(arena, index)) orelse "", "length")) {
+        switch (object.*) {
+            .array, .readonly_array => return number,
+            .tuple => |es| return try literal(arena, .{ .number = @floatFromInt(es.len) }),
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// A mapped type as an object type, once its keys are known; until then it stays deferred.
+pub fn resolveMapped(arena: std.mem.Allocator, m: *const Mapped, mapper: *const Mapper) Error!*const Type {
+    const deferred = try asPtr(.{ .mapped = m }, arena);
+    if (isGeneric(m.constraint)) {
+        return deferred;
+    }
+    if (m.source) |source| {
+        // A homomorphic mapped type of an array is an array, and of a primitive the primitive.
+        switch (source.*) {
+            .array, .readonly_array => {
+                var element = try instantiate(arena, m.template, &mapper.with(&.{m.parameter}, &.{number}));
+                if (m.optional == .add) {
+                    element = try unionOf(arena, &.{ element, @"undefined" });
+                }
+                const readonly = m.readonly == .add or (source.* == .readonly_array and m.readonly != .remove);
+                return asPtr(if (readonly) .{ .readonly_array = element } else .{ .array = element }, arena);
+            },
+            .tuple => return deferred,
+            .object => {},
+            .any => return any,
+            else => return source,
+        }
+    }
+    var properties: std.ArrayList(Property) = .empty;
+    var buffer: [1]*const Type = undefined;
+    for (m.constraint.members(&buffer)) |key| {
+        const name = try keyName(arena, key) orelse return deferred;
+        var t = try instantiate(arena, m.template, &mapper.with(&.{m.parameter}, &.{key}));
+        var optional = false;
+        var readonly = false;
+        var method = false;
+        if (m.source) |source| {
+            if (source.object.find(name)) |p| {
+                optional = p.optional;
+                readonly = p.readonly;
+                method = p.method and m.optional == .none and m.readonly == .none;
+            }
+        }
+        if (m.optional == .remove and optional) {
+            t = try removeUndefined(arena, t);
+        }
+        optional = switch (m.optional) {
+            .add => true,
+            .remove => false,
+            .none => optional,
+        };
+        readonly = switch (m.readonly) {
+            .add => true,
+            .remove => false,
+            .none => readonly,
+        };
+        if (optional) {
+            t = try unionOf(arena, &.{ t, @"undefined" });
+        }
+        try properties.append(arena, .{ .name = name, .type = t, .optional = optional, .readonly = readonly, .method = method });
+    }
+    const object = try arena.create(Object);
+    object.* = .{ .properties = properties.items };
+    return asPtr(.{ .object = object }, arena);
+}
+
+fn removeUndefined(arena: std.mem.Allocator, t: *const Type) Error!*const Type {
+    var kept: std.ArrayList(*const Type) = .empty;
+    var buffer: [1]*const Type = undefined;
+    for (t.members(&buffer)) |m| {
+        if (m.* != .undefined) {
+            try kept.append(arena, m);
+        }
+    }
+    return unionOf(arena, kept.items);
 }
 
 const testing = std.testing;
@@ -1043,4 +1712,58 @@ test "format" {
     const t = try unionOf(a, &.{ try literal(a, .{ .string = "x" }), try literal(a, .{ .number = 1.5 }), @"true", @"false" });
     try testing.expectFmt("boolean | \"x\" | 1.5", "{f}", .{t});
     try testing.expectFmt("string | number | null | undefined", "{f}", .{try unionOf(a, &.{ @"undefined", @"null", number, string })});
+}
+
+fn noNamed(_: *anyopaque, _: *const Object, _: []const *const Type) Error!*const Type {
+    unreachable;
+}
+
+test "instantiate" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var t_param: Param = .{ .name = "T" };
+    const t: Type = .{ .param = &t_param };
+    var context: u8 = 0;
+    const mapper: Mapper = .{ .from = &.{&t}, .to = &.{number}, .named = noNamed, .context = &context };
+    const list = try asPtr(.{ .array = try unionOf(a, &.{ &t, @"null" }) }, a);
+    try testing.expectFmt("(T | null)[]", "{f}", .{list});
+    try testing.expectFmt("(number | null)[]", "{f}", .{try instantiate(a, list, &mapper)});
+    // `keyof T` and `T["x"]` are deferred until `T` is known.
+    const object = try asPtr(.{ .object = &.{ .properties = &.{ .{ .name = "x", .type = string }, .{ .name = "0", .type = number } } } }, a);
+    const keys = (try keyOf(a, &t)).?;
+    try testing.expectFmt("keyof T", "{f}", .{keys});
+    try testing.expectFmt("\"x\" | 0", "{f}", .{try instantiate(a, keys, &mapper.with(&.{&t}, &.{object}))});
+    const x = try literal(a, .{ .string = "x" });
+    const indexed = (try indexedAccess(a, &t, x, &mapper)).?;
+    try testing.expectFmt("T[\"x\"]", "{f}", .{indexed});
+    try testing.expectFmt("string", "{f}", .{try instantiate(a, indexed, &mapper.with(&.{&t}, &.{object}))});
+}
+
+test "type parameters" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var t_param: Param = .{ .name = "T" };
+    const t: Type = .{ .param = &t_param };
+    var n_param: Param = .{ .name = "N", .constraint = number };
+    const n: Type = .{ .param = &n_param };
+    // An unconstrained type parameter is only assignable to itself and the top types.
+    try testing.expect(assignable(&t, &t));
+    try testing.expect(assignable(&t, try unionOf(a, &.{ &t, @"undefined" })));
+    try testing.expect(assignable(&t, unknown));
+    try testing.expect(!assignable(&t, number));
+    try testing.expect(!assignable(number, &t));
+    // A constrained one is assignable to what its constraint is.
+    try testing.expect(assignable(&n, number));
+    try testing.expect(!assignable(&n, string));
+    try testing.expect(!assignable(&n, &t));
+}
+
+test "readonly arrays" {
+    const ro: Type = .{ .readonly_array = number };
+    const rw: Type = .{ .array = number };
+    try testing.expect(assignable(&rw, &ro));
+    try testing.expect(!assignable(&ro, &rw));
+    try testing.expectFmt("readonly number[]", "{f}", .{&ro});
 }

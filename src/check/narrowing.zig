@@ -73,7 +73,7 @@ fn canBeFalsy(t: *const Type) bool {
     return switch (t.*) {
         .literal => isFalsyLiteral(t),
         .object => types.isEmptyObject(t),
-        .function, .array, .tuple, .never => false,
+        .function, .array, .readonly_array, .tuple, .never => false,
         else => true,
     };
 }
@@ -136,7 +136,9 @@ fn equality(arena: std.mem.Allocator, t: *const Type, value_type: *const Type, l
         if (!loose and (t.* == .unknown or has_empty)) {
             switch (value.*) {
                 .void, .undefined, .null, .boolean, .number, .string, .bigint, .literal => return value,
-                .object, .function, .array, .tuple => return if (types.isEmptyObject(value)) value else null,
+                .object, .function, .array, .tuple, .readonly_array => return if (types.isEmptyObject(value)) value else null,
+                // That'd be an intersection with the type parameter.
+                .param, .keyof, .indexed, .mapped => return null,
                 // A union, `any`, `unknown` or `never` says nothing tsc keeps: what can be
                 // compared with it stays.
                 .@"union", .any, .unknown, .never => if (t.* == .unknown) return t,
@@ -214,10 +216,10 @@ fn typeofName(t: *const Type) ?[]const u8 {
             .boolean => "boolean",
         },
         .undefined, .void => "undefined",
-        .null, .array, .tuple => "object",
+        .null, .array, .tuple, .readonly_array, .mapped => "object",
         .object => if (types.isEmptyObject(t)) null else "object",
         .function => "function",
-        .any, .unknown, .never, .@"union" => null,
+        .any, .unknown, .never, .@"union", .param, .keyof, .indexed => null,
     };
 }
 
@@ -264,6 +266,8 @@ fn typeOf(arena: std.mem.Allocator, t: *const Type, name: []const u8, assume: bo
         }
         switch (m.*) {
             .never => {},
+            // That'd be an intersection, like `T & string`.
+            .param, .keyof, .indexed => return null,
             // `any`, `unknown` and `{}` become the type the name implies; tsc's `object` and
             // `Function` aren't there yet.
             else => {
@@ -306,7 +310,7 @@ fn inKeyword(arena: std.mem.Allocator, t: *const Type, name: []const u8, assume:
 fn presencePossible(t: *const Type, name: []const u8, assume: bool) bool {
     const optional: ?bool = switch (t.*) {
         .object => |o| if (o.find(name)) |p| p.optional else null,
-        .array, .tuple, .function => if (std.mem.eql(u8, name, "length")) false else null,
+        .array, .readonly_array, .tuple, .function => if (std.mem.eql(u8, name, "length")) false else null,
         else => return true,
     };
     if (optional) |o| {

@@ -107,6 +107,9 @@ pub fn compile(this: *Runtime, path: []const u8, text: []const u8) Error!Program
     if (this.diagnostics.items().len > 0) {
         return error.CompileError;
     }
+    if (this.session.library == null) {
+        try this.declareLibrary();
+    }
     const resolved = try Checker.check(arena, source, &this.diagnostics, &this.session, program);
     if (this.diagnostics.items().len > 0) {
         // Like tsc, in source order; functions can be checked out of order.
@@ -114,6 +117,18 @@ pub fn compile(this: *Runtime, path: []const u8, text: []const u8) Error!Program
         return error.CompileError;
     }
     return .{ .ast = program, .resolved = resolved, .text = source.text };
+}
+
+/// Declares what `lib.d.ts` does, for every program after.
+fn declareLibrary(this: *Runtime) Error!void {
+    const arena = this.arena.allocator();
+    const source = try arena.create(Source);
+    source.* = try .init(arena, "lib.d.ts", @embedFile("lib/lib.d.ts"));
+    var diagnostics: diagnostic.Diagnostics = .init(this.gpa);
+    defer diagnostics.deinit();
+    const program = try Parser.parse(this.gpa, arena, source, &diagnostics);
+    std.debug.assert(diagnostics.items().len == 0);
+    try Checker.declareLibrary(arena, &this.session, program);
 }
 
 /// Writes `value` the way node's REPL shows it.
