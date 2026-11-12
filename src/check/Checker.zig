@@ -29,6 +29,7 @@ const diagnostic = @import("../diagnostic.zig");
 const ast = @import("../syntax/ast.zig");
 const types = @import("types.zig");
 const narrowing = @import("narrowing.zig");
+const inference = @import("inference.zig");
 const Type = types.Type;
 const Expr = ast.Expr;
 const Stmt = ast.Stmt;
@@ -91,10 +92,33 @@ added_types: std.ArrayList([]const u8) = .empty,
 /// reported at the end, since it's only resolved once, however many times the code around it is
 /// checked (or checked without reporting).
 declaring: u32 = 0,
+/// The type declarations being resolved, innermost last.
+resolving_decls: std.ArrayList(*TypeDecl) = .empty,
+/// Type arguments to check against their constraints (TS2344) once the declarations being resolved
+/// are, since they can be what's being resolved: `interface Card extends Ordered<Card>`.
+constraint_checks: std.ArrayList(ConstraintCheck) = .empty,
+/// How many of the type annotations being resolved are deferred: tsc resolves what's in them
+/// lazily, so a type alias can refer to itself in one (`type T = { next: T }`). Only a type alias
+/// that's another one, or a type argument of one, isn't.
+deferred: u32 = 0,
 late: std.ArrayList(Late) = .empty,
 /// Inside the operand of `as const`, where literals keep their types and properties are
 /// `readonly`.
 const_context: bool = false,
+/// The generic call whose arguments are being inferred from, while one of them is checked.
+argument_of: ?ArgumentOf = null,
+
+const ConstraintCheck = struct {
+    at: u32,
+    argument: *const Type,
+    constraint: *const Type,
+};
+
+const ArgumentOf = struct {
+    inferences: *inference.Context,
+    from_return: *inference.Context,
+    returns: *const Type,
+};
 
 const Late = struct {
     at: u32,
@@ -160,9 +184,27 @@ pub const Session = struct {
     flow: []VarFlow = &.{},
     /// Top-level interfaces and type aliases.
     types: std.StringHashMapUnmanaged(*TypeDecl) = .empty,
+    /// The scope of `lib.d.ts`'s declarations, which every program sees behind its own.
+    library: ?*Scope = null,
 };
 
-/// An interface or type alias.
+/// Declares the types in `lib.d.ts`, which has nothing but interfaces and type aliases.
+pub fn declareLibrary(arena: std.mem.Allocator, session: *Session, program: ast.Program) Error!void {
+    const scope = try arena.create(Scope);
+    scope.* = .{ .parent = null, .kind = .block, .function = null };
+    for (program.statements) |stmt| {
+        const decl = try arena.create(TypeDecl);
+        decl.* = switch (stmt.data) {
+            .interface => |i| .{ .name = i.name, .start = i.start, .node = .{ .interface = i }, .scope = scope },
+            .type_alias => |a| .{ .name = a.name, .start = a.start, .node = .{ .alias = a }, .scope = scope },
+            else => unreachable,
+        };
+        try scope.types.put(arena, decl.name, decl);
+    }
+    session.library = scope;
+}
+
+/// An interface, a type alias, or a type parameter.
 const TypeDecl = struct {
     name: []const u8,
     start: u32,
@@ -171,12 +213,39 @@ const TypeDecl = struct {
     scope: ?*Scope,
     resolved: ?*const Type = null,
     resolving: bool = false,
+    /// `Checker.deferred` when it began to be resolved.
+    deferred_at: u32 = 0,
+    /// Whether it's a type alias that circularly references itself (TS2456).
+    circular: bool = false,
     redeclared: bool = false,
+    /// A generic one's type parameters, once it's resolved.
+    parameters: []const *const Type = &.{},
+    /// A generic one's instantiations so far, so each is made once: an interface's has to be,
+    /// since it's only equal to itself.
+    instances: std.ArrayList(Instance) = .empty,
+    /// Instantiations of an interface (or object type alias) made while it was still being
+    /// resolved, whose properties are filled in once it is.
+    waiting: std.ArrayList(*types.Object) = .empty,
 
     const Node = union(enum) {
         interface: *const ast.Interface,
         alias: *const ast.TypeAlias,
+        /// A type parameter, which is its own type.
+        param,
     };
+
+    const Instance = struct {
+        arguments: []const *const Type,
+        type: *const Type,
+    };
+
+    fn typeParameters(this: *const TypeDecl) []const ast.GenericParameter {
+        return switch (this.node) {
+            .interface => |i| i.type_parameters,
+            .alias => |a| a.type_parameters,
+            .param => &.{},
+        };
+    }
 };
 
 const Variable = struct {
@@ -730,7 +799,144 @@ fn lookupType(this: *Checker, name: []const u8) ?*TypeDecl {
             return decl;
         }
     }
-    return this.session.types.get(name);
+    if (this.session.types.get(name)) |decl| {
+        return decl;
+    }
+    const library = this.session.library orelse return null;
+    return library.types.get(name);
+}
+
+/// Declares type parameters in the current scope, and resolves their constraints and defaults.
+fn declareTypeParameters(this: *Checker, list: []const ast.GenericParameter) Error![]const *const Type {
+    const result = try this.declareTypeParameterNames(list);
+    try this.constrainTypeParameters(list, result);
+    return result;
+}
+
+/// Declares type parameters in the current scope, without their constraints and defaults yet.
+fn declareTypeParameterNames(this: *Checker, list: []const ast.GenericParameter) Error![]const *const Type {
+    if (list.len == 0) {
+        return &.{};
+    }
+    const scope = this.scope.?;
+    const result = try this.arena.alloc(*const Type, list.len);
+    const params = try this.arena.alloc(types.Param, list.len);
+    for (list, params, result) |g, *p, *t| {
+        p.* = .{ .name = g.name };
+        t.* = try this.newType(.{ .param = p });
+        const decl = try this.arena.create(TypeDecl);
+        decl.* = .{ .name = g.name, .start = g.start, .node = .param, .scope = scope, .resolved = t.* };
+        const entry = try scope.types.getOrPut(this.arena, g.name);
+        if (entry.found_existing) {
+            try this.report(g.start, .ts(2300), "Duplicate identifier '{s}'.", .{g.name});
+        } else {
+            entry.value_ptr.* = decl;
+        }
+    }
+    return result;
+}
+
+/// Resolves the constraints and defaults of type parameters `declareTypeParameterNames` declared.
+fn constrainTypeParameters(this: *Checker, list: []const ast.GenericParameter, result: []const *const Type) Error!void {
+    var seen_default = false;
+    for (list, result) |g, t| {
+        const p: *types.Param = @constCast(t.param);
+        if (g.constraint) |c| {
+            p.constraint = try this.resolveType(c);
+            // `T extends T`, or `T extends U, U extends T`.
+            var next = p.constraint;
+            var steps: usize = 0;
+            while (next) |n| : (steps += 1) {
+                if (n == t or steps > list.len) {
+                    try this.report(c.start, .ts(2313), "Type parameter '{s}' has a circular constraint.", .{g.name});
+                    p.constraint = null;
+                    break;
+                }
+                next = if (n.* == .param) n.param.constraint else null;
+            }
+        }
+        if (g.default) |d| {
+            seen_default = true;
+            p.default = try this.resolveType(d);
+            if (p.constraint) |c| {
+                const constraint = try types.instantiate(this.arena, c, &this.mapper(result, result));
+                try this.checkConstraint(.{ .at = d.start, .argument = p.default.?, .constraint = constraint });
+            }
+        } else if (seen_default) {
+            try this.report(g.start, .ts(2706), "Required type parameters may not follow optional type parameters.", .{});
+        }
+    }
+}
+
+/// A mapper substituting `to` for `from`.
+fn mapper(this: *Checker, from: []const *const Type, to: []const *const Type) types.Mapper {
+    return .{ .from = from, .to = to, .named = instantiateNamed, .context = this };
+}
+
+fn instantiateNamed(context: *anyopaque, object: *const types.Object, arguments: []const *const Type) Error!*const Type {
+    const this: *Checker = @ptrCast(@alignCast(context));
+    const decl: *TypeDecl = @ptrCast(@alignCast(@constCast(object.generic.?)));
+    return this.instantiateDecl(decl, arguments);
+}
+
+fn instantiate(this: *Checker, t: *const Type, from: []const *const Type, to: []const *const Type) Error!*const Type {
+    return types.instantiate(this.arena, t, &this.mapper(from, to));
+}
+
+/// A generic interface or type alias with type arguments for its type parameters (all of them,
+/// defaults included).
+fn instantiateDecl(this: *Checker, decl: *TypeDecl, arguments: []const *const Type) Error!*const Type {
+    const generic = try this.resolveDecl(decl);
+    if (generic.* == .any) {
+        // Including one that refers to itself, which has been reported.
+        return generic;
+    }
+    const same = for (decl.parameters, arguments) |p, a| {
+        if (p != a) {
+            break false;
+        }
+    } else true;
+    if (same or decl.parameters.len != arguments.len) {
+        return generic;
+    }
+    for (decl.instances.items) |instance| {
+        const eql = for (instance.arguments, arguments) |x, y| {
+            if (!x.eql(y)) {
+                break false;
+            }
+        } else true;
+        if (eql) {
+            return instance.type;
+        }
+    }
+    if (generic.* == .object and generic.object.generic == @as(*const anyopaque, decl)) {
+        const object = try this.arena.create(types.Object);
+        object.* = .{ .name = generic.object.name, .properties = &.{}, .type_arguments = arguments, .generic = decl };
+        const t = try this.newType(.{ .object = object });
+        try decl.instances.append(this.arena, .{ .arguments = arguments, .type = t });
+        if (decl.resolving) {
+            try decl.waiting.append(this.arena, object);
+        } else {
+            object.properties = try this.instantiateProperties(generic.object.properties, decl.parameters, arguments);
+        }
+        return t;
+    }
+    if (decl.resolving) {
+        try this.unsupported(decl.start, "A generic type alias that refers to itself is not supported yet.", .{});
+        return types.any;
+    }
+    const t = try this.instantiate(generic, decl.parameters, arguments);
+    try decl.instances.append(this.arena, .{ .arguments = arguments, .type = t });
+    return t;
+}
+
+fn instantiateProperties(this: *Checker, properties: []const types.Property, from: []const *const Type, to: []const *const Type) Error![]const types.Property {
+    const list = try this.arena.alloc(types.Property, properties.len);
+    for (properties, list) |p, *x| {
+        x.* = p;
+        x.type = try this.instantiate(p.type, from, to);
+    }
+    return list;
 }
 
 /// The type an interface or type alias names, resolved the first time it's needed.
@@ -739,10 +945,16 @@ fn resolveDecl(this: *Checker, decl: *TypeDecl) Error!*const Type {
         return t;
     }
     if (decl.resolving) {
-        // Only an alias can get here: an interface has its type before its members are resolved.
+        // Only an alias can get here: an interface (or object type alias) has its type before its
+        // type parameters' constraints and its members are resolved.
         decl.resolved = types.any;
-        if (decl.node.alias.type.data == .reference) {
-            try this.report(decl.start, .ts(2456), "Type alias '{s}' circularly references itself.", .{decl.name});
+        if (decl.deferred_at == this.deferred) {
+            // Each alias it refers to on the way back to itself is circular too.
+            const index = std.mem.indexOfScalar(*TypeDecl, this.resolving_decls.items, decl).?;
+            for (this.resolving_decls.items[index..]) |d| {
+                d.circular = true;
+                try this.report(d.start, .ts(2456), "Type alias '{s}' circularly references itself.", .{d.name});
+            }
         } else {
             // tsc allows `type T = T[]`, which needs types that are resolved lazily.
             try this.unsupported(decl.start, "A type alias that refers to itself is not supported yet.", .{});
@@ -753,22 +965,79 @@ fn resolveDecl(this: *Checker, decl: *TypeDecl) Error!*const Type {
     this.scope = decl.scope;
     this.declaring += 1;
     decl.resolving = true;
+    decl.deferred_at = this.deferred;
+    try this.resolving_decls.append(this.arena, decl);
     defer {
         this.scope = saved_scope;
         this.declaring -= 1;
         decl.resolving = false;
+        _ = this.resolving_decls.pop();
     }
+    const type_parameters = decl.typeParameters();
+    if (type_parameters.len > 0) {
+        // A scope of their own, for the type parameters.
+        try this.pushScope(null, .block);
+        decl.parameters = try this.declareTypeParameterNames(type_parameters);
+    }
+    // An interface or object type alias exists before its constraints, so they can refer to it.
+    const object = try this.declObject(decl);
+    if (type_parameters.len > 0) {
+        this.deferred += 1;
+        defer this.deferred -= 1;
+        try this.constrainTypeParameters(type_parameters, decl.parameters);
+    }
+    const t = blk: {
+        // What's in an interface or object type is deferred.
+        const deferred = @intFromBool(object != null);
+        this.deferred += deferred;
+        defer this.deferred -= deferred;
+        break :blk try this.resolveDeclType(decl, object);
+    };
+    if (decl.circular) {
+        decl.resolved = types.any;
+    }
+    // Instantiations made while it was resolved can be filled in now.
+    if (t.* == .object and !decl.circular) {
+        for (decl.waiting.items) |instance| {
+            instance.properties = try this.instantiateProperties(t.object.properties, decl.parameters, instance.type_arguments);
+        }
+    }
+    decl.waiting.clearRetainingCapacity();
+    if (this.resolving_decls.items.len == 1) {
+        // The outermost declaration being resolved: what it needed is complete now.
+        for (this.constraint_checks.items) |c| {
+            try this.reportConstraint(c);
+        }
+        this.constraint_checks.clearRetainingCapacity();
+    }
+    return decl.resolved.?;
+}
+
+/// The object type an interface or object type alias is, without its members yet, so they (and
+/// its type parameters' constraints) can refer to it. Null for other declarations.
+fn declObject(this: *Checker, decl: *TypeDecl) Error!?*types.Object {
+    const name = switch (decl.node) {
+        .param => unreachable,
+        .interface => |i| i.name,
+        .alias => |a| if (a.type.data == .object) a.name else return null,
+    };
+    // tsc shows an object type alias by the alias's name.
+    const generic: ?*const anyopaque = if (decl.parameters.len > 0) decl else null;
+    const object = try this.arena.create(types.Object);
+    object.* = .{ .name = name, .properties = &.{}, .type_arguments = decl.parameters, .generic = generic };
+    decl.resolved = try this.newType(.{ .object = object });
+    return object;
+}
+
+fn resolveDeclType(this: *Checker, decl: *TypeDecl, object: ?*types.Object) Error!*const Type {
     switch (decl.node) {
+        .param => unreachable,
         .interface => |i| {
-            // The type exists before its members, so they can refer to it.
-            const object = try this.arena.create(types.Object);
-            object.* = .{ .name = i.name, .properties = &.{} };
-            const t = try this.newType(.{ .object = object });
-            decl.resolved = t;
+            const t = decl.resolved.?;
             var properties: std.ArrayList(types.Property) = .empty;
             var bases: std.ArrayList(*const types.Object) = .empty;
             for (i.extends) |base| {
-                const bt = try this.resolveReference(base.start, base.name);
+                const bt = try this.resolveReference(base.start, base);
                 if (bt.* != .object) {
                     if (bt.* != .any) {
                         try this.report(base.start, .ts(2312), "An interface can only extend an object type or intersection of object types with statically known members.", .{});
@@ -789,18 +1058,13 @@ fn resolveDecl(this: *Checker, decl: *TypeDecl) Error!*const Type {
                 }
                 try putProperty(this.arena, &properties, p);
             }
-            object.properties = properties.items;
+            object.?.properties = properties.items;
             return t;
         },
         .alias => |a| {
-            if (a.type.data == .object) {
-                // Like an interface, so it can refer to itself. tsc shows it by the alias's name.
-                const object = try this.arena.create(types.Object);
-                object.* = .{ .name = a.name, .properties = &.{} };
-                const t = try this.newType(.{ .object = object });
-                decl.resolved = t;
-                object.properties = try this.members(a.type.data.object);
-                return t;
+            if (object) |o| {
+                o.properties = try this.members(a.type.data.object);
+                return decl.resolved.?;
             }
             const t = try this.resolveType(a.type);
             if (decl.resolved == null) {
@@ -869,22 +1133,64 @@ fn members(this: *Checker, list: []const ast.TypeMember) Error![]const types.Pro
 
 /// Names of types the standard library has, which aren't supported yet.
 const library_types = std.StaticStringMap(void).initComptime(.{
-    .{"Array"},       .{"ReadonlyArray"}, .{"Record"},      .{"Partial"},      .{"Required"},         .{"Readonly"},
-    .{"Pick"},        .{"Omit"},          .{"Exclude"},     .{"Extract"},      .{"NonNullable"},      .{"ReturnType"},
-    .{"Parameters"},  .{"InstanceType"},  .{"Awaited"},     .{"Number"},       .{"String"},           .{"Boolean"},
-    .{"Object"},      .{"Function"},      .{"Symbol"},      .{"BigInt"},       .{"Map"},              .{"Set"},
-    .{"WeakMap"},     .{"WeakSet"},       .{"Error"},       .{"TypeError"},    .{"RangeError"},       .{"ReferenceError"},
-    .{"SyntaxError"}, .{"Promise"},       .{"PromiseLike"}, .{"Date"},         .{"RegExp"},           .{"Math"},
-    .{"JSON"},        .{"Console"},       .{"Iterable"},    .{"Iterator"},     .{"IterableIterator"}, .{"ArrayLike"},
-    .{"PropertyKey"}, .{"Uppercase"},     .{"Lowercase"},   .{"Capitalize"},   .{"Uncapitalize"},     .{"ThisType"},
-    .{"NoInfer"},     .{"IArguments"},    .{"Generator"},   .{"ArrayBuffer"},  .{"object"},           .{"symbol"},
-    .{"bigint"},      .{"Int8Array"},     .{"Uint8Array"},  .{"Float64Array"}, .{"DataView"},         .{"TemplateStringsArray"},
+    .{"Omit"},         .{"Exclude"},      .{"Extract"},              .{"NonNullable"},      .{"ReturnType"},
+    .{"Parameters"},   .{"InstanceType"}, .{"Awaited"},              .{"Number"},           .{"String"},
+    .{"Boolean"},      .{"Object"},       .{"Function"},             .{"Symbol"},           .{"BigInt"},
+    .{"Map"},          .{"Set"},          .{"WeakMap"},              .{"WeakSet"},          .{"Error"},
+    .{"TypeError"},    .{"RangeError"},   .{"ReferenceError"},       .{"SyntaxError"},      .{"Promise"},
+    .{"PromiseLike"},  .{"Date"},         .{"RegExp"},               .{"Math"},             .{"JSON"},
+    .{"Console"},      .{"Iterable"},     .{"Iterator"},             .{"IterableIterator"}, .{"ArrayLike"},
+    .{"PropertyKey"},  .{"Uppercase"},    .{"Lowercase"},            .{"Capitalize"},       .{"Uncapitalize"},
+    .{"ThisType"},     .{"NoInfer"},      .{"IArguments"},           .{"Generator"},        .{"ArrayBuffer"},
+    .{"object"},       .{"symbol"},       .{"bigint"},               .{"Int8Array"},        .{"Uint8Array"},
+    .{"Float64Array"}, .{"DataView"},     .{"TemplateStringsArray"},
 });
 
-/// A type name in an annotation.
-fn resolveReference(this: *Checker, at: u32, name: []const u8) Error!*const Type {
-    if (this.lookupType(name)) |decl| {
-        return this.resolveDecl(decl);
+/// A type name in an annotation, with its type arguments.
+fn resolveReference(this: *Checker, at: u32, reference: ast.TypeReference) Error!*const Type {
+    const name = reference.name;
+    const found = this.lookupType(name);
+    const arguments = try this.arena.alloc(*const Type, reference.arguments.len);
+    {
+        // A type alias's type arguments are resolved with it, anything else's lazily.
+        const deferred = @intFromBool(found == null or found.?.node != .alias);
+        this.deferred += deferred;
+        defer this.deferred -= deferred;
+        for (reference.arguments, arguments) |node, *t| {
+            t.* = try this.resolveType(node);
+        }
+    }
+    if (found) |decl| {
+        const t = try this.resolveDecl(decl);
+        if (decl.circular) {
+            if (arguments.len > 0) {
+                // tsc gives a circular alias an error type, which isn't generic.
+                try this.report(at, .ts(2315), "Type '{s}' is not generic.", .{name});
+            }
+            return types.any;
+        }
+        const parameters = decl.typeParameters();
+        if (parameters.len == 0) {
+            if (arguments.len > 0) {
+                try this.report(at, .ts(2315), "Type '{s}' is not generic.", .{name});
+            }
+            return t;
+        }
+        const filled = try this.typeArguments(at, decl.name, decl.parameters, arguments, reference.arguments) orelse return types.any;
+        const instance = try this.instantiateDecl(decl, filled);
+        if (instance.* == .mapped and !types.isGeneric(instance.mapped.constraint)) {
+            // `Record<string, T>` is an index signature.
+            try this.unsupported(at, "Mapping over the keys '{f}' is not supported yet.", .{instance.mapped.constraint});
+            return types.any;
+        }
+        return instance;
+    }
+    if (std.mem.eql(u8, name, "Array") or std.mem.eql(u8, name, "ReadonlyArray")) {
+        if (arguments.len != 1) {
+            try this.report(at, .ts(2314), "Generic type '{s}<T>' requires 1 type argument(s).", .{name});
+            return types.any;
+        }
+        return this.newType(if (name[0] == 'A') .{ .array = arguments[0] } else .{ .readonly_array = arguments[0] });
     }
     if (library_types.has(name)) {
         try this.unsupported(at, "The type '{s}' is not supported yet.", .{name});
@@ -894,6 +1200,56 @@ fn resolveReference(this: *Checker, at: u32, name: []const u8) Error!*const Type
         try this.report(at, .ts(2304), "Cannot find name '{s}'.", .{name});
     }
     return types.any;
+}
+
+/// The type arguments `arguments` give `parameters`, with defaults for the ones left out, after
+/// checking there are as many as there should be (TS2314) and that they satisfy their
+/// constraints (TS2344). Null if there aren't.
+fn typeArguments(this: *Checker, at: u32, name: []const u8, parameters: []const *const Type, arguments: []const *const Type, nodes: []const *const ast.TypeNode) Error!?[]const *const Type {
+    var required: usize = 0;
+    for (parameters, 0..) |p, i| {
+        if (p.param.default == null) {
+            required = i + 1;
+        }
+    }
+    if (arguments.len < required or arguments.len > parameters.len) {
+        var list: std.Io.Writer.Allocating = .init(this.arena);
+        for (parameters, 0..) |p, i| {
+            list.writer.print("{s}{s}", .{ if (i > 0) ", " else "", p.param.name }) catch return error.OutOfMemory;
+        }
+        if (required == parameters.len) {
+            try this.report(at, .ts(2314), "Generic type '{s}<{s}>' requires {d} type argument(s).", .{ name, list.written(), required });
+        } else {
+            try this.report(at, .ts(2707), "Generic type '{s}<{s}>' requires between {d} and {d} type arguments.", .{ name, list.written(), required, parameters.len });
+        }
+        return null;
+    }
+    const filled = try this.arena.alloc(*const Type, parameters.len);
+    @memcpy(filled[0..arguments.len], arguments);
+    for (filled[arguments.len..], arguments.len..) |*t, i| {
+        t.* = try this.instantiate(parameters[i].param.default.?, parameters[0..i], filled[0..i]);
+    }
+    for (parameters, filled, 0..) |p, t, i| {
+        const c = p.param.constraint orelse continue;
+        const constraint = try this.instantiate(c, parameters, filled);
+        try this.checkConstraint(.{ .at = if (i < nodes.len) nodes[i].start else at, .argument = t, .constraint = constraint });
+    }
+    return filled;
+}
+
+/// Reports a type argument that doesn't satisfy its constraint, once the declarations being
+/// resolved are.
+fn checkConstraint(this: *Checker, c: ConstraintCheck) Error!void {
+    if (this.resolving_decls.items.len > 0) {
+        return this.constraint_checks.append(this.arena, c);
+    }
+    try this.reportConstraint(c);
+}
+
+fn reportConstraint(this: *Checker, c: ConstraintCheck) Error!void {
+    if (!types.assignable(c.argument, c.constraint)) {
+        try this.report(c.at, .ts(2344), "Type '{f}' does not satisfy the constraint '{f}'.", .{ c.argument, c.constraint });
+    }
 }
 
 fn newType(this: *Checker, t: Type) Error!*const Type {
@@ -1035,6 +1391,9 @@ fn circular(this: *Checker, slot: u32) Error!void {
 }
 
 fn resolveType(this: *Checker, node: *const ast.TypeNode) Error!*const Type {
+    const deferred = @intFromBool(node.data != .reference);
+    this.deferred += deferred;
+    defer this.deferred -= deferred;
     return switch (node.data) {
         .keyword => |keyword| switch (keyword) {
             .any => types.any,
@@ -1047,7 +1406,24 @@ fn resolveType(this: *Checker, node: *const ast.TypeNode) Error!*const Type {
             .number => types.number,
             .string => types.string,
         },
-        .reference => |name| this.resolveReference(node.start, name),
+        .reference => |r| this.resolveReference(node.start, r),
+        .keyof => |operand| blk: {
+            const t = try this.resolveType(operand);
+            break :blk try types.keyOf(this.arena, t) orelse {
+                try this.unsupported(node.start, "'keyof {f}' is not supported yet.", .{t});
+                break :blk types.string_or_number;
+            };
+        },
+        .readonly => |operand| blk: {
+            const t = try this.resolveType(operand);
+            break :blk switch (t.*) {
+                .array => |e| this.newType(.{ .readonly_array = e }),
+                else => t,
+            };
+        },
+        .indexed => |i| this.indexedType(i),
+        .query => |q| this.typeQuery(node.start, q),
+        .mapped => |m| this.mappedType(node.start, m),
         .literal => |l| types.literal(this.arena, switch (l) {
             .number => |n| .{ .number = n },
             .string => |str| .{ .string = str },
@@ -1074,13 +1450,20 @@ fn resolveType(this: *Checker, node: *const ast.TypeNode) Error!*const Type {
             break :blk this.newType(.{ .object = object });
         },
         .function => |f| blk: {
+            var type_parameters: []const *const Type = &.{};
+            const saved_scope = this.scope;
+            defer this.scope = saved_scope;
+            if (f.type_parameters.len > 0) {
+                try this.pushScope(null, .block);
+                type_parameters = try this.declareTypeParameters(f.type_parameters);
+            }
             var parameters: std.ArrayList(types.Parameter) = .empty;
             var rest: ?types.Parameter = null;
             for (f.parameters) |p| {
                 var t = types.any;
                 if (p.type) |annotation| {
                     t = try this.resolveType(annotation);
-                    if (p.rest and t.* != .array and t.* != .any) {
+                    if (p.rest and t.* != .array and t.* != .readonly_array and t.* != .any) {
                         try this.report(annotation.start, .ts(2370), "A rest parameter must be of an array type.", .{});
                     }
                 } else {
@@ -1099,12 +1482,115 @@ fn resolveType(this: *Checker, node: *const ast.TypeNode) Error!*const Type {
                 }
             }
             const function = try this.arena.create(types.Function);
-            function.* = .{ .parameters = parameters.items, .rest = rest, .returns = if (f.returns) |r| try this.resolveType(r) else types.any };
+            function.* = .{ .type_parameters = type_parameters, .parameters = parameters.items, .rest = rest, .returns = if (f.returns) |r| try this.resolveType(r) else types.any };
             const t = try this.arena.create(Type);
             t.* = .{ .function = function };
             break :blk t;
         },
     };
+}
+
+/// `T[K]`
+fn indexedType(this: *Checker, i: ast.TypeNode.Indexed) Error!*const Type {
+    const object = try this.resolveType(i.object);
+    const index = try this.resolveType(i.index);
+    if (object.* == .any or index.* == .any) {
+        return types.any;
+    }
+    if (types.isGeneric(object) or types.isGeneric(index)) {
+        // It has to be one of the keys `T` is known to have.
+        const keys = try types.keyOf(this.arena, object) orelse types.never;
+        if (!types.assignable(index, keys)) {
+            try this.report(i.index.start, .ts(2536), "Type '{f}' cannot be used to index type '{f}'.", .{ index, object });
+            return types.any;
+        }
+    }
+    return try types.indexedAccess(this.arena, object, index, &this.mapper(&.{}, &.{})) orelse {
+        if (try types.keyName(this.arena, index)) |name| {
+            if (index.literal.value == .string or object.* != .tuple) {
+                try this.report(i.index.start, .ts(2339), "Property '{s}' does not exist on type '{f}'.", .{ name, object });
+            } else {
+                try this.report(i.index.start, .ts(2493), "Tuple type '{f}' of length '{d}' has no element at index '{s}'.", .{ object, object.tuple.len, name });
+            }
+        } else {
+            try this.report(i.index.start, .ts(2536), "Type '{f}' cannot be used to index type '{f}'.", .{ index, object });
+        }
+        return types.any;
+    };
+}
+
+/// `typeof x` and `typeof x.y`: the type the variable has here.
+fn typeQuery(this: *Checker, at: u32, q: ast.TypeNode.Query) Error!*const Type {
+    var t: *const Type = undefined;
+    if (this.lookup(q.name)) |slot| {
+        t = try this.declaredType(slot);
+        if (this.flow.reachable and this.variable(slot).kind != .function) {
+            if (this.flow.vars[slot].type) |narrowed| {
+                t = narrowed;
+            }
+        }
+    } else if (global(q.name)) |g| {
+        t = g;
+    } else {
+        try this.report(at + @as(u32, "typeof ".len), .ts(2304), "Cannot find name '{s}'.", .{q.name});
+        return types.any;
+    }
+    for (q.path) |name| {
+        const object = try this.removeNullish(t);
+        t = if (try this.property(object, name, at)) |access| access.type else {
+            try this.report(at, .ts(2339), "Property '{s}' does not exist on type '{f}'.", .{ name, object });
+            return types.any;
+        };
+    }
+    return types.regular(this.arena, t);
+}
+
+/// `{ [P in K]: X }`
+fn mappedType(this: *Checker, at: u32, m: *const ast.TypeNode.Mapped) Error!*const Type {
+    // `[P in keyof T]` is homomorphic: it keeps the modifiers of `T`'s properties.
+    var source: ?*const Type = null;
+    var constraint: *const Type = undefined;
+    if (m.constraint.data == .keyof) {
+        const operand = try this.resolveType(m.constraint.data.keyof);
+        source = operand;
+        constraint = try types.keyOf(this.arena, operand) orelse {
+            try this.unsupported(m.constraint.start, "'keyof {f}' is not supported yet.", .{operand});
+            return types.any;
+        };
+    } else {
+        constraint = try this.resolveType(m.constraint);
+    }
+    if (constraint.* == .any) {
+        return types.any;
+    }
+    if (!types.isGeneric(constraint) and !types.assignable(constraint, types.string_or_number)) {
+        try this.report(m.constraint.start, .ts(2322), "Type '{f}' is not assignable to type 'string | number | symbol'.", .{constraint});
+        return types.any;
+    }
+    const saved_scope = this.scope;
+    defer this.scope = saved_scope;
+    try this.pushScope(null, .block);
+    const parameter = (try this.declareTypeParameters(&.{m.parameter}))[0];
+    @constCast(parameter.param).constraint = constraint;
+    const template = if (m.type) |node| try this.resolveType(node) else blk: {
+        try this.report(at, .ts(7008), "Member '[{s} in {f}]' implicitly has an 'any' type.", .{ m.parameter.name, constraint });
+        break :blk types.any;
+    };
+    const mapped = try this.arena.create(types.Mapped);
+    mapped.* = .{
+        .parameter = parameter,
+        .constraint = constraint,
+        .template = template,
+        .optional = @fromBackingInt(@intCast(@backingInt(m.optional))),
+        .readonly = @fromBackingInt(@intCast(@backingInt(m.readonly))),
+        .source = source,
+    };
+    const t = try types.resolveMapped(this.arena, mapped, &this.mapper(&.{}, &.{}));
+    if (t.* == .mapped and !types.isGeneric(constraint)) {
+        try this.unsupported(m.constraint.start, "Mapping over the keys '{f}' is not supported yet.", .{constraint});
+        return types.any;
+    }
+    return t;
 }
 
 /// tsc's `getAssignmentReducedType`: assigning to a variable whose type is a union narrows it to
@@ -1470,7 +1956,7 @@ fn checkIterable(this: *Checker, t: *const Type, at: u32, comptime what: []const
     var buffer: [1]*const Type = undefined;
     for (t.members(&buffer)) |m| {
         switch (m.*) {
-            .any, .never, .array, .tuple => {},
+            .any, .never, .array, .tuple, .readonly_array => {},
             else => {
                 if (types.isStringLike(m)) {
                     try this.unsupported(at, what ++ " is not supported yet.", .{});
@@ -1491,7 +1977,7 @@ fn elementOf(this: *Checker, t: *const Type, index: usize, at: u32, has_default:
     var buffer: [1]*const Type = undefined;
     for (t.members(&buffer)) |m| {
         try parts.append(this.arena, switch (m.*) {
-            .array => |e| e,
+            .array, .readonly_array => |e| e,
             .tuple => |es| if (index < es.len) es[index] else if (has_default) types.undefined else blk: {
                 try this.report(at, .ts(2493), "Tuple type '{f}' of length '{d}' has no element at index '{d}'.", .{ m, es.len, index });
                 break :blk types.undefined;
@@ -1506,6 +1992,7 @@ fn elementOf(this: *Checker, t: *const Type, index: usize, at: u32, has_default:
 fn arrayRest(this: *Checker, t: *const Type, from: usize) Error!*const Type {
     return switch (t.*) {
         .array => t,
+        .readonly_array => |e| this.newType(.{ .array = e }),
         .tuple => |es| this.newType(.{ .tuple = es[@min(from, es.len)..] }),
         else => types.any,
     };
@@ -1662,7 +2149,7 @@ fn iterationType(this: *Checker, expr: *const Expr, t: *const Type) Error!*const
     var buffer: [1]*const Type = undefined;
     for (iterable.members(&buffer)) |m| {
         switch (m.*) {
-            .array => |e| try parts.append(this.arena, e),
+            .array, .readonly_array => |e| try parts.append(this.arena, e),
             .tuple => |es| try parts.appendSlice(this.arena, es),
             else => try parts.append(this.arena, m),
         }
@@ -1683,7 +2170,7 @@ fn isObjectType(t: *const Type) bool {
     var buffer: [1]*const Type = undefined;
     for (t.members(&buffer)) |m| {
         switch (m.*) {
-            .any, .never, .object, .array, .tuple, .function => {},
+            .any, .never, .object, .array, .tuple, .readonly_array, .function => {},
             else => return false,
         }
     }
@@ -2444,6 +2931,7 @@ fn contextual(this: *Checker, expr: *const Expr, context: ?*const Type) Error!*c
         .conditional => |c| this.conditional(c, ctx),
         .object => |o| this.objectLiteral(o, ctx),
         .array => |a| this.arrayLiteral(expr.start, a, ctx),
+        .call => |c| this.callWith(expr, c, try this.calleeType(c), ctx),
         else => this.expression(expr),
     };
 }
@@ -2476,7 +2964,7 @@ fn chainLink(this: *Checker, expr: *const Expr) Error!Link {
             } else {
                 callee.type = try this.checkCallable(c.callee, callee.type);
             }
-            return .{ .type = try this.callWith(expr, c, callee.type), .short = callee.short };
+            return .{ .type = try this.callWith(expr, c, callee.type, null), .short = callee.short };
         },
         .non_null => |inner| {
             const link = try this.chainLink(inner);
@@ -2677,7 +3165,7 @@ fn arrayContext(context: ?*const Type) ArrayContext {
     var buffer: [1]*const Type = undefined;
     for (t.members(&buffer)) |m| {
         const this_one: ArrayContext = switch (m.*) {
-            .array => |e| .{ .element = e },
+            .array, .readonly_array => |e| .{ .element = e },
             .tuple => |es| .{ .tuple = es },
             .any, .unknown => .{ .element = m },
             .null, .undefined => continue,
@@ -2824,7 +3312,7 @@ fn arrayLiteral(this: *Checker, start: u32, a: ast.ArrayLiteral, context: ?*cons
                 var buffer: [1]*const Type = undefined;
                 for (t.members(&buffer)) |m| {
                     switch (m.*) {
-                        .array => |element| try parts.append(this.arena, element),
+                        .array, .readonly_array => |element| try parts.append(this.arena, element),
                         .tuple => |es| try parts.appendSlice(this.arena, es),
                         else => try parts.append(this.arena, m),
                     }
@@ -2843,7 +3331,8 @@ const Use = enum { assignment, argument };
 /// Checks that `expr`, of type `source`, can be used where a `target` is expected, reporting it
 /// if not. Like tsc, an object literal can't have properties the target doesn't know (TS2353),
 /// and a mismatch inside a literal is reported where it is.
-fn checkAssignable(this: *Checker, expr: *const Expr, source: *const Type, target: *const Type, at: u32, kind: Use) Error!void {
+fn checkAssignable(this: *Checker, expr: *const Expr, given: *const Type, target: *const Type, at: u32, kind: Use) Error!void {
+    const source = try this.instantiateInContext(given, target);
     if (try this.excessProperty(expr, target)) {
         return;
     }
@@ -2995,12 +3484,24 @@ const Access = struct {
 fn property(this: *Checker, object: *const Type, name: []const u8, at: u32) Error!?Access {
     switch (object.*) {
         .any => return .{ .type = types.any, .name = name, .named = false },
+        // A type parameter has the properties of its constraint.
+        .param, .keyof, .indexed => {
+            const base = types.baseConstraint(object);
+            if (base.* == .unknown or base == object) {
+                return null;
+            }
+            return this.property(base, name, at);
+        },
+        .mapped => {
+            try this.unsupported(at, "Properties of '{f}' are not supported yet.", .{object});
+            return .{ .type = types.any, .name = name, .named = false };
+        },
         // tsc reports reading a property of `never`, though indexing it is fine.
         .never => return null,
         .@"union" => |ms| {
             for (ms) |m| {
-                switch (m.*) {
-                    .object, .function, .array, .tuple => {},
+                switch (types.baseConstraint(m).*) {
+                    .object, .function, .array, .tuple, .readonly_array => {},
                     else => {
                         try this.unsupported(at, "Properties of '{f}' are not supported yet.", .{try types.widen(this.arena, object)});
                         return .{ .type = types.any, .name = name, .named = false };
@@ -3033,16 +3534,20 @@ fn property(this: *Checker, object: *const Type, name: []const u8, at: u32) Erro
             }
             return this.unsupportedProperty(name, at, object, &.{ "apply", "bind", "call", "toString", "prototype", "arguments", "caller" });
         },
-        .array, .tuple => {
+        .array, .tuple, .readonly_array => {
             if (std.mem.eql(u8, name, "length")) {
                 if (object.* == .tuple) {
                     return .{ .type = try types.literal(this.arena, .{ .number = @floatFromInt(object.tuple.len) }), .name = name };
+                }
+                if (object.* == .readonly_array) {
+                    return .{ .type = types.number, .name = name, .readonly = true };
                 }
                 return .{ .type = types.number, .name = name, .array_length = true };
             }
             if (arrayIndex(name)) |i| {
                 return switch (object.*) {
                     .array => |e| .{ .type = e, .name = name, .named = false },
+                    .readonly_array => |e| .{ .type = e, .name = name, .named = false, .readonly = true },
                     .tuple => |es| if (i < es.len) .{ .type = es[i], .name = name, .named = false } else null,
                     else => unreachable,
                 };
@@ -3107,6 +3612,21 @@ fn indexWith(this: *Checker, expr: *const Expr, i: ast.Index, object: *const Typ
     if (object.* == .any or object.* == .never) {
         return .{ .type = object, .named = false };
     }
+    if (types.isGeneric(object) or types.isGeneric(key)) {
+        // `o[k]` with `k: K extends keyof T` is a `T[K]`.
+        const keys = try types.keyOf(this.arena, object) orelse types.never;
+        if (types.assignable(key, keys)) {
+            const t = try types.indexedAccess(this.arena, object, key, &this.mapper(&.{}, &.{})) orelse types.any;
+            return .{ .type = t, .named = false };
+        }
+        const apparent_object = types.baseConstraint(object);
+        const apparent_key = types.baseConstraint(key);
+        if (apparent_object.* == .unknown or apparent_key.* == .unknown or (apparent_object == object and apparent_key == key)) {
+            try this.report(i.index.start, .ts(2536), "Type '{f}' cannot be used to index type '{f}'.", .{ key, object });
+            return null;
+        }
+        return this.indexWith(expr, i, apparent_object, apparent_key);
+    }
     // A literal key names a property.
     if (key.* == .literal and key.literal.value != .boolean) {
         const name = switch (key.literal.value) {
@@ -3129,8 +3649,11 @@ fn indexWith(this: *Checker, expr: *const Expr, i: ast.Index, object: *const Typ
         if (object.* == .array and key.literal.value == .number) {
             return .{ .type = object.array, .name = name, .named = false };
         }
+        if (object.* == .readonly_array and key.literal.value == .number) {
+            return .{ .type = object.readonly_array, .name = name, .named = false, .readonly = true };
+        }
         return try this.property(object, name, i.index.start) orelse {
-            if (object.* == .array or object.* == .tuple) {
+            if (object.* == .array or object.* == .tuple or object.* == .readonly_array) {
                 try this.report(i.index.start, .ts(7015), "Element implicitly has an 'any' type because index expression is not of type 'number'.", .{});
                 return null;
             }
@@ -3142,6 +3665,7 @@ fn indexWith(this: *Checker, expr: *const Expr, i: ast.Index, object: *const Typ
     if (k.* == .any) {
         return switch (object.*) {
             .array => |e| .{ .type = e, .named = false },
+            .readonly_array => |e| .{ .type = e, .named = false, .readonly = true },
             .tuple => |es| .{ .type = try types.unionOf(this.arena, es), .named = false },
             else => .{ .type = types.any, .named = false },
         };
@@ -3149,6 +3673,7 @@ fn indexWith(this: *Checker, expr: *const Expr, i: ast.Index, object: *const Typ
     if (types.isNumberLike(k)) {
         switch (object.*) {
             .array => |e| return .{ .type = e, .named = false },
+            .readonly_array => |e| return .{ .type = e, .named = false, .readonly = true },
             .tuple => |es| return .{ .type = try types.unionOf(this.arena, es), .named = false },
             else => {},
         }
@@ -3158,7 +3683,7 @@ fn indexWith(this: *Checker, expr: *const Expr, i: ast.Index, object: *const Typ
         return null;
     }
     switch (object.*) {
-        .array, .tuple => try this.report(i.index.start, .ts(7015), "Element implicitly has an 'any' type because index expression is not of type 'number'.", .{}),
+        .array, .tuple, .readonly_array => try this.report(i.index.start, .ts(7015), "Element implicitly has an 'any' type because index expression is not of type 'number'.", .{}),
         .object => try this.report(expr.start, .ts(7053), "Element implicitly has an 'any' type because expression of type '{f}' can't be used to index type '{f}'.\n  No index signature with a parameter of type '{f}' was found on type '{f}'.", .{ k, object, k, object }),
         else => {
             try this.unsupported(expr.start, "Indexing '{f}' is not supported yet.", .{try types.widen(this.arena, object)});
@@ -3184,6 +3709,10 @@ fn writableProperty(this: *Checker, target: *const Expr) Error!?*const Type {
     const access = try this.propertyAccess(target) orelse return null;
     if (access.readonly) {
         const at = if (target.data == .member) target.data.member.property_start else target.data.index.index.start;
+        if (!access.named) {
+            try this.report(target.start, .ts(2542), "Index signature in type '{f}' only permits reading.", .{try this.typeOf(if (target.data == .member) target.data.member.object else target.data.index.object)});
+            return null;
+        }
         try this.report(at, .ts(2540), "Cannot assign to '{s}' because it is a read-only property.", .{access.name});
         return null;
     }
@@ -3911,7 +4440,11 @@ const Operation = struct {
 
 /// The checks and result type of a binary operator, also used for compound assignments
 /// (`compound` adds the `=` to the operator in messages).
-fn operator(this: *Checker, op: ast.BinaryOp, left_expr: *const Expr, right_expr: *const Expr, left: *const Type, right: *const Type, compound: bool) Error!Operation {
+fn operator(this: *Checker, op: ast.BinaryOp, left_expr: *const Expr, right_expr: *const Expr, given_left: *const Type, given_right: *const Type, compound: bool) Error!Operation {
+    // Operators see a type parameter as its constraint: `x + 1` is fine for `x: T extends number`.
+    const equality = op == .equal or op == .not_equal or op == .strict_equal or op == .strict_not_equal or op == .comma;
+    const left = if (equality) given_left else try this.apparentType(given_left);
+    const right = if (equality) given_right else try this.apparentType(given_right);
     switch (op) {
         .comma => return .{ .type = right },
         .in => {
@@ -4003,6 +4536,20 @@ fn operator(this: *Checker, op: ast.BinaryOp, left_expr: *const Expr, right_expr
     }
 }
 
+/// `t` with its generic members replaced by their constraints, where they have one.
+fn apparentType(this: *Checker, t: *const Type) Error!*const Type {
+    if (!types.isGeneric(t)) {
+        return t;
+    }
+    var list: std.ArrayList(*const Type) = .empty;
+    var buffer: [1]*const Type = undefined;
+    for (t.members(&buffer)) |m| {
+        const base = types.baseConstraint(m);
+        try list.append(this.arena, if (base.* == .unknown) m else base);
+    }
+    return types.unionOf(this.arena, list.items);
+}
+
 fn operatorError(this: *Checker, op: ast.BinaryOp, compound: bool, left_expr: *const Expr, left: *const Type, right: *const Type) Error!void {
     try this.report(left_expr.start, .ts(2365), "Operator '{s}{s}' cannot be applied to types '{f}' and '{f}'.", .{
         op.lexeme(),
@@ -4065,7 +4612,7 @@ fn unsupportedProperty(this: *Checker, name: []const u8, at: u32, object: *const
 }
 
 fn call(this: *Checker, expr: *const Expr, c: ast.Call) Error!*const Type {
-    return this.callWith(expr, c, try this.calleeType(c));
+    return this.callWith(expr, c, try this.calleeType(c), null);
 }
 
 /// The type of what a call calls, which can't be `null` or `undefined`.
@@ -4115,10 +4662,17 @@ fn calleeExpression(this: *Checker, c: ast.Call) Error!*const Type {
     return this.expression(c.callee);
 }
 
-/// A call of something of type `callee`, which has been checked.
-fn callWith(this: *Checker, expr: *const Expr, c: ast.Call, callee_type: *const Type) Error!*const Type {
+/// A call of something of type `callee`, which has been checked. `context` is the type the call's
+/// surroundings expect it to return, which type arguments can be inferred from.
+fn callWith(this: *Checker, expr: *const Expr, c: ast.Call, callee_type: *const Type, context: ?*const Type) Error!*const Type {
     if (callee_type.* == .function) {
-        return this.callFunction(expr, c, callee_type.function);
+        return this.callFunction(expr, c, callee_type.function, context);
+    }
+    for (c.type_arguments) |node| {
+        _ = try this.resolveType(node);
+    }
+    if (c.type_arguments.len > 0 and callee_type.* != .any) {
+        try this.report(c.type_arguments[0].start, .ts(2558), "Expected 0 type arguments, but got {d}.", .{c.type_arguments.len});
     }
     for (c.arguments) |arg| {
         _ = try this.expression(arg);
@@ -4142,10 +4696,26 @@ fn callWith(this: *Checker, expr: *const Expr, c: ast.Call, callee_type: *const 
     }
 }
 
-fn callFunction(this: *Checker, expr: *const Expr, c: ast.Call, f: *const types.Function) Error!*const Type {
+fn callFunction(this: *Checker, expr: *const Expr, c: ast.Call, generic: *const types.Function, context: ?*const Type) Error!*const Type {
+    if (generic.pending and generic.type_parameters.len > 0) {
+        // tsc gives a call to a generic function whose return type is being worked out `never`,
+        // rather than reporting it (TS7023), so `return f(x)` adds nothing to it.
+        for (c.arguments) |arg| {
+            _ = try this.contextual(arg, null);
+        }
+        return types.never;
+    }
+    var f = generic;
     var args: std.ArrayList(*const Type) = .empty;
-    for (c.arguments, 0..) |arg, i| {
-        try args.append(this.arena, try this.contextual(arg, f.parameterType(i)));
+    if (c.type_arguments.len > 0) {
+        f = try this.explicitInstantiation(c, generic);
+    } else if (generic.type_parameters.len > 0) {
+        f = try this.inferCall(c, generic, context, &args);
+    }
+    if (args.items.len == 0) {
+        for (c.arguments, 0..) |arg, i| {
+            try args.append(this.arena, try this.contextual(arg, f.parameterType(i)));
+        }
     }
     if (f.pending) {
         // Its return type is what's being worked out.
@@ -4172,12 +4742,214 @@ fn callFunction(this: *Checker, expr: *const Expr, c: ast.Call, f: *const types.
         if (i < f.parameters.len and f.parameters[i].optional) {
             param = try types.unionOf(this.arena, &.{ param, types.undefined });
         }
-        if (try this.excessProperty(arg, param) or types.assignable(arg_type, param) or try this.elaborateLiteral(arg, arg_type, param)) {
+        const source = try this.instantiateInContext(arg_type, param);
+        if (try this.excessProperty(arg, param) or types.assignable(source, param) or try this.elaborateLiteral(arg, source, param)) {
             continue;
         }
-        try this.reportNotAssignable(arg, arg_type, f.parameterType(i).?, arg.start, .argument);
+        try this.reportNotAssignable(arg, source, f.parameterType(i).?, arg.start, .argument);
     }
     return f.returns;
+}
+
+/// `f` without type parameters, with `arguments` for them.
+fn instantiateSignature(this: *Checker, f: *const types.Function, arguments: []const *const Type) Error!*const types.Function {
+    const plain = try this.arena.create(types.Function);
+    plain.* = f.*;
+    plain.type_parameters = &.{};
+    const t = try this.instantiate(try this.newType(.{ .function = plain }), f.type_parameters, arguments);
+    return if (t.* == .function) t.function else plain;
+}
+
+/// `f<A, B>(...)`: the signature with the type arguments given.
+fn explicitInstantiation(this: *Checker, c: ast.Call, f: *const types.Function) Error!*const types.Function {
+    const arguments = try this.arena.alloc(*const Type, c.type_arguments.len);
+    for (c.type_arguments, arguments) |node, *t| {
+        t.* = try this.resolveType(node);
+    }
+    const parameters = f.type_parameters;
+    var required: usize = 0;
+    for (parameters, 0..) |p, i| {
+        if (p.param.default == null) {
+            required = i + 1;
+        }
+    }
+    if (arguments.len < required or arguments.len > parameters.len) {
+        const at = c.type_arguments[0].start;
+        if (required == parameters.len) {
+            try this.report(at, .ts(2558), "Expected {d} type arguments, but got {d}.", .{ required, arguments.len });
+        } else {
+            try this.report(at, .ts(2558), "Expected {d}-{d} type arguments, but got {d}.", .{ required, parameters.len, arguments.len });
+        }
+        const anys = try this.arena.alloc(*const Type, parameters.len);
+        @memset(anys, types.any);
+        return this.instantiateSignature(f, anys);
+    }
+    const filled = try this.typeArguments(c.type_arguments[0].start, "", parameters, arguments, c.type_arguments) orelse unreachable;
+    return this.instantiateSignature(f, filled);
+}
+
+/// Infers a generic function's type arguments from a call's arguments, the way tsc does: first
+/// from the arguments that don't need a contextual type, then from the ones that do (functions
+/// with untyped parameters), each typed by what's been inferred so far. The arguments' types are
+/// added to `args`, since checking them again would report their errors twice.
+fn inferCall(this: *Checker, c: ast.Call, f: *const types.Function, context: ?*const Type, args: *std.ArrayList(*const Type)) Error!*const types.Function {
+    var inferences = try inference.Context.init(this.arena, f.type_parameters, this.mapper(&.{}, &.{}));
+    // What the call's context expects it to return is a weaker source of inferences, only used
+    // for type parameters the arguments say nothing about.
+    var from_return = try inference.Context.init(this.arena, f.type_parameters, this.mapper(&.{}, &.{}));
+    if (context) |ctx| {
+        if (ctx.* != .any and ctx.* != .unknown) {
+            try from_return.infer(try this.outerInferred(ctx), f.returns);
+        }
+    }
+    const saved_argument_of = this.argument_of;
+    defer this.argument_of = saved_argument_of;
+    this.argument_of = .{ .inferences = &inferences, .from_return = &from_return, .returns = f.returns };
+    const arg_types = try this.arena.alloc(?*const Type, c.arguments.len);
+    @memset(arg_types, null);
+    for (c.arguments, arg_types, 0..) |arg, *t, i| {
+        const param = f.parameterType(i) orelse continue;
+        if (isContextSensitive(arg)) {
+            continue;
+        }
+        t.* = try this.contextual(arg, param);
+        try inferences.infer(t.*.?, param);
+    }
+    for (c.arguments, arg_types, 0..) |arg, *t, i| {
+        if (t.* != null) {
+            continue;
+        }
+        const param = f.parameterType(i) orelse {
+            t.* = try this.expression(arg);
+            continue;
+        };
+        try inferences.fix(param, f.returns, &from_return);
+        const so_far = try inferences.inferredTypes(f.returns, &from_return);
+        t.* = try this.contextual(arg, try this.instantiate(param, f.type_parameters, so_far));
+        try inferences.infer(t.*.?, param);
+    }
+    for (arg_types) |t| {
+        try args.append(this.arena, t.?);
+    }
+    return this.instantiateSignature(f, try inferences.inferredTypes(f.returns, &from_return));
+}
+
+/// What the context of an argument of a generic call expects, with that call's type parameters
+/// replaced by what's been inferred for them so far, so a generic call in the argument doesn't
+/// infer them as its own type arguments. Ones with nothing inferred yet give no inferences
+/// (tsc's return mapper).
+fn outerInferred(this: *Checker, context: *const Type) Error!*const Type {
+    const outer = this.argument_of orelse return context;
+    const inferred = try outer.inferences.inferredTypes(outer.returns, outer.from_return);
+    const from = try this.arena.alloc(*const Type, inferred.len);
+    const to = try this.arena.alloc(*const Type, inferred.len);
+    for (outer.inferences.inferences, from, to, inferred, 0..) |i, *x, *y, t, index| {
+        x.* = i.parameter;
+        const known = i.fixed != null or outer.inferences.hasCandidates(index) or outer.from_return.hasCandidates(index);
+        y.* = if (known) t else inference.no_inference;
+    }
+    return this.instantiate(context, from, to);
+}
+
+/// tsc's `isContextSensitive`: an expression whose type depends on the type its context
+/// expects, like a function with untyped parameters. Inference leaves those for last.
+fn isContextSensitive(expr: *const Expr) bool {
+    const e = ast.skipParens(expr);
+    return switch (e.data) {
+        .function => |f| blk: {
+            for (f.parameters) |p| {
+                if (p.type == null) {
+                    break :blk true;
+                }
+            }
+            break :blk f.type_parameters.len == 0 and f.body == .expression and f.parameters.len > 0 and isContextSensitive(f.body.expression);
+        },
+        .object => |o| for (o.properties) |p| {
+            if (p == .property and isContextSensitive(p.property.value)) {
+                break true;
+            }
+        } else false,
+        .array => |a| for (a.elements) |element| {
+            if (element == .expr and isContextSensitive(element.expr)) {
+                break true;
+            }
+        } else false,
+        .conditional => |c| isContextSensitive(c.then) or isContextSensitive(c.otherwise),
+        else => false,
+    };
+}
+
+/// A generic function used where a non-generic one is expected, as `id` is in
+/// `const f: (x: number) => number = id`, is instantiated for it: its type arguments are
+/// inferred from the expected parameters (tsc's `instantiateSignatureInContextOf`). So is one in
+/// a property or element, as in `const o: { f: (x: number) => number } = { f: id }`.
+fn instantiateInContext(this: *Checker, source: *const Type, target: *const Type) Error!*const Type {
+    switch (source.*) {
+        .function => |f| if (f.type_parameters.len == 0) {
+            return source;
+        },
+        .object => |o| {
+            if (target.* != .object) {
+                return source;
+            }
+            var properties: ?[]types.Property = null;
+            for (o.properties, 0..) |p, i| {
+                const expected = target.object.property(p.name) orelse continue;
+                const t = try this.instantiateInContext(p.type, expected);
+                if (t != p.type) {
+                    if (properties == null) {
+                        properties = try this.arena.dupe(types.Property, o.properties);
+                    }
+                    properties.?[i].type = t;
+                }
+            }
+            const object = try this.arena.create(types.Object);
+            object.* = .{ .properties = properties orelse return source };
+            return this.newType(.{ .object = object });
+        },
+        .array, .readonly_array => |e| {
+            const expected = types.arrayElement(target) orelse return source;
+            const t = try this.instantiateInContext(e, expected);
+            if (t == e) {
+                return source;
+            }
+            return this.newType(if (source.* == .array) .{ .array = t } else .{ .readonly_array = t });
+        },
+        .tuple => |es| {
+            var elements: ?[]*const Type = null;
+            for (es, 0..) |e, i| {
+                const expected = switch (target.*) {
+                    .tuple => |ts| if (i < ts.len) ts[i] else continue,
+                    .array, .readonly_array => |x| x,
+                    else => return source,
+                };
+                const t = try this.instantiateInContext(e, expected);
+                if (t != e) {
+                    if (elements == null) {
+                        elements = try this.arena.dupe(*const Type, es);
+                    }
+                    elements.?[i] = t;
+                }
+            }
+            return this.newType(.{ .tuple = elements orelse return source });
+        },
+        else => return source,
+    }
+    const t = contextualSignature(target) orelse return source;
+    if (t.type_parameters.len > 0) {
+        return source;
+    }
+    const s = source.function;
+    var inferences = try inference.Context.init(this.arena, s.type_parameters, this.mapper(&.{}, &.{}));
+    const count = @max(s.parameters.len, t.parameters.len) + @intFromBool(s.rest != null and t.rest != null);
+    for (0..count) |i| {
+        const sp = s.parameterType(i) orelse continue;
+        const tp = t.parameterType(i) orelse continue;
+        try inferences.infer(tp, sp);
+    }
+    var from_return = try inference.Context.init(this.arena, s.type_parameters, this.mapper(&.{}, &.{}));
+    try from_return.infer(t.returns, s.returns);
+    return this.newType(.{ .function = try this.instantiateSignature(s, try inferences.inferredTypes(s.returns, &from_return)) });
 }
 
 /// A function's return type was needed while it was being inferred: it and every function whose
@@ -4221,8 +4993,12 @@ fn checkFunction(this: *Checker, f: *const ast.Function, context_type: ?*const T
     const saved_parameter = this.parameter;
     const saved_lazy = this.lazy;
     const saved_const = this.const_context;
+    const saved_argument_of = this.argument_of;
+    // A call in its body isn't an argument of a call around it.
+    this.argument_of = null;
     this.const_context = false;
     defer {
+        this.argument_of = saved_argument_of;
         this.const_context = saved_const;
         this.flow = saved_flow;
         this.scope = saved_scope;
@@ -4246,6 +5022,10 @@ fn checkFunction(this: *Checker, f: *const ast.Function, context_type: ?*const T
         // tsc's `isAritySmaller`: a function that needs more arguments than its context passes
         // isn't typed by it.
         if (ctx.rest == null and requiredParameters(f) > ctx.parameters.len) {
+            context = null;
+        }
+        // A generic function isn't typed by a generic context.
+        if (f.type_parameters.len > 0 and ctx.type_parameters.len > 0) {
             context = null;
         }
     }
@@ -4300,6 +5080,19 @@ fn checkFunction(this: *Checker, f: *const ast.Function, context_type: ?*const T
     this.flow = .{ .reachable = true, .vars = vars };
     this.scope = parent_scope;
     try this.pushScope(f.scope, .parameters);
+    signature.type_parameters = try this.declareTypeParameters(f.type_parameters);
+    if (context) |c| {
+        // A function typed by a generic context, like `const f: <T>(x: T) => T = (x) => x`, is
+        // generic too.
+        const untyped = for (f.parameters) |p| {
+            if (p.type == null) {
+                break true;
+            }
+        } else false;
+        if (f.type_parameters.len == 0 and untyped) {
+            signature.type_parameters = c.type_parameters;
+        }
+    }
 
     if (f.kind == .expression) {
         if (f.name) |n| {
@@ -4337,7 +5130,7 @@ fn checkFunction(this: *Checker, f: *const ast.Function, context_type: ?*const T
         var t: *const Type = types.any;
         if (p.type) |annotation| {
             t = try this.resolveType(annotation);
-            if (p.rest and t.* != .array and t.* != .any) {
+            if (p.rest and t.* != .array and t.* != .readonly_array and t.* != .any) {
                 try this.report(annotation.start, .ts(2370), "A rest parameter must be of an array type.", .{});
                 t = types.any_array;
             }
@@ -4544,7 +5337,7 @@ fn refersTo(t: *const Type, target: *const Type) bool {
                 break true;
             }
         } else false,
-        .array => |e| refersTo(e, target),
+        .array, .readonly_array => |e| refersTo(e, target),
         .tuple => |es| for (es) |e| {
             if (refersTo(e, target)) {
                 break true;
@@ -4608,6 +5401,13 @@ fn reportNotAssignable(this: *Checker, expr: *const Expr, source: *const Type, t
             if (f.kind == .arrow and f.body == .expression and !annotated and mismatch != null and mismatch.? == .returns) {
                 return this.report(f.body.expression.start, .ts(2322), "Type '{f}' is not assignable to type '{f}'.", .{ try this.shownSource(source.function.returns, t.returns), t.returns });
             }
+        }
+    }
+    if (source.* == .readonly_array and target.* == .array and types.assignable(source.readonly_array, target.array)) {
+        const text = try std.fmt.allocPrint(this.arena, "The type '{f}' is 'readonly' and cannot be assigned to the mutable type '{f}'.", .{ source, target });
+        switch (kind) {
+            .assignment => return this.report(at, .ts(4104), "{s}", .{text}),
+            .argument => return this.report(at, .ts(2345), "Argument of type '{f}' is not assignable to parameter of type '{f}'.\n  {s}", .{ source, target, text }),
         }
     }
     // A missing property is the whole message for an assignment, and the elaboration for an
@@ -4855,7 +5655,7 @@ fn canBeFalsy(this: *Checker, t: *const Type) Error!bool {
     for (t.members(&buffer)) |m| {
         switch (m.*) {
             .literal => if (isFalsyLiteral(m)) return true,
-            .object, .function, .array, .tuple, .never => {},
+            .object, .function, .array, .tuple, .readonly_array, .never => {},
             else => return true,
         }
     }
