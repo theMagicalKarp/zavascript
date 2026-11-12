@@ -19,19 +19,23 @@ $ echo 'console.log("a" * 2)' | zavascript
 
 > [!NOTE]
 > zavascript is early. Today it runs `let` and `const`, every operator
-> including assignment, `in` and `delete`, `if`, the loops (including
-> `for...of` over arrays and `for...in`), `switch`, labeled
-> `break`/`continue`, functions (declarations, expressions and arrows, with
-> closures, default, optional and rest parameters, and recursion), object and
-> array literals (with shorthand, computed keys, methods and spread),
-> destructuring with defaults and rest in declarations and parameters, and
-> `console.log`, which prints nested values the way node does. The checker
-> covers primitive, array, tuple, object and function types, interfaces
-> (with `extends`) and type aliases, optional and `readonly` properties,
-> structural assignability with tsc's excess and missing property checks,
-> definite assignment, narrowing by assignment and truthiness, and contextual
-> typing. Unions, generics, classes and the builtins are coming. Anything not
-> supported yet is a compile error (`ZV9001`), never a silent misbehavior.
+> including assignment, `in`, `delete`, optional chaining and `??`, `if`, the
+> loops (including `for...of` over arrays and `for...in`), `switch`, labeled
+> `break`/`continue`, `throw`, functions (declarations, expressions and
+> arrows, with closures, default, optional and rest parameters, and
+> recursion), object and array literals (with shorthand, computed keys,
+> methods and spread), destructuring with defaults and rest in declarations
+> and parameters, and `console.log`, which prints nested values the way node
+> does. The checker covers primitive, literal, union, array, tuple, object and
+> function types, interfaces (with `extends`) and type aliases, optional and
+> `readonly` properties, structural assignability with tsc's excess and
+> missing property checks, definite assignment, contextual typing, `as`,
+> `as const`, `satisfies` and `!`, and tsc's narrowing: by assignment,
+> truthiness, `===`/`==`, `typeof`, `in`, discriminant properties, `switch`
+> and control flow (`return`, `throw` and calls of functions returning
+> `never`), for variables and their properties alike. Generics, classes and
+> the builtins are coming. Anything not supported yet is a compile error
+> (`ZV9001`), never a silent misbehavior.
 
 ## Usage
 

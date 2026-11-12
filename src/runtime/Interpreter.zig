@@ -54,15 +54,19 @@ pub const Error = error{
     RuntimeError,
 };
 
-/// A runtime error. There's no `throw` or `catch` yet, so these always end the program.
+/// A runtime error, or a value a `throw` statement threw. There's no `catch` yet, so these always
+/// end the program.
 pub const Exception = struct {
     name: Name,
+    /// For a thrown value, the value as `console.log` shows it.
     message: []const u8,
 
     pub const Name = enum {
         TypeError,
         ReferenceError,
         RangeError,
+        /// A value from a `throw` statement.
+        thrown,
         /// Something that works in JavaScript but isn't implemented yet. Not a JavaScript error,
         /// so it can never be caught.
         Unsupported,
@@ -71,6 +75,7 @@ pub const Exception = struct {
     pub fn format(this: Exception, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (this.name) {
             .Unsupported => try writer.print("error ZV9001: {s}", .{this.message}),
+            .thrown => try writer.print("Uncaught {s}", .{this.message}),
             else => try writer.print("Uncaught {t}: {s}", .{ this.name, this.message }),
         }
     }
@@ -388,6 +393,7 @@ fn statement(this: *Interpreter, stmt: *const Stmt, labels: []const []const u8) 
         // Created when its scope was entered.
         .function => return .{ .normal = null },
         .@"return" => |e| return .{ .@"return" = if (e) |v| try this.evaluate(v) else .undefined },
+        .throw => |e| return this.throwValue(try this.evaluate(e)),
         .block => |b| {
             const saved = this.env;
             defer this.env = saved;
@@ -593,16 +599,84 @@ fn evaluate(this: *Interpreter, expr: *const Expr) Error!Value {
         .conditional => |c| if ((try this.evaluate(c.condition)).toBoolean()) this.evaluate(c.then) else this.evaluate(c.otherwise),
         .member => |m| this.member(m),
         .call => |c| this.call(c),
-        .index, .object, .array => this.evaluateObject(expr),
+        .non_null => |inner| this.evaluate(inner),
+        .assertion => |a| this.evaluate(a.expr),
+        .index, .object, .array, .chain => this.evaluateObject(expr),
     };
 }
 
-/// Element access and object and array literals, kept out of `evaluate`'s hot path.
+/// Ends the program with a value from a `throw` statement.
+noinline fn throwValue(this: *Interpreter, v: Value) Error {
+    if (v == .string) {
+        // Shown as `console.log` shows it.
+        this.exception = .{ .name = .thrown, .message = v.string };
+        return error.RuntimeError;
+    }
+    var out: std.Io.Writer.Allocating = .init(this.arena);
+    // Writing to memory only fails when it runs out.
+    value.inspect(this.arena, &out.writer, v) catch return error.OutOfMemory;
+    this.exception = .{ .name = .thrown, .message = out.written() };
+    return error.RuntimeError;
+}
+
+/// One link of an optional chain, or null when the chain short-circuits before it.
+fn chainLink(this: *Interpreter, expr: *const Expr) Error!?Value {
+    switch (expr.data) {
+        .member => |m| {
+            const object = try this.chainLink(m.object) orelse return null;
+            if (m.optional and isNullish(object)) {
+                return null;
+            }
+            return try this.getNamed(object, m.property);
+        },
+        .index => |i| {
+            const object = try this.chainLink(i.object) orelse return null;
+            if (i.optional and isNullish(object)) {
+                return null;
+            }
+            return try this.getProperty(object, try this.evaluate(i.index));
+        },
+        .call => |c| {
+            var receiver: Value = .undefined;
+            const callee: Value = switch (c.callee.data) {
+                .member => |m| blk: {
+                    receiver = try this.chainLink(m.object) orelse return null;
+                    if (m.optional and isNullish(receiver)) {
+                        return null;
+                    }
+                    break :blk try this.getNamed(receiver, m.property);
+                },
+                .index => |i| blk: {
+                    receiver = try this.chainLink(i.object) orelse return null;
+                    if (i.optional and isNullish(receiver)) {
+                        return null;
+                    }
+                    break :blk try this.getProperty(receiver, try this.evaluate(i.index));
+                },
+                else => try this.chainLink(c.callee) orelse return null,
+            };
+            if (c.optional and isNullish(callee)) {
+                return null;
+            }
+            return try this.callValue(c, callee, receiver);
+        },
+        .non_null => |inner| return this.chainLink(inner),
+        else => return try this.evaluate(expr),
+    }
+}
+
+fn isNullish(v: Value) bool {
+    return v == .null or v == .undefined;
+}
+
+/// Element access, object and array literals and optional chains, kept out of `evaluate`'s hot
+/// path.
 noinline fn evaluateObject(this: *Interpreter, expr: *const Expr) Error!Value {
     return switch (expr.data) {
         .index => |i| this.index(i),
         .object => |o| this.objectLiteral(o),
         .array => |a| this.arrayLiteral(a),
+        .chain => |inner| try this.chainLink(inner) orelse .undefined,
         else => unreachable,
     };
 }
@@ -1042,6 +1116,11 @@ fn call(this: *Interpreter, c: ast.Call) Error!Value {
         },
         else => try this.evaluate(c.callee),
     };
+    return @call(.always_inline, callValue, .{ this, c, callee, receiver });
+}
+
+/// Evaluates a call's arguments and calls `callee` with them.
+fn callValue(this: *Interpreter, c: ast.Call, callee: Value, receiver: Value) Error!Value {
     const args = try this.arena.alloc(Value, c.arguments.len);
     for (c.arguments, args) |arg, *slot| {
         slot.* = try this.evaluate(arg);
@@ -1064,6 +1143,7 @@ fn calleeText(expr: *const Expr) []const u8 {
     return switch (expr.data) {
         .identifier => |id| id.name,
         .member => |m| m.property,
+        .chain, .non_null, .paren => |inner| calleeText(inner),
         else => "expression",
     };
 }

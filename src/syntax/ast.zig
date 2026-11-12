@@ -52,6 +52,7 @@ pub const Stmt = struct {
         for_each: ForEach,
         interface: *const Interface,
         type_alias: *const TypeAlias,
+        throw: *Expr,
     };
 };
 
@@ -261,7 +262,8 @@ pub const TypeMember = struct {
     type: ?*const TypeNode,
 };
 
-/// A type annotation: a primitive keyword, a name, an array, tuple, object or function type.
+/// A type annotation: a primitive keyword, a name, a literal, an array, tuple, object, function
+/// or union type.
 pub const TypeNode = struct {
     start: u32,
     data: Data,
@@ -269,6 +271,10 @@ pub const TypeNode = struct {
     pub const Data = union(enum) {
         keyword: Keyword,
         reference: []const u8,
+        /// `1`, `-1`, `"a"`, `true`
+        literal: Literal,
+        /// `A | B`, with at least two members.
+        @"union": []const *const TypeNode,
         /// `T[]`
         array: *const TypeNode,
         /// `[T, U]`
@@ -280,6 +286,12 @@ pub const TypeNode = struct {
     };
 
     pub const Keyword = enum { any, unknown, never, void, undefined, null, boolean, number, string };
+
+    pub const Literal = union(enum) {
+        number: f64,
+        string: []const u8,
+        boolean: bool,
+    };
 };
 
 pub const FunctionType = struct {
@@ -390,6 +402,14 @@ pub const Expr = struct {
         object: ObjectLiteral,
         array: ArrayLiteral,
         function: *Function,
+        /// An optional chain such as `a?.b.c`: the outermost expression of the chain, whose links
+        /// (`member`, `index`, `call` and `non_null`) short-circuit to `undefined` together when
+        /// one marked `optional` finds `null` or `undefined`.
+        chain: *Expr,
+        /// `e!`
+        non_null: *Expr,
+        /// `e as T`, `e as const` and `e satisfies T`.
+        assertion: Assertion,
         /// Kept so that `(a ?? b) || c` can be told apart from `a ?? b || c`, which is an error, and
         /// so syntactic checks see through parentheses the way tsc does.
         paren: *Expr,
@@ -543,16 +563,31 @@ pub const Member = struct {
     object: *Expr,
     property: []const u8,
     property_start: u32,
+    /// `object?.property`, inside a `chain`.
+    optional: bool = false,
 };
 
 pub const Call = struct {
     callee: *Expr,
     arguments: []const *Expr,
+    /// `callee?.(arguments)`, inside a `chain`.
+    optional: bool = false,
 };
 
 pub const Index = struct {
     object: *Expr,
     index: *Expr,
+    /// `object?.[index]`, inside a `chain`.
+    optional: bool = false,
+};
+
+pub const Assertion = struct {
+    kind: enum { as, satisfies },
+    expr: *Expr,
+    /// Null for `as const`.
+    type: ?*const TypeNode,
+    /// Where the `as` or `satisfies` keyword is.
+    keyword_start: u32,
 };
 
 /// `{ a: 1, b, [k]: 2, ...o, m() {} }`
@@ -600,4 +635,17 @@ pub fn skipParens(expr: *const Expr) *const Expr {
         e = e.data.paren;
     }
     return e;
+}
+
+/// The expression with parentheses, type assertions and non-null assertions around it removed
+/// (tsc's `skipOuterExpressions`), for checks that look at what an expression is syntactically.
+pub fn skipOuter(expr: *const Expr) *const Expr {
+    var e = expr;
+    while (true) {
+        e = switch (e.data) {
+            .paren, .non_null => |inner| inner,
+            .assertion => |a| a.expr,
+            else => return e,
+        };
+    }
 }

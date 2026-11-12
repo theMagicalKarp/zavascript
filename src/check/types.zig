@@ -333,6 +333,34 @@ pub fn widenFresh(arena: std.mem.Allocator, t: *const Type) error{OutOfMemory}!*
     };
 }
 
+/// `t` with its fresh literals made regular, as `as const` and narrowing do: they no longer widen.
+pub fn regular(arena: std.mem.Allocator, t: *const Type) error{OutOfMemory}!*const Type {
+    return switch (t.*) {
+        .literal => |lit| if (lit.fresh) literal(arena, lit.value) else t,
+        .@"union" => |ms| blk: {
+            var list: std.ArrayList(*const Type) = .empty;
+            for (ms) |m| {
+                try list.append(arena, try regular(arena, m));
+            }
+            break :blk unionOf(arena, list.items);
+        },
+        else => t,
+    };
+}
+
+/// tsc's `isUnitType`: a type with a single value.
+pub fn isUnit(t: *const Type) bool {
+    return t.* == .literal or t.* == .null or t.* == .undefined;
+}
+
+/// The anonymous object type `{}`, which every value but `null` and `undefined` belongs to.
+pub const empty_object: *const Type = &.{ .object = &.{ .properties = &.{} } };
+
+/// Whether `t` is an object type without properties, like `{}`, which a primitive can be too.
+pub fn isEmptyObject(t: *const Type) bool {
+    return t.* == .object and t.object.properties.len == 0;
+}
+
 /// The union of `parts`, flattened and deduplicated. Literals are absorbed by their primitive,
 /// `never` disappears, `any`/`unknown` swallow everything, and `true | false` is `boolean`.
 /// Members are kept in the order tsc prints them.
@@ -416,6 +444,33 @@ pub fn unionOf(arena: std.mem.Allocator, parts: []const *const Type) error{OutOf
     return asPtr(.{ .@"union" = list.items }, arena);
 }
 
+/// `t` with its members in the order `like` has them, for a union made from parts of `like` (as
+/// where control flow joins), which tsc would print in `like`'s order.
+pub fn orderLike(arena: std.mem.Allocator, t: *const Type, like: *const Type) error{OutOfMemory}!*const Type {
+    if (t.* != .@"union" or like.* != .@"union") {
+        return t;
+    }
+    const Ordered = struct {
+        like: []const *const Type,
+        fn index(this: @This(), m: *const Type) usize {
+            for (this.like, 0..) |l, i| {
+                if (l.eql(m)) {
+                    return i;
+                }
+            }
+            return this.like.len;
+        }
+        fn before(this: @This(), a: *const Type, b: *const Type) bool {
+            const ra = printRank(a);
+            const rb = printRank(b);
+            return ra < rb or (ra == rb and this.index(a) < this.index(b));
+        }
+    };
+    const list = try arena.dupe(*const Type, t.@"union");
+    std.mem.sort(*const Type, list, Ordered{ .like = like.@"union" }, Ordered.before);
+    return asPtr(.{ .@"union" = list }, arena);
+}
+
 /// tsc orders a union's members by when each type was created: its built-in types first (in a
 /// fixed order), then literals in the order the program mentions them. It prints `null` and
 /// `undefined` last. The sort is stable, so literals keep their relative order.
@@ -494,6 +549,16 @@ fn expandBoolean(t: *const Type, buffer: *[1]*const Type) []const *const Type {
 /// This is tsc's "comparable" relation, which for the types we have so far means the two share
 /// at least one possible value.
 pub fn comparable(a: *const Type, b: *const Type) bool {
+    return comparableWith(a, b, true);
+}
+
+/// tsc's `areTypesComparable`, which narrowing uses: like `comparable`, except that `null` and
+/// `undefined` are only comparable to themselves.
+pub fn overlap(a: *const Type, b: *const Type) bool {
+    return comparableWith(a, b, false);
+}
+
+fn comparableWith(a: *const Type, b: *const Type, nullish_with_anything: bool) bool {
     if (a.* == .any or b.* == .any or a.* == .unknown or b.* == .unknown) {
         return true;
     }
@@ -501,7 +566,7 @@ pub fn comparable(a: *const Type, b: *const Type) bool {
     var b_buffer: [1]*const Type = undefined;
     for (expandBoolean(a, &a_buffer)) |x| {
         for (expandBoolean(b, &b_buffer)) |y| {
-            if (overlaps(x, y)) {
+            if (overlaps(x, y, nullish_with_anything)) {
                 return true;
             }
         }
@@ -509,10 +574,11 @@ pub fn comparable(a: *const Type, b: *const Type) bool {
     return false;
 }
 
-fn overlaps(x: *const Type, y: *const Type) bool {
-    // Under strict null checks, tsc still allows comparing anything with `null` or `undefined`.
+fn overlaps(x: *const Type, y: *const Type, nullish_with_anything: bool) bool {
     if (isNullish(x) or isNullish(y)) {
-        return true;
+        // Under strict null checks, tsc still allows comparing anything with `null` or
+        // `undefined`.
+        return nullish_with_anything or std.meta.activeTag(x.*) == std.meta.activeTag(y.*) or x.* == .never or y.* == .never;
     }
     // `never` is related to everything.
     if (x.* == .never or y.* == .never) {
@@ -525,10 +591,11 @@ fn overlaps(x: *const Type, y: *const Type) bool {
         return true;
     }
     if (x.* == .array and y.* == .array) {
-        return comparable(x.array, y.array);
+        return comparableWith(x.array, y.array, nullish_with_anything);
     }
-    if (isObjectLike(x) and isObjectLike(y)) {
-        // tsc's comparable relation holds when either side is assignable to the other.
+    if (isObjectLike(x) or isObjectLike(y)) {
+        // tsc's comparable relation holds when either side is assignable to the other, as a
+        // primitive is to `{}`.
         return assignable(x, y) or assignable(y, x);
     }
     return primitiveKind(x) != .other and primitiveKind(x) == primitiveKind(y);
@@ -583,6 +650,65 @@ fn allOfKind(t: *const Type, kind: Kind) bool {
         }
     }
     return true;
+}
+
+/// tsc's comparable relation, which `as` uses: like assignability, except that a union source only
+/// needs one member to be related, and optional properties needn't be present.
+pub fn comparableTo(source: *const Type, target: *const Type) bool {
+    return comparableIn(source, target, 0);
+}
+
+fn comparableIn(source: *const Type, target: *const Type, depth: u32) bool {
+    if (depth > 64 or source.eql(target)) {
+        return true;
+    }
+    if (target.* == .any or target.* == .unknown or source.* == .any or source.* == .never or source.* == .unknown) {
+        return true;
+    }
+    if (source.* == .@"union" or source.* == .boolean) {
+        var buffer: [1]*const Type = undefined;
+        for (expandBoolean(source, &buffer)) |m| {
+            if (comparableIn(m, target, depth + 1)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (target.* == .@"union" or target.* == .boolean) {
+        var buffer: [1]*const Type = undefined;
+        for (expandBoolean(target, &buffer)) |m| {
+            if (comparableIn(source, m, depth + 1)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return switch (target.*) {
+        .array => |element| switch (source.*) {
+            .array => |e| comparableIn(e, element, depth + 1),
+            .tuple => |es| for (es) |e| {
+                if (!comparableIn(e, element, depth + 1)) {
+                    break false;
+                }
+            } else true,
+            else => false,
+        },
+        .tuple => |ts| source.* == .tuple and source.tuple.len == ts.len and for (source.tuple, ts) |s, t| {
+            if (!comparableIn(s, t, depth + 1)) {
+                break false;
+            }
+        } else true,
+        .object => |o| switch (source.*) {
+            .object => |so| for (o.properties) |p| {
+                const sp = so.find(p.name) orelse if (p.optional) continue else break false;
+                if (!comparableIn(sp.type, p.type, depth + 1)) {
+                    break false;
+                }
+            } else true,
+            else => assignable(source, target),
+        },
+        else => assignable(source, target),
+    };
 }
 
 /// Whether a value of type `source` can be used where `target` is expected.

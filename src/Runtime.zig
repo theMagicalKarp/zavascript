@@ -217,6 +217,22 @@ test "runtime errors" {
     try expectThrows("let a: any = 1; a()", "Uncaught TypeError: a is not a function");
     try expectThrows("let a: any = undefined; a.b", "Uncaught TypeError: Cannot read properties of undefined (reading 'b')");
     try expectThrows("let a: any = 1; a.b", "error ZV9001: Reading the property 'b' of a number is not supported yet.");
+    try expectThrows("function f(x: number | null) { if (x === null) { throw 'no ' + x; } return x; } f(null)", "Uncaught no null");
+    try expectThrows("throw { code: 1 }", "Uncaught { code: 1 }");
+    // A non-null assertion checks nothing.
+    try expectThrows("const a: { b: number } | undefined = undefined as { b: number } | undefined; a!.b", "Uncaught TypeError: Cannot read properties of undefined (reading 'b')");
+}
+
+test "union narrowing between runs" {
+    var stdout: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout.deinit();
+    var runtime: Runtime = try .init(testing.allocator, .{ .stdout = &stdout.writer, .stderr = &stdout.writer });
+    defer runtime.deinit();
+    _ = try runtime.run("repl", "let x: string | number = 'a'");
+    // What an assignment narrowed `x` to carries over to the next line.
+    try testing.expectError(error.CompileError, runtime.run("repl", "const n: number = x"));
+    _ = try runtime.run("repl", "x = 1");
+    try testing.expectEqual(@as(f64, 2), (try runtime.run("repl", "const n: number = x; n + 1")).number);
 }
 
 test "keeps functions between runs" {
