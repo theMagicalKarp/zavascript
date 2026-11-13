@@ -6,6 +6,7 @@
 //! scope is entered.
 
 const std = @import("std");
+const Source = @import("../Source.zig");
 const ast = @import("../syntax/ast.zig");
 const Checker = @import("../check/Checker.zig");
 const value = @import("value.zig");
@@ -47,46 +48,80 @@ max_stack: usize,
 stack_limit: usize = 0,
 /// What was thrown, when a call returns `error.RuntimeError`.
 exception: ?Exception = null,
+/// Where the statement that's running starts, for where an exception is thrown from.
+position: u32 = 0,
+/// The calls in progress, innermost first, for stack traces.
+call_frame: ?*const CallFrame = null,
 /// State the builtins keep, like `console.count`'s counts.
 builtin_state: builtins.State = .{},
 
 pub const Error = error{
     OutOfMemory,
     WriteFailed,
-    /// An exception was thrown and not caught; it's in `exception`.
+    /// An exception was thrown; it's in `exception`.
     RuntimeError,
-    /// See `value.ConvertError`. Nothing can catch an exception yet, so `run` throws it as a
-    /// RangeError where it reaches the top.
+    /// See `value.ConvertError`. What catches it throws it as a RangeError.
     NestedTooDeep,
 };
 
-/// A runtime error, or a value a `throw` statement threw. There's no `catch` yet, so these always
-/// end the program.
+/// A call in progress.
+pub const CallFrame = struct {
+    parent: ?*const CallFrame,
+    closure: *const value.Closure,
+    /// Where the statement that called it starts, in the caller's program.
+    caller_position: u32,
+    caller_program: *const Program,
+};
+
+/// What's been thrown: a value from a `throw` statement or an error the runtime raised, or
+/// something that isn't supported yet.
 pub const Exception = struct {
-    name: Name,
-    /// For a thrown value, the value as `console.log` shows it.
-    message: []const u8,
+    /// What was thrown; for something unsupported, a string saying what.
+    value: Value,
+    /// Something that works in JavaScript but isn't implemented yet. Not a JavaScript exception,
+    /// so it can never be caught.
+    unsupported: bool = false,
+    /// The source and the position of the statement it was thrown from.
+    source: *const Source,
+    position: u32,
+    /// Once it's uncaught: on one line, as node's REPL shows it (`TypeError: message`).
+    summary: []const u8 = "",
+    /// Once it's uncaught: as node shows it when it ends a program, which for an error is its
+    /// stack and its own properties.
+    detail: []const u8 = "",
 
-    pub const Name = enum {
-        TypeError,
-        ReferenceError,
-        RangeError,
-        SyntaxError,
-        /// A value from a `throw` statement.
-        thrown,
-        /// Something that works in JavaScript but isn't implemented yet. Not a JavaScript error,
-        /// so it can never be caught.
-        Unsupported,
-    };
+    /// What it was thrown as: `TypeError`, for the runtime's own errors.
+    pub const Name = enum { TypeError, ReferenceError, RangeError, SyntaxError, Unsupported };
 
+    /// As node's REPL shows an uncaught exception.
     pub fn format(this: Exception, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        switch (this.name) {
-            .Unsupported => try writer.print("error ZV9001: {s}", .{this.message}),
-            .thrown => try writer.print("Uncaught {s}", .{this.message}),
-            else => try writer.print("Uncaught {t}: {s}", .{ this.name, this.message }),
+        if (this.unsupported) {
+            return writer.print("error ZV9001: {s}", .{this.summary});
         }
+        try writer.print("Uncaught {s}", .{this.summary});
+    }
+
+    /// As node reports an exception that ends a program: where it was thrown, with a caret under
+    /// the statement, and then the error's stack or the value. Something unsupported is reported
+    /// like a diagnostic.
+    pub fn render(this: Exception, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        const at = this.source.location(this.position);
+        if (this.unsupported) {
+            return writer.print("{s}({d},{d}): error ZV9001: {s}\n", .{ this.source.path, at.line, at.column, this.summary });
+        }
+        try writer.print("{s}:{d}\n{s}\n", .{ this.source.path, at.line, this.source.lineText(at.line) });
+        try writer.splatByteAll(' ', at.column - 1);
+        try writer.writeAll("^\n");
+        if (isError(this.value)) {
+            try writer.writeAll("\n");
+        }
+        try writer.print("{s}\n", .{this.detail});
     }
 };
+
+fn isError(v: Value) bool {
+    return v == .object and v.object.internal == .@"error";
+}
 
 pub fn init(arena: std.mem.Allocator, stdout: *std.Io.Writer, stderr: *std.Io.Writer, max_stack: usize, random_seed: u64) error{OutOfMemory}!Interpreter {
     var interpreter: Interpreter = .{ .arena = arena, .stdout = stdout, .stderr = stderr, .max_stack = max_stack };
@@ -101,12 +136,83 @@ pub const Program = struct {
     resolved: Checker.Resolved,
     /// The source text, for functions' `toString`.
     text: []const u8,
+    /// For where exceptions are thrown.
+    source: *const Source,
 };
 
-/// Ends the program with an exception.
+/// Throws one of the errors the runtime raises, or ends the program with something unsupported.
 pub fn throw(this: *Interpreter, name: Exception.Name, comptime fmt: []const u8, args: anytype) Error {
-    this.exception = .{ .name = name, .message = try std.fmt.allocPrint(this.arena, fmt, args) };
-    return error.RuntimeError;
+    const message = try std.fmt.allocPrint(this.arena, fmt, args);
+    const kind: value.ErrorKind = switch (name) {
+        .Unsupported => {
+            this.exception = .{ .value = .{ .string = message }, .unsupported = true, .source = this.program.source, .position = this.position };
+            return error.RuntimeError;
+        },
+        inline else => |n| @field(value.ErrorKind, @tagName(n)),
+    };
+    return this.throwValue(try this.newError(kind, .{ .string = message }, null));
+}
+
+/// A new error, with the stack of calls in progress.
+pub fn newError(this: *Interpreter, kind: value.ErrorKind, message: ?Value, cause: ?Value) Error!Value {
+    const data = try this.arena.create(value.ErrorData);
+    data.* = .{ .kind = kind, .message = message, .cause = cause };
+    const text = if (message) |m| try m.toString(this.arena) else "";
+    data.stack = .{ .string = try this.stackTrace(@tagName(kind), text) };
+    const o = try this.arena.create(value.Object);
+    o.* = .{ .internal = .{ .@"error" = data }, .methods = &builtins.errors.methods };
+    return .{ .object = o };
+}
+
+/// How many calls a stack trace shows, as V8's `Error.stackTraceLimit`.
+const stack_trace_limit = 10;
+
+/// What an error's `stack` says, as V8 writes it: `TypeError: message`, then a line for each call
+/// in progress, innermost first, with where it's at.
+fn stackTrace(this: *Interpreter, name: []const u8, message: []const u8) Error![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(this.arena);
+    // Writing to memory only fails when it runs out.
+    this.writeStackTrace(&out.writer, name, message) catch return error.OutOfMemory;
+    return out.written();
+}
+
+fn writeStackTrace(this: *Interpreter, w: *std.Io.Writer, name: []const u8, message: []const u8) std.Io.Writer.Error!void {
+    try w.writeAll(name);
+    if (message.len > 0) {
+        try w.print(": {s}", .{message});
+    }
+    var program = this.program;
+    var position = this.position;
+    var frame = this.call_frame;
+    for (0..stack_trace_limit) |_| {
+        const at = program.source.location(position);
+        const function = if (frame) |f| f.closure.name() else "";
+        if (function.len > 0) {
+            try w.print("\n    at {s} ({s}:{d}:{d})", .{ function, program.source.path, at.line, at.column });
+        } else {
+            try w.print("\n    at {s}:{d}:{d}", .{ program.source.path, at.line, at.column });
+        }
+        const f = frame orelse break;
+        program = f.caller_program;
+        position = f.caller_position;
+        frame = f.parent;
+    }
+}
+
+/// Turns `err` into a JavaScript exception in `exception`, if it's one, and says whether it is.
+/// Running out of memory or failing to write isn't, and nor is something unsupported.
+fn isException(this: *Interpreter, err: Error) Error!bool {
+    switch (err) {
+        error.OutOfMemory, error.WriteFailed => return false,
+        error.NestedTooDeep => {
+            const e = this.throw(.RangeError, "Maximum call stack size exceeded", .{});
+            if (e != error.RuntimeError) {
+                return e;
+            }
+            return true;
+        },
+        error.RuntimeError => return !this.exception.?.unsupported,
+    }
 }
 
 /// Throws a RangeError when the native stack is nearly full. Anything that recurses on a value's
@@ -122,12 +228,38 @@ pub fn checkStack(this: *Interpreter) Error!void {
 /// prints.
 pub fn run(this: *Interpreter, program: Program) error{ OutOfMemory, WriteFailed, RuntimeError }!Value {
     return this.runProgram(program) catch |err| switch (err) {
-        error.NestedTooDeep => {
-            this.exception = .{ .name = .RangeError, .message = "Maximum call stack size exceeded" };
+        error.NestedTooDeep, error.RuntimeError => {
+            _ = this.isException(err) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.RuntimeError;
+            try this.describeException();
             return error.RuntimeError;
         },
-        else => |e| e,
+        error.OutOfMemory => error.OutOfMemory,
+        error.WriteFailed => error.WriteFailed,
     };
+}
+
+/// Fills in how an uncaught exception is shown.
+fn describeException(this: *Interpreter) error{OutOfMemory}!void {
+    const e = &this.exception.?;
+    switch (e.value) {
+        .string => |str| {
+            e.summary = str;
+            e.detail = str;
+            return;
+        },
+        else => {},
+    }
+    var out: std.Io.Writer.Allocating = .init(this.arena);
+    // Writing to memory only fails when it runs out.
+    value.inspect(this.arena, &out.writer, e.value) catch return error.OutOfMemory;
+    e.detail = out.written();
+    e.summary = e.detail;
+    if (isError(e.value)) {
+        e.summary = value.errorString(this.arena, e.value.object) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.NestedTooDeep => "Error",
+        };
+    }
 }
 
 fn runProgram(this: *Interpreter, program: Program) Error!Value {
@@ -136,6 +268,8 @@ fn runProgram(this: *Interpreter, program: Program) Error!Value {
     this.setProgram(owned);
     this.exception = null;
     this.env = null;
+    this.call_frame = null;
+    this.position = 0;
     this.frame = 0;
     this.stack.clearRetainingCapacity();
     this.stack_limit = @frameAddress() -| this.max_stack;
@@ -322,7 +456,7 @@ pub fn iterate(this: *Interpreter, v: Value) Error!Iteration {
             .map => |c| return .{ .iterator = try builtins.iterators.create(this, .{ .map = c }, .entries) },
             .set => |c| return .{ .iterator = try builtins.iterators.create(this, .{ .set = c }, .values) },
             .iterator => |it| return .{ .iterator = it },
-            .none => {},
+            .none, .@"error" => {},
         },
         else => {},
     }
@@ -453,6 +587,7 @@ fn statementList(this: *Interpreter, statements: []const *Stmt) Error!Completion
 
 /// `labels` are the labels directly on this statement (LabelledEvaluation's label set).
 fn statement(this: *Interpreter, stmt: *const Stmt, labels: []const []const u8) Error!Completion {
+    this.position = stmt.start;
     switch (stmt.data) {
         .expression => |e| return .{ .normal = try this.evaluate(e) },
         .empty => return .{ .normal = null },
@@ -472,16 +607,13 @@ fn statement(this: *Interpreter, stmt: *const Stmt, labels: []const []const u8) 
         // Created when its scope was entered.
         .function => return .{ .normal = null },
         .@"return" => |e| return .{ .@"return" = if (e) |v| try this.evaluate(v) else .undefined },
-        .throw => |e| return this.throwValue(try this.evaluate(e)),
-        .block => |b| {
-            const saved = this.env;
-            defer this.env = saved;
-            try this.enterScope(b.scope);
-            if (b.declares_functions) {
-                try this.hoist(b.statements);
-            }
-            return this.statementList(b.statements);
+        .throw => |e| {
+            const v = try this.evaluate(e);
+            this.position = stmt.start;
+            return this.throwValue(v);
         },
+        .block => |b| return this.block(b),
+        .@"try" => |t| return this.tryStatement(t),
         .@"if" => |i| {
             const branch = if ((try this.evaluate(i.condition)).toBoolean()) i.then else i.otherwise orelse return .{ .normal = .undefined };
             return (try this.statement(branch, &.{})).updateEmpty(.undefined);
@@ -500,6 +632,59 @@ fn statement(this: *Interpreter, stmt: *const Stmt, labels: []const []const u8) 
             return completion;
         },
     }
+}
+
+fn block(this: *Interpreter, b: ast.Block) Error!Completion {
+    const saved = this.env;
+    defer this.env = saved;
+    try this.enterScope(b.scope);
+    if (b.declares_functions) {
+        try this.hoist(b.statements);
+    }
+    return this.statementList(b.statements);
+}
+
+/// TryStatement evaluation (§14.15.3).
+noinline fn tryStatement(this: *Interpreter, t: ast.Try) Error!Completion {
+    var result = this.block(t.block);
+    if (result) |_| {} else |err| {
+        if (!try this.isException(err)) {
+            return err;
+        }
+        if (t.handler) |h| {
+            const thrown = this.exception.?.value;
+            this.exception = null;
+            result = this.catchClause(h, thrown);
+            if (result) |_| {} else |e| {
+                if (!try this.isException(e)) {
+                    return e;
+                }
+                result = error.RuntimeError;
+            }
+        } else {
+            result = error.RuntimeError;
+        }
+    }
+    if (t.finalizer) |f| {
+        // What it does in between can throw and catch other exceptions.
+        const pending = this.exception;
+        const completion = try this.block(f);
+        if (completion != .normal) {
+            return completion.updateEmpty(.undefined);
+        }
+        this.exception = pending;
+    }
+    return (try result).updateEmpty(.undefined);
+}
+
+fn catchClause(this: *Interpreter, h: ast.Catch, thrown: Value) Error!Completion {
+    const saved = this.env;
+    defer this.env = saved;
+    try this.enterScope(h.scope);
+    if (h.parameter) |p| {
+        try this.bindPattern(p, thrown);
+    }
+    return this.block(h.block);
 }
 
 /// A loop or `switch` finishes normally when an unlabeled `break` leaves it.
@@ -526,7 +711,10 @@ fn loopContinues(completion: Completion, labels: []const []const u8) bool {
 fn loop(this: *Interpreter, stmt: *const Stmt, labels: []const []const u8) Error!Completion {
     var v: Value = .undefined;
     switch (stmt.data) {
-        .@"while" => |w| while ((try this.evaluate(w.condition)).toBoolean()) {
+        .@"while" => |w| while (blk: {
+            this.position = stmt.start;
+            break :blk (try this.evaluate(w.condition)).toBoolean();
+        }) {
             const result = try this.statement(w.body, &.{});
             if (!loopContinues(result, labels)) {
                 return result.updateEmpty(v);
@@ -539,6 +727,7 @@ fn loop(this: *Interpreter, stmt: *const Stmt, labels: []const []const u8) Error
                 return result.updateEmpty(v);
             }
             v = result.value() orelse v;
+            this.position = stmt.start;
             if (!(try this.evaluate(d.condition)).toBoolean()) {
                 break;
             }
@@ -552,6 +741,7 @@ fn loop(this: *Interpreter, stmt: *const Stmt, labels: []const []const u8) Error
             }
             try this.copyEnv(f.scope);
             while (true) {
+                this.position = stmt.start;
                 if (f.condition) |c| {
                     if (!(try this.evaluate(c)).toBoolean()) {
                         break;
@@ -563,6 +753,7 @@ fn loop(this: *Interpreter, stmt: *const Stmt, labels: []const []const u8) Error
                 }
                 v = result.value() orelse v;
                 try this.copyEnv(f.scope);
+                this.position = stmt.start;
                 if (f.update) |u| {
                     _ = try this.evaluate(u);
                 }
@@ -680,17 +871,9 @@ fn evaluate(this: *Interpreter, expr: *const Expr) Error!Value {
     };
 }
 
-/// Ends the program with a value from a `throw` statement.
-noinline fn throwValue(this: *Interpreter, v: Value) Error {
-    if (v == .string) {
-        // Shown as `console.log` shows it.
-        this.exception = .{ .name = .thrown, .message = v.string };
-        return error.RuntimeError;
-    }
-    var out: std.Io.Writer.Allocating = .init(this.arena);
-    // Writing to memory only fails when it runs out.
-    value.inspect(this.arena, &out.writer, v) catch return error.OutOfMemory;
-    this.exception = .{ .name = .thrown, .message = out.written() };
+/// Throws `v` from where the program is.
+pub noinline fn throwValue(this: *Interpreter, v: Value) Error {
+    this.exception = .{ .value = v, .source = this.program.source, .position = this.position };
     return error.RuntimeError;
 }
 
@@ -984,7 +1167,9 @@ noinline fn delete(this: *Interpreter, operand: *const Expr) Error!Value {
                 // Without strict mode, it silently stays.
                 return .{ .boolean = !o.properties.contains(key) };
             }
-            _ = o.properties.orderedRemove(key);
+            if (!o.properties.orderedRemove(key) and o.internal == .@"error") {
+                o.internal.@"error".delete(key);
+            }
         },
         .array => |a| {
             const key = try this.propertyKey(p.key);
@@ -1004,7 +1189,8 @@ noinline fn delete(this: *Interpreter, operand: *const Expr) Error!Value {
 noinline fn hasProperty(this: *Interpreter, key: Value, object: Value) Error!bool {
     const name = try this.propertyKey(key);
     return switch (object) {
-        .object => |o| o.properties.contains(name) or (if (o.methods) |m| m.has(name) else false) or builtins.objects.prototype.has(name) or (o.internal == .map or o.internal == .set) and std.mem.eql(u8, name, "size"),
+        .object => |o| o.properties.contains(name) or (if (o.methods) |m| m.has(name) else false) or builtins.objects.prototype.has(name) or (o.internal == .map or o.internal == .set) and std.mem.eql(u8, name, "size") or
+            o.internal == .@"error" and o.internal.@"error".get(name) != null,
         .array => |a| std.mem.eql(u8, name, "length") or (if (value.arrayIndex(name)) |i| i < a.items().len else false) or builtins.arrays.methods.has(name) or builtins.objects.prototype.has(name),
         .function => if (std.mem.eql(u8, name, "prototype"))
             this.throw(.Unsupported, "Functions' 'prototype' is not supported yet.", .{})
@@ -1013,6 +1199,49 @@ noinline fn hasProperty(this: *Interpreter, key: Value, object: Value) Error!boo
         .native_function => |f| std.mem.eql(u8, name, "name") or std.mem.eql(u8, name, "length") or (if (f.statics) |statics| statics.has(name) else false),
         else => this.throw(.TypeError, "Cannot use 'in' operator to search for '{s}' in {s}", .{ name, try object.toString(this.arena) }),
     };
+}
+
+/// The `instanceof` operator (§13.10.2), for the constructors there are: only the builtins
+/// construct anything yet.
+noinline fn instanceOf(this: *Interpreter, v: Value, constructor: Value) Error!bool {
+    switch (constructor) {
+        .native_function => |f| {
+            if (builtins.errors.kindOf(f)) |kind| {
+                return isError(v) and (kind == .Error or v.object.internal.@"error".kind == kind);
+            }
+            if (f == builtins.arrays.constructor.native_function) {
+                return v == .array;
+            }
+            if (f == builtins.objects.constructor.native_function) {
+                return switch (v) {
+                    .object, .array, .function, .native_function => true,
+                    else => false,
+                };
+            }
+            if (f == builtins.collections.map_constructor.native_function) {
+                return v == .object and v.object.internal == .map;
+            }
+            if (f == builtins.collections.set_constructor.native_function) {
+                return v == .object and v.object.internal == .set;
+            }
+            if (f.statics == null) {
+                // Not a constructor, like `console.log`, so it has no `prototype`.
+                return this.throw(.TypeError, "Function has non-object prototype 'undefined' in instanceof check", .{});
+            }
+            // `Number`, `String`, `Boolean`: only their wrapper objects are instances, and there
+            // aren't any.
+            return false;
+        },
+        .function => |c| {
+            if (c.function.kind == .arrow or c.function.method) {
+                return this.throw(.TypeError, "Function has non-object prototype 'undefined' in instanceof check", .{});
+            }
+            // Nothing can be made with a function's `prototype` yet.
+            return false;
+        },
+        .object, .array => return this.throw(.TypeError, "Right-hand side of 'instanceof' is not callable", .{}),
+        else => return this.throw(.TypeError, "Right-hand side of 'instanceof' is not an object", .{}),
+    }
 }
 
 fn binary(this: *Interpreter, b: ast.Binary) Error!Value {
@@ -1065,6 +1294,7 @@ fn operate(this: *Interpreter, op: ast.BinaryOp, left: Value, right: Value) Erro
         .strict_equal => .{ .boolean = left.strictEquals(right) },
         .strict_not_equal => .{ .boolean = !left.strictEquals(right) },
         .in => .{ .boolean = try this.hasProperty(left, right) },
+        .instanceof => .{ .boolean = try this.instanceOf(left, right) },
         .logical_and, .logical_or, .nullish => unreachable,
     };
 }
@@ -1153,6 +1383,9 @@ pub fn getNamed(this: *Interpreter, object: Value, name: []const u8) Error!Value
                 .map, .set => |c| if (std.mem.eql(u8, name, "size")) {
                     return .{ .number = @floatFromInt(c.size) };
                 },
+                .@"error" => |e| if (e.get(name)) |v| {
+                    return v;
+                },
                 else => {},
             }
             return this.inherited(&builtins.objects.prototype, object, name);
@@ -1238,6 +1471,9 @@ pub fn setProperty(this: *Interpreter, object: Value, key: Value, v: Value) Erro
         .object => |o| {
             if (o.frozen) {
                 // Without strict mode, the assignment silently does nothing.
+                return;
+            }
+            if (o.internal == .@"error" and o.internal.@"error".set(name, v)) {
                 return;
             }
             return o.properties.put(this.arena, name, v);
@@ -1382,11 +1618,15 @@ pub fn callFunction(this: *Interpreter, c: *const value.Closure, args: []const V
     const saved_env = this.env;
     const saved_frame = this.frame;
     const saved_len = this.stack.items.len;
+    var call_frame: CallFrame = .{ .parent = this.call_frame, .closure = c, .caller_position = this.position, .caller_program = saved_program };
+    this.call_frame = &call_frame;
     defer {
         this.setProgram(saved_program);
         this.env = saved_env;
         this.frame = saved_frame;
         this.stack.shrinkRetainingCapacity(saved_len);
+        this.call_frame = call_frame.parent;
+        this.position = call_frame.caller_position;
     }
     this.setProgram(c.program);
     this.env = c.env;
@@ -1400,6 +1640,8 @@ pub fn callFunction(this: *Interpreter, c: *const value.Closure, args: []const V
         }
     }
     for (f.parameters, 0..) |p, i| {
+        // A default value or a destructuring that throws does so from the parameter.
+        this.position = p.node_start;
         var v: Value = undefined;
         if (p.rest) {
             v = try this.newArray(args[@min(i, args.len)..]);
@@ -1418,7 +1660,10 @@ pub fn callFunction(this: *Interpreter, c: *const value.Closure, args: []const V
         }
     }
     switch (f.body) {
-        .expression => |e| return this.evaluate(e),
+        .expression => |e| {
+            this.position = e.start;
+            return this.evaluate(e);
+        },
         .block => |b| {
             try this.enterScope(b.scope);
             try this.hoist(b.statements);

@@ -3,8 +3,12 @@
 //!
 //!   console.log(1 + 2); //> 3          one expected line of stdout, in source order
 //!   const n: number = "x"; //! TS2322  diagnostics expected to start on this line
+//!   null!.x; //!! TypeError: Cannot read properties of null (reading 'x')
+//!                                      an uncaught exception thrown from this line, as node
+//!                                      shows it: `Name: message` for an error
 //!
-//! A case that expects diagnostics must not also expect output, since it never runs.
+//! A case that expects diagnostics must not also expect output or an exception, since it never
+//! runs.
 //! `tests/oracle.mjs` checks the same annotations against tsc and node.
 //!
 //! Usage: conformance <cases dir> [filter]   (only cases whose path contains `filter`)
@@ -16,12 +20,18 @@ const Expectation = struct {
     stdout: []const u8,
     /// Sorted `line:code` strings, e.g. `3:TS2322`.
     diagnostics: []const []const u8,
+    /// The uncaught exception, as `line: text`.
+    exception: ?[]const u8 = null,
+    /// More than one line expects an exception.
+    exceptions: usize = 0,
 };
 
 /// Reads the `//>` and `//!` annotations out of a case's source.
 fn parseExpectation(arena: std.mem.Allocator, source: []const u8) !Expectation {
     var stdout: std.ArrayList(u8) = .empty;
     var diagnostics: std.ArrayList([]const u8) = .empty;
+    var exception: ?[]const u8 = null;
+    var exceptions: usize = 0;
     var lines = std.mem.splitScalar(u8, source, '\n');
     var line_number: usize = 0;
     while (lines.next()) |raw_line| {
@@ -34,6 +44,13 @@ fn parseExpectation(arena: std.mem.Allocator, source: []const u8) !Expectation {
             }
             try stdout.appendSlice(arena, text);
             try stdout.append(arena, '\n');
+        } else if (std.mem.indexOf(u8, line, "//!!")) |i| {
+            var text = line[i + 4 ..];
+            if (text.len > 0 and text[0] == ' ') {
+                text = text[1..];
+            }
+            exception = try std.fmt.allocPrint(arena, "{d}: {s}", .{ line_number, text });
+            exceptions += 1;
         } else if (std.mem.indexOf(u8, line, "//!")) |i| {
             var codes = std.mem.tokenizeAny(u8, line[i + 3 ..], " \t");
             while (codes.next()) |code| {
@@ -42,7 +59,7 @@ fn parseExpectation(arena: std.mem.Allocator, source: []const u8) !Expectation {
         }
     }
     std.mem.sort([]const u8, diagnostics.items, {}, lessThanString);
-    return .{ .stdout = stdout.items, .diagnostics = diagnostics.items };
+    return .{ .stdout = stdout.items, .diagnostics = diagnostics.items, .exception = exception, .exceptions = exceptions };
 }
 
 fn lessThanString(_: void, a: []const u8, b: []const u8) bool {
@@ -56,8 +73,11 @@ const Outcome = union(enum) {
 
 fn runCase(gpa: std.mem.Allocator, arena: std.mem.Allocator, path: []const u8, source: []const u8) !Outcome {
     const expected = try parseExpectation(arena, source);
-    if (expected.diagnostics.len > 0 and expected.stdout.len > 0) {
-        return .{ .fail = "case expects both diagnostics (//!) and output (//>); a case with errors never runs" };
+    if (expected.diagnostics.len > 0 and (expected.stdout.len > 0 or expected.exception != null)) {
+        return .{ .fail = "case expects both diagnostics (//!) and output (//> or //!!); a case with errors never runs" };
+    }
+    if (expected.exceptions > 1) {
+        return .{ .fail = "case expects more than one uncaught exception (//!!)" };
     }
 
     var stdout: std.Io.Writer.Allocating = .init(arena);
@@ -92,8 +112,18 @@ fn runCase(gpa: std.mem.Allocator, arena: std.mem.Allocator, path: []const u8, s
             return .{ .fail = report.written() };
         },
         error.RuntimeError => {
-            try w.print("threw: {f}\n", .{runtime.exception().?});
-            return .{ .fail = report.written() };
+            const e = runtime.exception().?;
+            const actual = try std.fmt.allocPrint(arena, "{d}: {s}", .{ e.source.location(e.position).line, e.summary });
+            if (expected.exception == null or e.unsupported) {
+                try w.print("threw: {f}\n", .{e});
+                try e.render(w);
+                return .{ .fail = report.written() };
+            }
+            if (!std.mem.eql(u8, expected.exception.?, actual)) {
+                try w.print("exception differs\n  expected: {s}\n  actual:   {s}\n", .{ expected.exception.?, actual });
+                return .{ .fail = report.written() };
+            }
+            return checkStdout(&report, expected, stdout.written());
         },
         else => return err,
     };
@@ -105,11 +135,20 @@ fn runCase(gpa: std.mem.Allocator, arena: std.mem.Allocator, path: []const u8, s
         }
         return .{ .fail = report.written() };
     }
-    if (std.mem.eql(u8, expected.stdout, stdout.written())) {
+    if (expected.exception) |e| {
+        try w.print("expected an uncaught exception, but it finished: {s}\n", .{e});
+        return .{ .fail = report.written() };
+    }
+    return checkStdout(&report, expected, stdout.written());
+}
+
+fn checkStdout(report: *std.Io.Writer.Allocating, expected: Expectation, actual: []const u8) !Outcome {
+    const w = &report.writer;
+    if (std.mem.eql(u8, expected.stdout, actual)) {
         return .pass;
     }
     try w.writeAll("stdout differs\n");
-    try diffLines(w, expected.stdout, stdout.written());
+    try diffLines(w, expected.stdout, actual);
     return .{ .fail = report.written() };
 }
 

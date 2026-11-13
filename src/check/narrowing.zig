@@ -21,6 +21,8 @@ pub const Test = union(enum) {
     in: []const u8,
     /// A call of a type guard, `(x: unknown) => x is T`, with `x`.
     guard: *const Type,
+    /// `x instanceof C`, with what `C` constructs.
+    instance: *const Type,
 };
 
 /// The type of something of type `t` once `test` is known to be `assume`. Null when the narrowed
@@ -32,7 +34,114 @@ pub fn narrow(arena: std.mem.Allocator, t: *const Type, test_: Test, assume: boo
         .typeof => |name| typeOf(arena, t, name, assume),
         .in => |name| inKeyword(arena, t, name, assume),
         .guard => |candidate| guard(arena, t, candidate, assume),
+        .instance => |candidate| instanceOf(arena, t, candidate, assume),
     };
+}
+
+/// tsc's `getNarrowedType` with `checkDerived`, which is what `instanceof` does: it keeps the
+/// members of `t` declared to derive from the candidate (or the candidate, for a member it derives
+/// from) rather than going by structure, so `TypeError | RangeError` can be told apart.
+fn instanceOf(arena: std.mem.Allocator, t: *const Type, candidate: *const Type, assume: bool) Error!?*const Type {
+    if (!assume) {
+        if (t.* == .any or t.* == .unknown) {
+            return t;
+        }
+        var kept: std.ArrayList(*const Type) = .empty;
+        for (try types.expandedMembers(arena, t)) |m| {
+            if (!derivesFrom(m, candidate)) {
+                try kept.append(arena, m);
+            }
+        }
+        return try types.unionOf(arena, kept.items);
+    }
+    if (t.* == .any or t.* == .unknown) {
+        return candidate;
+    }
+    var kept: std.ArrayList(*const Type) = .empty;
+    var c_buffer: [1]*const Type = undefined;
+    for (candidate.members(&c_buffer)) |c| {
+        for (try types.expandedMembers(arena, t)) |m| {
+            if (derivesFrom(m, c)) {
+                try kept.append(arena, m);
+            } else if (derivesFrom(c, m)) {
+                try kept.append(arena, c);
+            }
+        }
+    }
+    const narrowed = try types.unionOf(arena, kept.items);
+    if (narrowed.* != .never) {
+        return narrowed;
+    }
+    if (types.assignable(candidate, t)) {
+        return candidate;
+    }
+    if (types.assignable(t, candidate)) {
+        return t;
+    }
+    // That'd be an intersection.
+    return null;
+}
+
+/// tsc's `isTypeDerivedFrom`: the same interface, or one that (eventually) extends it. Arrays and
+/// tuples derive from arrays, and every object from `Object`.
+fn derivesFrom(source: *const Type, target: *const Type) bool {
+    var s_buffer: [1]*const Type = undefined;
+    if (source.* == .@"union") {
+        for (source.members(&s_buffer)) |m| {
+            if (!derivesFrom(m, target)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    var t_buffer: [1]*const Type = undefined;
+    if (target.* == .@"union") {
+        for (target.members(&t_buffer)) |m| {
+            if (derivesFrom(source, m)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (source.* == .param) {
+        return derivesFrom(types.baseConstraint(source), target);
+    }
+    if (target.* == .object and target.object.interface and std.mem.eql(u8, target.object.name, "Object")) {
+        return switch (source.*) {
+            .object, .function, .array, .tuple, .readonly_array, .non_primitive => true,
+            else => false,
+        };
+    }
+    switch (target.*) {
+        .array => return switch (source.*) {
+            .array, .tuple, .readonly_array => true,
+            else => false,
+        },
+        .readonly_array => return switch (source.*) {
+            .array, .tuple, .readonly_array => true,
+            else => false,
+        },
+        .object => |o| return source.* == .object and objectDerivesFrom(source.object, o),
+        else => return source.eql(target),
+    }
+}
+
+fn objectDerivesFrom(source: *const types.Object, target: *const types.Object) bool {
+    if (source == target) {
+        return true;
+    }
+    if (target.name.len == 0) {
+        return false;
+    }
+    if (std.mem.eql(u8, source.name, target.name) and source.interface == target.interface) {
+        return true;
+    }
+    for (source.bases) |base| {
+        if (objectDerivesFrom(base, target)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// tsc's `getNarrowedType` for a type guard: when it passes, the members of `t` that are a `T`

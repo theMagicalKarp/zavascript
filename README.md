@@ -21,9 +21,10 @@ $ echo 'console.log("a" * 2)' | zavascript
 > zavascript is early. Today it runs `let` and `const`, every operator
 > including assignment, `in`, `delete`, optional chaining and `??`, `if`, the
 > loops (including `for...of` over arrays, strings, maps, sets and iterators,
-> and `for...in`), `switch`, labeled `break`/`continue`, `throw`, functions
-> (declarations, expressions and arrows, with closures, default, optional and
-> rest parameters, spread arguments, and recursion), object and array literals
+> and `for...in`), `switch`, labeled `break`/`continue`, `throw` and
+> `try`/`catch`/`finally`, functions (declarations, expressions and arrows,
+> with closures, default, optional and rest parameters, spread arguments, and
+> recursion), object and array literals
 > (with shorthand, computed keys, methods and spread), and destructuring with
 > defaults and rest in declarations and parameters. The checker covers
 > primitive, literal, union, array, tuple, object and function types,
@@ -33,7 +34,8 @@ $ echo 'console.log("a" * 2)' | zavascript
 > typing, `as`, `as const`, `satisfies` and `!`, and tsc's narrowing: by
 > assignment, truthiness, `===`/`==`, `typeof`, `in`, discriminant properties,
 > `switch`, control flow, and type guards (written as `x is T`, or inferred
-> the way tsc 5.5 does, so `xs.filter((x) => x !== null)` narrows). Generic
+> the way tsc 5.5 does, so `xs.filter((x) => x !== null)` narrows), and
+> `instanceof`. A `catch` binding is `unknown`, as under `strict`. Generic
 > functions, interfaces and type aliases work too, with constraints, defaults,
 > explicit type arguments and tsc's inference, as do `keyof`, indexed access
 > types, `typeof` in types, mapped types, `readonly` arrays, `Partial`,
@@ -44,10 +46,13 @@ $ echo 'console.log("a" * 2)' | zavascript
 > `Array.prototype`, `String.prototype` (with UTF-16 indices), `Math` (with
 > V8's fdlibm results), `Number`, `Boolean`, `Object` (`keys`, `values`,
 > `entries`, `assign`, `freeze`, `fromEntries`, `hasOwn`), `JSON`, `Map`,
-> `Set`, their iterators, and `console` (`log` and friends with format
-> specifiers, `group`, `count`, `assert`, `dir`), all printing the way node
-> does. Classes are coming. Anything not supported yet, like `Date` or
-> `RegExp`, is a compile error (`ZV9001`), never a silent misbehavior.
+> `Set`, their iterators, `Error` and its subclasses (which the runtime's own
+> `TypeError`s and `RangeError`s are, so they can be caught), and `console`
+> (`log` and friends with format specifiers, `group`, `count`, `assert`,
+> `dir`), all printing the way node does. An uncaught exception is reported the way node reports it, with a
+> stack trace, and exits with 1. Classes are coming. Anything not supported
+> yet, like `Date` or `RegExp`, is a compile error (`ZV9001`), never a silent
+> misbehavior.
 
 ## Usage
 
@@ -92,6 +97,10 @@ const result = runtime.run("rule.ts", source) catch |err| switch (err) {
         try runtime.diagnostics.render(stderr); // tsc-style, one per line
         return err;
     },
+    error.RuntimeError => {
+        try runtime.exception().?.render(stderr); // as node reports an uncaught exception
+        return err;
+    },
     else => return err,
 };
 ```
@@ -107,9 +116,11 @@ comments:
 ```ts
 console.log(1 + 2 * 3); //> 7
 console.log("a" * 2); //! TS2362
+JSON.parse("{"); //!! SyntaxError: Expected property name or '}' in JSON at position 1 (line 1 column 2)
 ```
 
-`//>` is a line of expected output and `//!` lists the diagnostics expected on
-that line. `mise run test` checks zavascript against them, and `mise run oracle`
+`//>` is a line of expected output, `//!` lists the diagnostics expected on
+that line, and `//!!` is the uncaught exception the program ends with there. A
+case with diagnostics never runs, so it can't expect output or an exception. `mise run test` checks zavascript against them, and `mise run oracle`
 checks the expectations themselves against `tsc` and `node`, so a case can't
 encode behavior that TypeScript doesn't have.

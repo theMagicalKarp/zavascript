@@ -347,7 +347,8 @@ fn statement(this: *Parser) Error!*Stmt {
             try this.semicolon();
             return this.newStmt(tok.start, .{ .throw = value });
         },
-        .kw_try, .kw_with, .kw_debugger => {
+        .kw_try => return this.tryStatement(),
+        .kw_with, .kw_debugger => {
             return this.unsupported(tok.start, "'{s}' statements are", .{this.tokenText(tok)});
         },
         .kw_interface => return this.interfaceDeclaration(),
@@ -410,6 +411,37 @@ fn parenthesized(this: *Parser) Error!*Expr {
     const expr = try this.expression();
     _ = try this.expect(.r_paren);
     return expr;
+}
+
+fn tryStatement(this: *Parser) Error!*Stmt {
+    const start = this.advance().start;
+    const body = try this.block();
+    var handler: ?ast.Catch = null;
+    if (this.current().tag == .kw_catch) {
+        const catch_start = this.advance().start;
+        const scope = this.newScope();
+        var parameter: ?*const ast.Pattern = null;
+        var annotation: ?*const ast.TypeNode = null;
+        if (this.eat(.l_paren)) {
+            parameter = try this.bindingPattern();
+            if (this.current().tag == .colon) {
+                annotation = try this.typeAnnotation(this.advance().start);
+            }
+            if (this.current().tag == .equal) {
+                return this.fail(this.current().start, .ts(1197), "Catch clause variable cannot have an initializer.", .{});
+            }
+            _ = try this.expect(.r_paren);
+        }
+        handler = .{ .start = catch_start, .scope = scope, .parameter = parameter, .type = annotation, .block = try this.block() };
+    }
+    var finalizer: ?ast.Block = null;
+    if (this.eat(.kw_finally)) {
+        finalizer = try this.block();
+    }
+    if (handler == null and finalizer == null) {
+        return this.fail(this.current().start, .ts(1472), "'catch' or 'finally' expected.", .{});
+    }
+    return this.newStmt(start, .{ .@"try" = .{ .block = body, .handler = handler, .finalizer = finalizer } });
 }
 
 fn ifStatement(this: *Parser) Error!*Stmt {
@@ -1770,6 +1802,7 @@ fn binaryInfo(this: *Parser) ?BinaryInfo {
         .less => .{ .op = .less, .precedence = 8 },
         .less_equal => .{ .op = .less_equal, .precedence = 8 },
         .kw_in => .{ .op = .in, .precedence = 8 },
+        .kw_instanceof => .{ .op = .instanceof, .precedence = 8 },
         .less_less => .{ .op = .shift_left, .precedence = 9 },
         .greater => blk: {
             const op = this.greaterOperator() orelse unreachable;
@@ -1827,9 +1860,6 @@ fn binary(this: *Parser, min_precedence: u8) Error!*Expr {
         const tok = this.current();
         if (tok.tag == .kw_in and this.no_in) {
             return left;
-        }
-        if (tok.tag == .kw_instanceof) {
-            return this.unsupported(tok.start, "The '{s}' operator is", .{this.tokenText(tok)});
         }
         // `as` and `satisfies` bind like the relational operators.
         if ((this.isContextual(tok, "as") or this.isContextual(tok, "satisfies")) and !tok.newline_before) {
@@ -2226,6 +2256,7 @@ fn objectProperty(this: *Parser) Error!ast.ObjectProperty {
         },
         .l_paren, .less => {
             const f = try this.function(.expression, tok.start);
+            f.method = true;
             if (key == .name) {
                 f.inferred_name = key.name;
             }
@@ -2760,6 +2791,27 @@ fn renderStmt(writer: *std.Io.Writer, stmt: *const Stmt) std.Io.Writer.Error!voi
             try writer.writeAll("throw ");
             try sexpr(writer, e);
         },
+        .@"try" => |t| {
+            try writer.writeAll("try ");
+            try renderStmt(writer, &.{ .start = 0, .end = 0, .data = .{ .block = t.block } });
+            if (t.handler) |h| {
+                try writer.writeAll(" catch ");
+                if (h.parameter) |p| {
+                    try writer.writeAll("(");
+                    try renderPattern(writer, p);
+                    if (h.type) |annotation| {
+                        try writer.writeAll(": ");
+                        try renderType(writer, annotation);
+                    }
+                    try writer.writeAll(") ");
+                }
+                try renderStmt(writer, &.{ .start = 0, .end = 0, .data = .{ .block = h.block } });
+            }
+            if (t.finalizer) |f| {
+                try writer.writeAll(" finally ");
+                try renderStmt(writer, &.{ .start = 0, .end = 0, .data = .{ .block = f } });
+            }
+        },
         .@"break", .@"continue" => |j| {
             try writer.writeAll(if (stmt.data == .@"break") "break" else "continue");
             if (j.label) |label| {
@@ -2973,10 +3025,19 @@ test "statement errors" {
     try testing.expectEqualStrings("{ }\nc\n", try parsed.render());
 }
 
+test "try statements" {
+    try expectParse("try { a } catch (e) { b } finally { c }", "try { a } catch (e#0) { b } finally { c }\n");
+    try expectParse("try { a } catch { b }", "try { a } catch { b }\n");
+    try expectParse("try { a } catch ({ message }: any) { b }", "try { a } catch ({message: message#0}: any) { b }\n");
+    try expectParse("try {} finally {}", "try { } finally { }\n");
+    try expectParse("a instanceof b && c", "(&& (instanceof a b) c)\n");
+    try expectErrors("try {}", &.{1472});
+    try expectErrors("try {} catch (e = 1) {}", &.{1197});
+}
+
 test "unsupported syntax is reported and skipped" {
     try expectErrors("var x = 1", &.{9001});
     try expectErrors("let a: number & string", &.{9001});
-    try expectErrors("x instanceof y", &.{9001});
     try expectErrors("let a: typeof this", &.{9001});
     try expectErrors("[1, , 2]", &.{9001});
     try expectErrors("({ get a() { return 1 } })", &.{9001});

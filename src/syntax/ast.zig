@@ -53,6 +53,7 @@ pub const Stmt = struct {
         interface: *const Interface,
         type_alias: *const TypeAlias,
         throw: *Expr,
+        @"try": Try,
         /// `declare var x: T;` or `declare function f(): T;`, only in a `.d.ts` file.
         declare: *const Declare,
     };
@@ -177,6 +178,24 @@ pub const ArrayPattern = struct {
 pub const PatternElement = struct {
     pattern: *const Pattern,
     init: ?*Expr,
+};
+
+/// `try { } catch (e) { } finally { }`, with a `catch`, a `finally` or both.
+pub const Try = struct {
+    block: Block,
+    handler: ?Catch,
+    finalizer: ?Block,
+};
+
+pub const Catch = struct {
+    start: u32,
+    /// The scope of the parameter, around the block's own.
+    scope: u32,
+    /// Null for `catch { }`.
+    parameter: ?*const Pattern,
+    /// Only `any` or `unknown` are allowed (TS1196).
+    type: ?*const TypeNode,
+    block: Block,
 };
 
 pub const If = struct {
@@ -413,6 +432,8 @@ pub const Function = struct {
     /// Where the return type annotation starts, for TS2355 and TS2366.
     returns_start: u32,
     body: Body,
+    /// An object literal's method (`{ m() {} }`), which isn't a constructor.
+    method: bool = false,
 
     pub const Kind = enum { declaration, expression, arrow };
 
@@ -590,6 +611,8 @@ pub const BinaryOp = enum {
     nullish,
     /// `key in object`
     in,
+    /// `object instanceof Constructor`
+    instanceof,
     /// The comma operator.
     comma,
 
@@ -619,6 +642,7 @@ pub const BinaryOp = enum {
             .logical_or => "||",
             .nullish => "??",
             .in => "in",
+            .instanceof => "instanceof",
             .comma => ",",
         };
     }

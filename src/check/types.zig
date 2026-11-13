@@ -279,6 +279,9 @@ pub const Object = struct {
     /// Declared by an interface, which (unlike an object literal or a type literal) doesn't get
     /// an implicit index signature: it isn't assignable to `{ [key: string]: T }`.
     interface: bool = false,
+    /// The interfaces an interface extends, for `instanceof` narrowing, which (like tsc) goes by
+    /// what's declared to derive from what rather than by structure.
+    bases: []const *const Object = &.{},
     /// For an instantiation of a generic interface or type alias (`Box<number>`), its type
     /// arguments; for the generic declaration itself, its own type parameters.
     type_arguments: []const *const Type = &.{},

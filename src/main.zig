@@ -123,7 +123,7 @@ fn runSource(runtime: *zavascript.Runtime, path: []const u8, source: []const u8,
         },
         error.RuntimeError => {
             try stdout.flush();
-            try stderr.print("{s}: {f}\n", .{ path, runtime.exception().? });
+            try runtime.exception().?.render(stderr);
             return 1;
         },
         else => return err,

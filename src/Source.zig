@@ -65,6 +65,19 @@ pub fn location(this: Source, offset: u32) Location {
     return .{ .line = @intCast(lo + 1), .column = @intCast(utf16Length(this.text[start..end]) + 1) };
 }
 
+/// The text of a 1-based line, without its line break.
+pub fn lineText(this: Source, line: u32) []const u8 {
+    const start = this.line_starts[line - 1];
+    var end: usize = if (line < this.line_starts.len) this.line_starts[line] else this.text.len;
+    while (end > start and (this.text[end - 1] == '\n' or this.text[end - 1] == '\r')) {
+        end -= 1;
+    }
+    if (end >= start + 3 and (std.mem.eql(u8, this.text[end - 3 .. end], "\u{2028}") or std.mem.eql(u8, this.text[end - 3 .. end], "\u{2029}"))) {
+        end -= 3;
+    }
+    return this.text[start..end];
+}
+
 /// The number of UTF-16 code units `bytes` would take; invalid bytes count as one each.
 fn utf16Length(bytes: []const u8) usize {
     var n: usize = 0;
@@ -88,4 +101,6 @@ test location {
     // '€' is 3 bytes but one UTF-16 unit; the emoji is 4 bytes and two units.
     try std.testing.expectEqual(Location{ .line = 4, .column = 2 }, source.location(13));
     try std.testing.expectEqual(Location{ .line = 4, .column = 5 }, source.location(18));
+    try std.testing.expectEqualStrings("cd", source.lineText(2));
+    try std.testing.expectEqualStrings("€x\u{1F600}y", source.lineText(4));
 }
