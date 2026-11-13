@@ -141,10 +141,17 @@ fn fromEntries(it: *Interpreter, _: Value, args: []const Value) Error!Value {
     return .{ .object = o };
 }
 
+/// Whether an error has `name` as an own property that isn't enumerable.
+fn errorOwns(e: *const value.ErrorData, name: []const u8) bool {
+    return (std.mem.eql(u8, name, "stack") and e.stack != null) or
+        (std.mem.eql(u8, name, "message") and e.message != null) or
+        (std.mem.eql(u8, name, "cause") and e.cause != null);
+}
+
 /// Whether `v` has an own property called `name`.
 fn hasOwnName(it: *Interpreter, v: Value, name: []const u8) Error!bool {
     return switch (v) {
-        .object => |o| o.properties.contains(name),
+        .object => |o| o.properties.contains(name) or (o.internal == .@"error" and errorOwns(o.internal.@"error", name)),
         .array => |a| std.mem.eql(u8, name, "length") or if (value.arrayIndex(name)) |i| i < a.items().len else false,
         .string => |s| std.mem.eql(u8, name, "length") or if (value.arrayIndex(name)) |i| i < strings.lengthOf(it, s) else false,
         .function, .native_function => std.mem.eql(u8, name, "name") or std.mem.eql(u8, name, "length"),

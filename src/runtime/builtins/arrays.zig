@@ -536,7 +536,7 @@ fn from(it: *Interpreter, _: Value, args: []const Value) Error!Value {
     var out: std.ArrayList(Value) = .empty;
     const iterable = switch (items) {
         .array, .string => true,
-        .object => |o| o.internal != .none,
+        .object => |o| o.internal != .none and o.internal != .@"error",
         .undefined, .null => return it.throw(.TypeError, "{s} is not iterable (cannot read property Symbol(Symbol.iterator))", .{try native.typed(it, items)}),
         else => false,
     };

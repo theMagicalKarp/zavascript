@@ -6,6 +6,7 @@
 //! defer runtime.deinit();
 //! _ = runtime.run("main.ts", source) catch |err| switch (err) {
 //!     error.CompileError => try runtime.diagnostics.render(stderr),
+//!     error.RuntimeError => try runtime.exception().?.render(stderr),
 //!     else => return err,
 //! };
 //! ```
@@ -118,7 +119,7 @@ pub fn compile(this: *Runtime, path: []const u8, text: []const u8) Error!Program
         this.diagnostics.sort();
         return error.CompileError;
     }
-    return .{ .ast = program, .resolved = resolved, .text = source.text };
+    return .{ .ast = program, .resolved = resolved, .text = source.text, .source = source };
 }
 
 /// Declares what `lib.d.ts` does, for every program after.
@@ -243,6 +244,85 @@ test "runtime errors" {
     try expectThrows("const a: { b: number } | undefined = undefined as { b: number } | undefined; a!.b", "Uncaught TypeError: Cannot read properties of undefined (reading 'b')");
 }
 
+fn expectReport(source: []const u8, expected: []const u8) !void {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var runtime: Runtime = try .init(testing.allocator, .{ .stdout = &out.writer, .stderr = &out.writer });
+    defer runtime.deinit();
+    try testing.expectError(error.RuntimeError, runtime.run("main.ts", source));
+    var report: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer report.deinit();
+    try runtime.exception().?.render(&report.writer);
+    try testing.expectEqualStrings(expected, report.written());
+}
+
+test "uncaught exceptions are reported the way node reports them" {
+    try expectReport(
+        \\function f(o: any) {
+        \\  return o.a.b;
+        \\}
+        \\const g = () => f({});
+        \\g();
+    ,
+        \\main.ts:2
+        \\  return o.a.b;
+        \\  ^
+        \\
+        \\TypeError: Cannot read properties of undefined (reading 'b')
+        \\    at f (main.ts:2:3)
+        \\    at g (main.ts:4:17)
+        \\    at main.ts:5:1
+        \\
+    );
+    try expectReport("const e = new Error('x');\n(e as any).code = 1;\nthrow e;",
+        \\main.ts:3
+        \\throw e;
+        \\^
+        \\
+        \\Error: x
+        \\    at main.ts:1:1 {
+        \\  code: 1
+        \\}
+        \\
+    );
+    try expectReport("  throw 'plain';",
+        \\main.ts:1
+        \\  throw 'plain';
+        \\  ^
+        \\plain
+        \\
+    );
+    try expectReport("throw [1, { a: 'b' }];",
+        \\main.ts:1
+        \\throw [1, { a: 'b' }];
+        \\^
+        \\[ 1, { a: 'b' } ]
+        \\
+    );
+    try expectReport("const a: any = [1];\na.copyWithin(0, 0);", "main.ts(2,1): error ZV9001: 'copyWithin' of a object is not supported yet.\n");
+}
+
+test "stack traces stop after ten calls" {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var runtime: Runtime = try .init(testing.allocator, .{ .stdout = &out.writer, .stderr = &out.writer });
+    defer runtime.deinit();
+    const v = try runtime.run("main.ts", "function f(n: number): string | undefined { return n === 0 ? new Error('deep').stack : f(n - 1); } f(20)");
+    try testing.expectEqual(10, std.mem.count(u8, v.string, "\n"));
+    try testing.expect(std.mem.startsWith(u8, v.string, "Error: deep\n    at f (main.ts:1:45)\n"));
+}
+
+test "exceptions don't stop the REPL" {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var runtime: Runtime = try .init(testing.allocator, .{ .stdout = &out.writer, .stderr = &out.writer });
+    defer runtime.deinit();
+    try testing.expectError(error.RuntimeError, runtime.run("repl", "function boom(): never { throw new TypeError('boom'); }; boom()"));
+    try testing.expectFmt("Uncaught TypeError: boom", "{f}", .{runtime.exception().?});
+    try testing.expectEqualStrings("caught boom", (try runtime.run("repl", "let m = ''; try { boom(); } catch (e) { if (e instanceof Error) { m = 'caught ' + e.message; } } m")).string);
+    try testing.expectEqual(null, runtime.exception());
+}
+
 test "string methods remember the last long string" {
     var stdout: std.Io.Writer.Allocating = .init(testing.allocator);
     defer stdout.deinit();
@@ -309,6 +389,9 @@ test "runtime errors in builtins" {
     try expectThrows("(Object.freeze([1]) as number[]).push(2)", "Uncaught TypeError: Cannot add property 1, object is not extensible");
     try expectThrows("JSON.parse('{a')", "Uncaught SyntaxError: Expected property name or '}' in JSON at position 1 (line 1 column 2)");
     try expectThrows("JSON.parse('')", "Uncaught SyntaxError: Unexpected end of JSON input");
+    try expectThrows("JSON.parse('{')", "Uncaught SyntaxError: Expected property name or '}' in JSON at position 1 (line 1 column 2)");
+    try expectThrows("JSON.parse('{\"a\":1,}')", "Uncaught SyntaxError: Expected double-quoted property name in JSON at position 7 (line 1 column 8)");
+    try expectThrows("JSON.parse('{\"a\"')", "Uncaught SyntaxError: Expected ':' after property name in JSON at position 4 (line 1 column 5)");
     try expectThrows("JSON.parse('[1,]')", "Uncaught SyntaxError: Unexpected token ']', \"[1,]\" is not valid JSON");
     try expectThrows("JSON.parse('abcdefghijklmnopqrstuvwxyz')", "Uncaught SyntaxError: Unexpected token 'a', \"abcdefghij\"... is not valid JSON");
     try expectThrows("JSON.parse('1 2')", "Uncaught SyntaxError: Unexpected non-whitespace character after JSON at position 2 (line 1 column 3)");

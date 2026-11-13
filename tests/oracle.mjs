@@ -2,6 +2,10 @@
 // diagnostics (code and line), and node must print exactly the `//>` lines. A case only proves
 // zavascript right if its expectations are right, and this is what keeps them honest.
 //
+// A `//!!` line expects node to end with that exception, thrown from that line: node has to exit
+// with 1 and print the text (an error's `Name: message`, or the value) on a line of its own, and
+// say the exception was thrown on that line, or that its stack's first frame in the case is there.
+//
 // `ZV` codes are ours and tsc never reports them, so for a case that expects one, the oracle only
 // checks that tsc reports the case's TS codes (usually none) and skips running it.
 //
@@ -11,7 +15,7 @@ import { spawn } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";
 import { availableParallelism } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const casesDir = path.join(root, "tests", "cases");
@@ -29,6 +33,7 @@ function findCases(dir) {
 function parseExpectation(source) {
   const stdout = [];
   const diagnostics = [];
+  let exception = null;
   source.split("\n").forEach((raw, i) => {
     const line = raw.replace(/\r$/, "");
     const out = line.indexOf("//>");
@@ -38,6 +43,13 @@ function parseExpectation(source) {
       stdout.push(text + "\n");
       return;
     }
+    const thrown = line.indexOf("//!!");
+    if (thrown >= 0) {
+      let text = line.slice(thrown + 4);
+      if (text.startsWith(" ")) text = text.slice(1);
+      exception = { line: i + 1, text };
+      return;
+    }
     const err = line.indexOf("//!");
     if (err >= 0) {
       for (const code of line.slice(err + 3).trim().split(/\s+/).filter(Boolean)) {
@@ -45,7 +57,7 @@ function parseExpectation(source) {
       }
     }
   });
-  return { stdout: stdout.join(""), diagnostics: diagnostics.sort() };
+  return { stdout: stdout.join(""), diagnostics: diagnostics.sort(), exception };
 }
 
 const cases = findCases(casesDir)
@@ -103,13 +115,39 @@ async function worker() {
     }
     if (c.diagnostics.length > 0) continue;
     const result = await run("node", ["--no-warnings", c.file]);
-    if (result.code !== 0) {
+    if (c.exception) {
+      const problem = checkException(c, result);
+      if (problem) {
+        failures.push(`${c.name}: ${problem}\n${result.stderr}`);
+        continue;
+      }
+    } else if (result.code !== 0) {
       failures.push(`${c.name}: node exited with ${result.code}\n${result.stderr}`);
-    } else if (result.stdout !== c.stdout) {
+      continue;
+    }
+    if (result.stdout !== c.stdout) {
       failures.push(`${c.name}: node output differs\n--- expected\n${c.stdout}--- node\n${result.stdout}`);
     }
   }
 }
+
+/** Whether node ended the way a `//!!` case expects; what's wrong if not. */
+function checkException(c, result) {
+  if (result.code !== 1) return `node exited with ${result.code}, not 1 for an uncaught exception`;
+  const lines = result.stderr.split("\n");
+  if (!lines.includes(c.exception.text)) return `node didn't print the exception \`${c.exception.text}\``;
+  // Node starts with where it was thrown, unless that's in native code (like `JSON.parse`).
+  const url = pathToFileURL(c.file).href;
+  const header = lines.find((line) => line.length > 0);
+  let line = header.startsWith(`${url}:`) ? Number(header.slice(url.length + 1)) : null;
+  if (line === null) {
+    const frame = lines.find((l) => l.includes(`${url}:`));
+    line = frame ? parseInt(frame.slice(frame.indexOf(`${url}:`) + url.length + 1), 10) : null;
+  }
+  if (line !== c.exception.line) return `node threw it from line ${line}, not ${c.exception.line}`;
+  return null;
+}
+
 await Promise.all(Array.from({ length: availableParallelism() }, worker));
 
 for (const failure of failures) console.log(`FAIL ${failure}\n`);

@@ -341,20 +341,17 @@ const Parser = struct {
             this.i += 1;
             return .{ .object = o };
         }
+        var first = true;
         while (true) {
             this.whitespace();
+            // V8 says where, even at the end of the input.
             if (this.i >= this.text.len or this.text[this.i] != '"') {
-                if (this.i >= this.text.len) {
-                    return this.unexpected();
-                }
-                return this.fail("Expected property name or '}}'");
+                return if (first) this.fail("Expected property name or '}}'") else this.fail("Expected double-quoted property name");
             }
+            first = false;
             const key = try this.parseString();
             this.whitespace();
             if (this.i >= this.text.len or this.text[this.i] != ':') {
-                if (this.i >= this.text.len) {
-                    return this.unexpected();
-                }
                 return this.fail("Expected ':' after property name");
             }
             this.i += 1;

@@ -54,6 +54,8 @@ scope: ?*Scope = null,
 flow: Flow,
 /// Enclosing statements that `break` and `continue` can jump to, innermost last.
 targets: std.ArrayList(Target) = .empty,
+/// The enclosing `try` blocks (and `catch` blocks with a `finally`), innermost last.
+tries: std.ArrayList(TryBlock) = .empty,
 /// Every enclosing label, for TS1114.
 labels: std.ArrayList([]const u8) = .empty,
 /// Names this program added to the session's top level, removed again if it doesn't check.
@@ -482,6 +484,14 @@ const Target = struct {
     continues: Flow = .unreachable_flow,
 };
 
+/// A `try` block being checked, and every state it could throw from: where it started, and after
+/// each assignment in it. tsc's catch clause is reached from those, as here.
+const TryBlock = struct {
+    /// The function it's in, since an assignment in a nested one doesn't happen here.
+    context: ?*Context,
+    throws: Flow,
+};
+
 /// The right operands of the `&&` expressions a condition is the left operand of, innermost first.
 const AndChain = struct {
     right: *const Expr,
@@ -689,6 +699,16 @@ fn setVariable(this: *Checker, slot: u32, t: *const Type) Error!void {
     if (this.flow.reachable) {
         this.flow.vars[slot] = .{ .initialized = true, .type = t };
         try this.forgetPaths(.{ .slot = slot });
+        try this.noteThrowPoint();
+    }
+}
+
+/// Anything after an assignment in a `try` block can throw, so the `catch` sees what it assigned.
+fn noteThrowPoint(this: *Checker) Error!void {
+    for (this.tries.items) |*t| {
+        if (t.context == this.context) {
+            try this.mergeInto(&t.throws, this.flow);
+        }
     }
 }
 
@@ -716,6 +736,7 @@ fn setPath(this: *Checker, reference: Reference, t: *const Type) Error!void {
     try paths.appendSlice(this.arena, this.flow.paths);
     try paths.append(this.arena, .{ .reference = reference, .type = t });
     this.flow.paths = paths.items;
+    try this.noteThrowPoint();
 }
 
 // Scopes and declarations
@@ -843,7 +864,11 @@ fn declareType(this: *Checker, stmt: *const Stmt) Error!void {
 }
 
 fn lookupType(this: *Checker, name: []const u8) ?*TypeDecl {
-    var scope = this.scope;
+    return this.lookupTypeIn(this.scope, name);
+}
+
+fn lookupTypeIn(this: *Checker, from: ?*Scope, name: []const u8) ?*TypeDecl {
+    var scope = from;
     while (scope) |s| : (scope = s.parent) {
         if (s.types.get(name)) |decl| {
             return decl;
@@ -982,6 +1007,7 @@ fn instantiateDecl(this: *Checker, decl: *TypeDecl, arguments: []const *const Ty
 
 /// Gives `object`, an instantiation of the generic `generic`, its members.
 fn instantiateMembers(this: *Checker, object: *types.Object, generic: *const types.Object, from: []const *const Type, to: []const *const Type) Error!void {
+    object.bases = generic.bases;
     object.properties = try this.instantiateProperties(generic.properties, from, to);
     object.calls = try this.instantiateSignatures(generic.calls, from, to);
     object.constructs = try this.instantiateSignatures(generic.constructs, from, to);
@@ -1114,7 +1140,12 @@ fn resolveDeclType(this: *Checker, decl: *TypeDecl, object: ?*types.Object) Erro
             var number_index = own.number_index;
             try calls.appendSlice(this.arena, own.calls);
             try constructs.appendSlice(this.arena, own.constructs);
-            for (i.extends) |base| {
+            // tsc gives an interface that extends itself, through any others, no bases.
+            const cyclic = try this.extendsItself(decl);
+            if (cyclic) {
+                try this.report(i.start, .ts(2310), "Type '{s}' recursively references itself as a base type.", .{i.name});
+            }
+            for (if (cyclic) &.{} else i.extends) |base| {
                 const bt = try this.resolveReference(base.start, base);
                 if (bt.* != .object) {
                     if (bt.* != .any) {
@@ -1131,6 +1162,7 @@ fn resolveDeclType(this: *Checker, decl: *TypeDecl, object: ?*types.Object) Erro
                 string_index = string_index orelse bt.object.string_index;
                 number_index = number_index orelse bt.object.number_index;
             }
+            object.?.bases = bases.items;
             object.?.calls = calls.items;
             object.?.constructs = constructs.items;
             object.?.string_index = string_index;
@@ -1164,6 +1196,37 @@ fn resolveDeclType(this: *Checker, decl: *TypeDecl, object: ?*types.Object) Erro
             return decl.resolved.?;
         },
     }
+}
+
+/// Whether the interface `decl` extends itself, directly or through the interfaces it extends.
+/// Worked out from the declarations, since the bases it would find are still being resolved.
+fn extendsItself(this: *Checker, decl: *TypeDecl) Error!bool {
+    var visited: std.ArrayList(*TypeDecl) = .empty;
+    var pending: std.ArrayList(*TypeDecl) = .empty;
+    try pending.append(this.arena, decl);
+    while (pending.pop()) |d| {
+        const interface = switch (d.node) {
+            .interface => |i| i,
+            else => continue,
+        };
+        next: for (interface.extends) |base| {
+            // A type parameter of the same name hides the interface.
+            for (interface.type_parameters) |p| {
+                if (std.mem.eql(u8, p.name, base.name)) {
+                    continue :next;
+                }
+            }
+            const found = this.lookupTypeIn(d.scope, base.name) orelse continue;
+            if (found == decl) {
+                return true;
+            }
+            if (std.mem.indexOfScalar(*TypeDecl, visited.items, found) == null) {
+                try visited.append(this.arena, found);
+                try pending.append(this.arena, found);
+            }
+        }
+    }
+    return false;
 }
 
 /// Adds a property, or replaces the one with the same name.
@@ -1913,14 +1976,8 @@ fn labeledStatement(this: *Checker, stmt: *const Stmt, labels: []const []const u
         .variable => |v| try this.variableStatement(v),
         .function => |f| _ = try this.checkFunction(f, null, .check),
         .@"return" => |value| try this.returnStatement(stmt, value),
-        .block => |b| {
-            try this.pushScope(b.scope, .block);
-            defer this.popScope();
-            try this.prescan(b.statements);
-            for (b.statements) |s| {
-                try this.statement(s);
-            }
-        },
+        .block => |b| try this.block(b),
+        .@"try" => |t| try this.tryStatement(t),
         .@"if" => |i| try this.ifStatement(i),
         .@"break" => |j| try this.jump(stmt, j, .@"break"),
         .@"continue" => |j| try this.jump(stmt, j, .@"continue"),
@@ -1933,6 +1990,104 @@ fn labeledStatement(this: *Checker, stmt: *const Stmt, labels: []const []const u
     if (labels.len > 0) {
         const target = this.targets.pop().?;
         try this.mergeInto(&this.flow, target.breaks);
+    }
+}
+
+fn block(this: *Checker, b: ast.Block) Error!void {
+    try this.pushScope(b.scope, .block);
+    defer this.popScope();
+    try this.prescan(b.statements);
+    for (b.statements) |s| {
+        try this.statement(s);
+    }
+}
+
+/// Checks the `try` block, then the `catch` block from every state the `try` block could throw
+/// from, then the `finally` block from every way into it.
+fn tryStatement(this: *Checker, t: ast.Try) Error!void {
+    try this.tries.append(this.arena, .{ .context = this.context, .throws = try this.copyFlow(this.flow) });
+    try this.block(t.block);
+    var throws = this.tries.pop().?.throws;
+    var normal = this.flow;
+    if (t.handler) |h| {
+        this.flow = try this.copyFlow(throws);
+        if (t.finalizer != null) {
+            try this.tries.append(this.arena, .{ .context = this.context, .throws = try this.copyFlow(throws) });
+        }
+        try this.catchClause(h);
+        if (t.finalizer != null) {
+            throws = this.tries.pop().?.throws;
+        }
+        try this.mergeInto(&normal, this.flow);
+    }
+    const finalizer = t.finalizer orelse {
+        this.flow = normal;
+        return;
+    };
+    // What follows only runs when the `try` (or `catch`) finished normally, so the `finally` is
+    // checked once from there for that, without its diagnostics, and once from everywhere for
+    // them.
+    var after: Flow = .unreachable_flow;
+    if (normal.reachable) {
+        const mark = this.diagnostics.items().len;
+        this.flow = try this.copyFlow(normal);
+        try this.block(finalizer);
+        after = this.flow;
+        this.diagnostics.truncate(mark);
+    }
+    try this.mergeInto(&throws, normal);
+    this.flow = throws;
+    try this.block(finalizer);
+    if (this.flow.reachable) {
+        this.flow = after;
+    }
+}
+
+fn catchClause(this: *Checker, h: ast.Catch) Error!void {
+    try this.pushScope(h.scope, .block);
+    defer this.popScope();
+    // With tsc's `useUnknownInCatchVariables`, which `strict` turns on.
+    var t = types.unknown;
+    if (h.type) |annotation| {
+        const declared = try this.resolveType(annotation);
+        if (declared.* == .any or declared.* == .unknown) {
+            t = declared;
+        } else {
+            try this.report(annotation.start, .ts(1196), "Catch clause variable type annotation must be 'any' or 'unknown' if specified.", .{});
+            t = types.any;
+        }
+    }
+    if (h.parameter) |p| {
+        try this.declarePattern(p, .let, p.start, null);
+        _ = try this.bindPattern(p, t, .{ .widen = false, .annotated = h.type != null });
+        try this.redeclaredInCatch(p, h.block);
+    }
+    try this.block(h.block);
+}
+
+/// The catch block can't declare a name its parameter does (TS2492). tsc doesn't say so for one
+/// in a destructuring pattern, which JavaScript doesn't allow either.
+fn redeclaredInCatch(this: *Checker, parameter: *const ast.Pattern, b: ast.Block) Error!void {
+    const names = try parameter.bindings(this.arena);
+    for (b.statements) |stmt| {
+        if (stmt.data != .variable) {
+            continue;
+        }
+        for (stmt.data.variable.declarators) |d| {
+            const declared = if (d.pattern) |p| try p.bindings(this.arena) else &[_]ast.Binding{.{ .name = d.name, .start = d.start, .binding = d.binding }};
+            for (declared) |n| {
+                for (names) |name| {
+                    if (!std.mem.eql(u8, n.name, name.name)) {
+                        continue;
+                    }
+                    if (parameter.data == .identifier) {
+                        try this.report(n.start, .ts(2492), "Cannot redeclare identifier '{s}' in catch clause.", .{n.name});
+                    } else {
+                        try this.unsupported(n.start, "'{s}' is already declared by the catch clause, which JavaScript doesn't allow.", .{n.name});
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2983,7 +3138,7 @@ const AssignmentScan = struct {
 
     fn statement(this: *AssignmentScan, s: *const Stmt, outer_end: ?u32, nested: bool) void {
         const counts = switch (s.data) {
-            .variable, .expression, .@"if", .do_while, .@"while", .@"for", .@"switch" => true,
+            .variable, .expression, .@"if", .do_while, .@"while", .@"for", .@"switch", .@"try" => true,
             else => false,
         };
         const outer = outer_end orelse if (counts and s.start > this.after) s.end else null;
@@ -3038,6 +3193,18 @@ const AssignmentScan = struct {
                 this.statement(f.body, outer, nested);
             },
             .labeled => |l| this.statement(l.body, outer, nested),
+            .@"try" => |t| {
+                this.statements(t.block.statements, outer, nested);
+                if (t.handler) |h| {
+                    if (h.parameter) |p| {
+                        this.pattern(p, outer, nested);
+                    }
+                    this.statements(h.block.statements, outer, nested);
+                }
+                if (t.finalizer) |f| {
+                    this.statements(f.statements, outer, nested);
+                }
+            },
             .@"switch" => |sw| {
                 this.expr(sw.discriminant, outer, nested);
                 for (sw.clauses) |clause| {
@@ -4183,6 +4350,7 @@ fn deleteExpression(this: *Checker, operand: *const Expr) Error!*const Type {
     const access = try this.propertyAccess(e) orelse return types.boolean;
     if (try this.referenceOf(e)) |r| {
         try this.forgetPaths(r);
+        try this.noteThrowPoint();
     }
     if (access.readonly) {
         try this.report(operand.start, .ts(2704), "The operand of a 'delete' operator cannot be a read-only property.", .{});
@@ -4215,6 +4383,7 @@ fn condition(this: *Checker, expr: *const Expr, if_body: ?*const Stmt, chain: ?*
             .logical_and, .logical_or, .nullish => return this.logical(b, if_body, chain),
             .equal, .not_equal, .strict_equal, .strict_not_equal => return this.equalityCondition(b),
             .in => return this.inCondition(b),
+            .instanceof => return this.instanceofCondition(b),
             else => {},
         },
         else => {},
@@ -4287,6 +4456,20 @@ fn inCondition(this: *Checker, b: ast.Binary) Error!Branches {
             .boolean => return branches,
         };
         try this.narrowBranches(&branches, b.right, .{ .in = name }, true);
+    }
+    return branches;
+}
+
+/// `x instanceof C` as a condition, which narrows `x` to (or away from) what `C` constructs.
+fn instanceofCondition(this: *Checker, b: ast.Binary) Error!Branches {
+    const left = try this.expression(b.left);
+    const right = try this.expression(b.right);
+    const operation = try this.operator(.instanceof, b.left, b.right, left, right, false);
+    var branches: Branches = .{ .type = types.boolean, .when_true = this.flow, .when_false = try this.copyFlow(this.flow) };
+    if (operation.ok) {
+        if (try this.instanceType(right)) |instance| {
+            try this.narrowBranches(&branches, b.left, .{ .instance = instance }, true);
+        }
     }
     return branches;
 }
@@ -4454,7 +4637,7 @@ fn impliesPresent(test_: narrowing.Test, assume: bool) bool {
             break :blk true;
         },
         .typeof => |name| assume != std.mem.eql(u8, name, "undefined"),
-        .in, .guard => false,
+        .in, .guard, .instance => false,
     };
 }
 
@@ -4566,7 +4749,7 @@ fn isPureTest(expr: *const Expr) bool {
         .index => |i| isPureTest(i.object) and isPureTest(i.index),
         .unary => |u| u.op != .delete and isPureTest(u.operand),
         .binary => |b| switch (b.op) {
-            .logical_and, .logical_or, .nullish, .equal, .not_equal, .strict_equal, .strict_not_equal, .in => isPureTest(b.left) and isPureTest(b.right),
+            .logical_and, .logical_or, .nullish, .equal, .not_equal, .strict_equal, .strict_not_equal, .in, .instanceof => isPureTest(b.left) and isPureTest(b.right),
             else => false,
         },
         else => false,
@@ -4735,6 +4918,7 @@ fn update(this: *Checker, u: ast.Update) Error!*const Type {
         const t = try this.writableProperty(operand) orelse return types.number;
         if (try this.referenceOf(operand)) |r| {
             try this.forgetPaths(r);
+            try this.noteThrowPoint();
         }
         if (!isNumeric(try this.checkNonNull(u.operand, t))) {
             try this.report(u.operand.start, .ts(2356), "An arithmetic operand " ++ arithmetic_operand, .{});
@@ -4856,6 +5040,7 @@ fn assignProperty(this: *Checker, a: ast.Assign, target: *const Expr) Error!*con
     };
     if (reference) |r| {
         try this.forgetPaths(r);
+        try this.noteThrowPoint();
     }
     const current = declared orelse types.any;
     const left = try types.widen(this.arena, current);
@@ -4901,6 +5086,19 @@ fn operator(this: *Checker, op: ast.BinaryOp, left_expr: *const Expr, right_expr
     const right = if (equality) given_right else try this.constrainedType(given_right);
     switch (op) {
         .comma => return .{ .type = right },
+        .instanceof => {
+            var ok = true;
+            if (!isInstanceOperand(left)) {
+                try this.report(left_expr.start, .ts(2358), "The left-hand side of an 'instanceof' expression must be of type 'any', an object type or a type parameter.", .{});
+                ok = false;
+            }
+            const r = try this.checkNonNull(right_expr, right);
+            if (!isAny(r) and !isConstructorType(r)) {
+                try this.report(right_expr.start, .ts(2359), "The right-hand side of an 'instanceof' expression must be either of type 'any', a class, a function, or other type assignable to the 'Function' interface type, or an object type with a 'Symbol.hasInstance' method.", .{});
+                ok = false;
+            }
+            return .{ .type = types.boolean, .ok = ok };
+        },
         .in => {
             var ok = true;
             if (!isAny(left) and !types.isStringLike(left) and !types.isNumberLike(left)) {
@@ -4988,6 +5186,57 @@ fn operator(this: *Checker, op: ast.BinaryOp, left_expr: *const Expr, right_expr
             return .{ .type = types.number, .ok = ok };
         },
     }
+}
+
+/// Whether `instanceof` can test a `t`: anything but a primitive.
+fn isInstanceOperand(t: *const Type) bool {
+    var buffer: [1]*const Type = undefined;
+    for (t.members(&buffer)) |m| {
+        switch (m.*) {
+            .any, .unknown, .object, .array, .tuple, .readonly_array, .function, .non_primitive, .intersection, .param, .keyof, .indexed => return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// Whether `instanceof` can test against a `t`: something callable or constructable, as tsc's
+/// `Function` interface is, or with a `prototype`, like the constructors in `lib.d.ts` that we
+/// can't call yet.
+fn isConstructorType(t: *const Type) bool {
+    var buffer: [1]*const Type = undefined;
+    for (t.members(&buffer)) |m| {
+        switch (m.*) {
+            .function => {},
+            .object => |o| if (o.calls.len == 0 and o.constructs.len == 0 and o.find("prototype") == null) {
+                return false;
+            },
+            else => return false,
+        }
+    }
+    return true;
+}
+
+/// What `x instanceof C` narrows `x` to: C's `prototype`, or else what its construct signatures
+/// return (tsc's `getTypeOfPropertyOfType(rightType, "prototype")` and
+/// `getInstanceTypeOfConstructSignatures`). Null when that's `any`, which narrows nothing.
+fn instanceType(this: *Checker, constructor: *const Type) Error!?*const Type {
+    if (constructor.* != .object) {
+        return null;
+    }
+    const o = constructor.object;
+    if (o.property("prototype")) |prototype| {
+        return if (prototype.* == .any) null else prototype;
+    }
+    if (o.constructs.len == 0) {
+        return null;
+    }
+    var list: std.ArrayList(*const Type) = .empty;
+    for (o.constructs) |f| {
+        try list.append(this.arena, f.returns);
+    }
+    const t = try types.unionOf(this.arena, list.items);
+    return if (t.* == .any) null else t;
 }
 
 /// `t` with its generic members replaced by their constraints, where they have one.
@@ -6817,6 +7066,9 @@ fn usesInStatement(this: *const Checker, stmt: *const Stmt, target: *const Expr)
         .labeled => |l| this.usesInStatement(l.body, target),
         .interface, .type_alias, .declare => false,
         .throw => |e| this.uses(e, target),
+        .@"try" => |t| this.usesInStatements(t.block.statements, target) or
+            (if (t.handler) |h| this.usesInStatements(h.block.statements, target) else false) or
+            (if (t.finalizer) |f| this.usesInStatements(f.statements, target) else false),
         .for_each => |f| (f.head == .target and this.uses(f.head.target, target)) or this.uses(f.right, target) or this.usesInStatement(f.body, target),
         .@"switch" => |sw| this.uses(sw.discriminant, target) or for (sw.clauses) |clause| {
             if (clause.case) |c| {

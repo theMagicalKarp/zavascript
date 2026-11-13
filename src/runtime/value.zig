@@ -87,7 +87,7 @@ pub const Value = union(enum) {
     /// object becomes its default string.
     pub fn toPrimitive(this: Value, allocator: std.mem.Allocator) ConvertError!Value {
         return switch (this) {
-            .object => |o| .{ .string = objectString(o) },
+            .object => |o| .{ .string = if (o.internal == .@"error") try errorString(allocator, o) else objectString(o) },
             .native_function => |f| .{ .string = f.source },
             .function => |f| .{ .string = try f.sourceText(allocator) },
             .array => |a| .{ .string = try a.join(allocator) },
@@ -169,11 +169,17 @@ pub const Object = struct {
         map: *Collection,
         set: *Collection,
         iterator: *Iterator,
+        @"error": *ErrorData,
     };
 
     pub fn get(this: *const Object, name: []const u8) Value {
         if (this.properties.get(name)) |v| {
             return v;
+        }
+        if (this.internal == .@"error") {
+            if (this.internal.@"error".get(name)) |v| {
+                return v;
+            }
         }
         if (this.methods) |methods| {
             if (methods.get(name)) |v| {
@@ -222,6 +228,107 @@ pub const Object = struct {
     };
 };
 
+/// The constructors of the builtin errors, which name them.
+pub const ErrorKind = enum {
+    Error,
+    EvalError,
+    RangeError,
+    ReferenceError,
+    SyntaxError,
+    TypeError,
+    URIError,
+};
+
+/// What an error object has besides its own enumerable properties. Its `message`, `stack` and
+/// `cause` are its own properties, but not enumerable ones; its `name` and `toString` come from
+/// its prototype.
+pub const ErrorData = struct {
+    kind: ErrorKind,
+    /// Null when it was made without one, so it has the prototype's `""`.
+    message: ?Value = null,
+    /// Null once it's been deleted.
+    stack: ?Value = null,
+    /// Null when it was made without one.
+    cause: ?Value = null,
+
+    /// One of its own properties that isn't enumerable, or one it inherits from its prototype.
+    pub fn get(this: *const ErrorData, name: []const u8) ?Value {
+        if (std.mem.eql(u8, name, "message")) {
+            return this.message orelse .{ .string = "" };
+        }
+        if (std.mem.eql(u8, name, "stack")) {
+            return this.stack;
+        }
+        if (std.mem.eql(u8, name, "name")) {
+            return .{ .string = @tagName(this.kind) };
+        }
+        if (std.mem.eql(u8, name, "cause")) {
+            return this.cause;
+        }
+        return null;
+    }
+
+    /// Assigns one of its own properties that isn't enumerable; false if `name` isn't one.
+    pub fn set(this: *ErrorData, name: []const u8, v: Value) bool {
+        if (std.mem.eql(u8, name, "message")) {
+            if (this.message == null) {
+                // The prototype's is inherited, so assigning makes an own, enumerable one.
+                return false;
+            }
+            this.message = v;
+        } else if (std.mem.eql(u8, name, "stack")) {
+            if (this.stack == null) {
+                // Deleted, so assigning makes an own, enumerable one.
+                return false;
+            }
+            this.stack = v;
+        } else if (std.mem.eql(u8, name, "cause") and this.cause != null) {
+            this.cause = v;
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    /// Deletes one of its own properties that isn't enumerable, if `name` is one.
+    pub fn delete(this: *ErrorData, name: []const u8) void {
+        if (std.mem.eql(u8, name, "message")) {
+            this.message = null;
+        } else if (std.mem.eql(u8, name, "stack")) {
+            this.stack = null;
+        } else if (std.mem.eql(u8, name, "cause")) {
+            this.cause = null;
+        }
+    }
+};
+
+/// Error.prototype.toString (§20.5.3.4) for an error object: `TypeError: message`, or just one of
+/// the two if the other is empty.
+pub fn errorString(allocator: std.mem.Allocator, o: *const Object) ConvertError![]const u8 {
+    // An error whose name or message is itself (or holds it) would recurse forever, where V8
+    // runs out of stack.
+    if (error_string_depth == max_error_string_depth) {
+        return error.NestedTooDeep;
+    }
+    error_string_depth += 1;
+    defer error_string_depth -= 1;
+    const name_value = o.get("name");
+    const message_value = o.get("message");
+    const name = if (name_value == .undefined) "Error" else try name_value.toString(allocator);
+    const message = if (message_value == .undefined) "" else try message_value.toString(allocator);
+    if (name.len == 0) {
+        return message;
+    }
+    if (message.len == 0) {
+        return name;
+    }
+    return std.fmt.allocPrint(allocator, "{s}: {s}", .{ name, message });
+}
+
+/// How many `errorString`s are in progress, each converting an error's name or message.
+threadlocal var error_string_depth: usize = 0;
+const max_error_string_depth = 1_000;
+
 /// What `String(o)` gives for an object: `[object Object]`, or `[object Map]` and so on for the
 /// builtin objects, by their `Symbol.toStringTag`.
 pub fn objectString(o: *const Object) []const u8 {
@@ -232,6 +339,7 @@ pub fn objectString(o: *const Object) []const u8 {
             "[object Object]",
         .map => "[object Map]",
         .set => "[object Set]",
+        .@"error" => "[object Error]",
         .iterator => |it| switch (it.source) {
             .array => "[object Array Iterator]",
             .string => "[object String Iterator]",
@@ -642,6 +750,7 @@ const Inspector = struct {
                 .none => this.formatObject(.{ .object = o }, depth),
                 .map, .set => |c| this.formatObject(.{ .collection = .{ .object = o, .entries = c, .map = o.internal == .map } }, depth),
                 .iterator => |it| this.formatIterator(o, it, depth),
+                .@"error" => this.formatObject(.{ .object = o }, depth),
             },
             .uninitialized => unreachable,
         };
@@ -709,6 +818,8 @@ const Inspector = struct {
         var open: []const u8 = "{";
         var close: []const u8 = "}";
         var keys: []const []const u8 = &.{};
+        // What an error shows before its own enumerable properties, if it has any.
+        var error_base: []const u8 = "";
         switch (container) {
             .array => |a| {
                 open = "[";
@@ -722,7 +833,12 @@ const Inspector = struct {
                     open = try std.fmt.allocPrint(this.allocator, "{s} {{", .{tag});
                 }
                 keys = try o.keys(this.allocator);
-                if (keys.len == 0) {
+                if (o.internal == .@"error") {
+                    error_base = try this.errorBase(o);
+                    if (keys.len == 0) {
+                        return error_base;
+                    }
+                } else if (keys.len == 0) {
                     return std.fmt.allocPrint(this.allocator, "{s}}}", .{open});
                 }
             },
@@ -791,12 +907,37 @@ const Inspector = struct {
                 });
             },
         }
-        var base: []const u8 = "";
+        var base: []const u8 = error_base;
         if (std.mem.indexOfScalar(*const anyopaque, this.circular.items, ptr)) |index| {
-            base = try std.fmt.allocPrint(this.allocator, "<ref *{d}>", .{index + 1});
+            base = try std.fmt.allocPrint(this.allocator, "<ref *{d}>{s}{s}", .{ index + 1, if (base.len > 0) " " else "", base });
         }
         _ = this.seen.pop();
         return this.reduceToSingleString(output.items, base, open, close, container, inner);
+    }
+
+    /// Node's `formatError`: an error's stack (or what `toString` gives, in brackets, if it has
+    /// no frames), with its lines indented as far as the error is.
+    fn errorBase(this: *Inspector, o: *const Object) InspectError![]const u8 {
+        const stack = o.get("stack");
+        var text = if (stack == .string and stack.string.len > 0) stack.string else errorString(this.allocator, o) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.NestedTooDeep => "Error",
+        };
+        if (std.mem.indexOf(u8, text, "\n    at") == null) {
+            text = try std.fmt.allocPrint(this.allocator, "[{s}]", .{text});
+        }
+        if (this.indentation == 0 or std.mem.indexOfScalar(u8, text, '\n') == null) {
+            return text;
+        }
+        var out: std.ArrayList(u8) = .empty;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        try out.appendSlice(this.allocator, lines.first());
+        while (lines.next()) |line| {
+            try out.append(this.allocator, '\n');
+            try out.appendNTimes(this.allocator, ' ', this.indentation);
+            try out.appendSlice(this.allocator, line);
+        }
+        return out.items;
     }
 
     /// A property's value or an array's element, indented two more than its container.

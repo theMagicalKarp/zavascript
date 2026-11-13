@@ -131,6 +131,7 @@ interface ObjectConstructor {
     fromEntries<T = any>(entries: Iterable<readonly [PropertyKey, T]>): { [k: string]: T };
     fromEntries(entries: Iterable<readonly any[]>): any;
     hasOwn(o: object, v: PropertyKey): boolean;
+    readonly prototype: Object;
 }
 
 declare var Object: ObjectConstructor;
@@ -365,6 +366,7 @@ interface ArrayConstructor {
     from<T>(arrayLike: ArrayLike<T>): T[];
     from<T, U>(arrayLike: ArrayLike<T>, mapfn: (v: T, k: number) => U, thisArg?: any): U[];
     of<T>(...items: T[]): T[];
+    readonly prototype: any[];
 }
 
 declare var Array: ArrayConstructor;
@@ -434,6 +436,101 @@ interface ReadonlySet<T> {
     keys(): SetIterator<T>;
     values(): SetIterator<T>;
 }
+
+// Errors. tsc's `lib.es5.d.ts` and `lib.es2022.error.d.ts`, merged.
+
+interface ErrorOptions {
+    cause?: unknown;
+}
+
+interface Error {
+    name: string;
+    message: string;
+    stack?: string;
+    cause?: unknown;
+}
+
+interface ErrorConstructor {
+    new (message?: string, options?: ErrorOptions): Error;
+    (message?: string, options?: ErrorOptions): Error;
+    new (message?: string): Error;
+    (message?: string): Error;
+    readonly prototype: Error;
+}
+
+declare var Error: ErrorConstructor;
+
+interface EvalError extends Error {}
+
+interface EvalErrorConstructor extends ErrorConstructor {
+    new (message?: string, options?: ErrorOptions): EvalError;
+    (message?: string, options?: ErrorOptions): EvalError;
+    new (message?: string): EvalError;
+    (message?: string): EvalError;
+    readonly prototype: EvalError;
+}
+
+declare var EvalError: EvalErrorConstructor;
+
+interface RangeError extends Error {}
+
+interface RangeErrorConstructor extends ErrorConstructor {
+    new (message?: string, options?: ErrorOptions): RangeError;
+    (message?: string, options?: ErrorOptions): RangeError;
+    new (message?: string): RangeError;
+    (message?: string): RangeError;
+    readonly prototype: RangeError;
+}
+
+declare var RangeError: RangeErrorConstructor;
+
+interface ReferenceError extends Error {}
+
+interface ReferenceErrorConstructor extends ErrorConstructor {
+    new (message?: string, options?: ErrorOptions): ReferenceError;
+    (message?: string, options?: ErrorOptions): ReferenceError;
+    new (message?: string): ReferenceError;
+    (message?: string): ReferenceError;
+    readonly prototype: ReferenceError;
+}
+
+declare var ReferenceError: ReferenceErrorConstructor;
+
+interface SyntaxError extends Error {}
+
+interface SyntaxErrorConstructor extends ErrorConstructor {
+    new (message?: string, options?: ErrorOptions): SyntaxError;
+    (message?: string, options?: ErrorOptions): SyntaxError;
+    new (message?: string): SyntaxError;
+    (message?: string): SyntaxError;
+    readonly prototype: SyntaxError;
+}
+
+declare var SyntaxError: SyntaxErrorConstructor;
+
+interface TypeError extends Error {}
+
+interface TypeErrorConstructor extends ErrorConstructor {
+    new (message?: string, options?: ErrorOptions): TypeError;
+    (message?: string, options?: ErrorOptions): TypeError;
+    new (message?: string): TypeError;
+    (message?: string): TypeError;
+    readonly prototype: TypeError;
+}
+
+declare var TypeError: TypeErrorConstructor;
+
+interface URIError extends Error {}
+
+interface URIErrorConstructor extends ErrorConstructor {
+    new (message?: string, options?: ErrorOptions): URIError;
+    (message?: string, options?: ErrorOptions): URIError;
+    new (message?: string): URIError;
+    (message?: string): URIError;
+    readonly prototype: URIError;
+}
+
+declare var URIError: URIErrorConstructor;
 
 // JSON
 

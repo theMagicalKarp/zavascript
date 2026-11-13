@@ -102,7 +102,7 @@ pub fn typed(it: *Interpreter, v: Value) Error![]const u8 {
 pub fn iterate(it: *Interpreter, v: Value) Error!Interpreter.Iteration {
     const iterable = switch (v) {
         .array, .string => true,
-        .object => |o| o.internal != .none,
+        .object => |o| o.internal != .none and o.internal != .@"error",
         else => false,
     };
     if (!iterable) {

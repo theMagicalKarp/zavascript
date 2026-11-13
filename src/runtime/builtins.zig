@@ -12,6 +12,7 @@ pub const native = @import("builtins/native.zig");
 pub const arrays = @import("builtins/arrays.zig");
 pub const collections = @import("builtins/collections.zig");
 pub const console = @import("builtins/console.zig");
+pub const errors = @import("builtins/errors.zig");
 pub const iterators = @import("builtins/iterators.zig");
 pub const json = @import("builtins/json.zig");
 pub const math = @import("builtins/math.zig");
@@ -58,6 +59,9 @@ pub fn install(it: *Interpreter) error{OutOfMemory}!void {
     };
     for (globals) |g| {
         try it.globals.put(it.arena, g[0], g[1]);
+    }
+    for (errors.constructors) |c| {
+        try it.globals.put(it.arena, c.native_function.name, c);
     }
 }
 
@@ -213,7 +217,8 @@ test "everything lib.d.ts declares is implemented, and nothing else" {
         const interface = d.type.data.reference.name;
         switch (global.?) {
             .native_function => |f| {
-                try expectMatches(arena, library, f.statics.?, &.{interface}, &.{});
+                // An error's `prototype` isn't an object we have.
+                try expectMatches(arena, library, f.statics.?, &.{interface}, &.{"prototype"});
                 try expectIn("callable but not declared so, or the other way round", d.name, (library.signatures(interface, .call) > 0) == (f.call != null));
                 try expectIn("constructable but not declared so, or the other way round", d.name, (library.signatures(interface, .construct) > 0) == (f.construct != null));
             },
@@ -248,6 +253,7 @@ test "everything lib.d.ts declares is implemented, and nothing else" {
     try expectMatches(arena, library, &collections.map_methods, &.{ "ReadonlyMap", "Map" }, &.{"size"});
     try expectMatches(arena, library, &collections.set_methods, &.{"Set"}, &.{"size"});
     try expectMatches(arena, library, &collections.set_methods, &.{ "ReadonlySet", "Set" }, &.{"size"});
+    try expectMatches(arena, library, &errors.methods, &.{ "Error", "Object" }, &.{ "name", "message", "stack", "cause" });
     for ([_][]const u8{ "ArrayIterator", "MapIterator", "SetIterator", "StringIterator" }) |name| {
         try expectMatches(arena, library, &iterators.methods, &.{name}, &.{});
     }
