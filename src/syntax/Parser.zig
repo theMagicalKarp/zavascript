@@ -30,6 +30,9 @@ function_count: u32 = 0,
 type_spans: std.ArrayList(ast.Span) = .empty,
 /// Set while parsing a `for` head, where `in` starts a `for...in` instead of being an operator.
 no_in: bool = false,
+/// A `.d.ts` file, which only declares things: `declare`, overloads, intersections and
+/// `[Symbol.iterator]` members are allowed there.
+ambient: bool = false,
 
 /// `error.Syntax` unwinds to the enclosing statement, which reports nothing more and resyncs.
 const Error = error{ OutOfMemory, Syntax };
@@ -39,7 +42,7 @@ const Error = error{ OutOfMemory, Syntax };
 pub fn parse(gpa: std.mem.Allocator, arena: std.mem.Allocator, source: *const Source, diagnostics: *diagnostic.Diagnostics) error{OutOfMemory}!ast.Program {
     const tokens = try Lexer.tokenize(gpa, source, diagnostics);
     defer gpa.free(tokens);
-    var parser: Parser = .{ .arena = arena, .source = source, .diagnostics = diagnostics, .tokens = tokens };
+    var parser: Parser = .{ .arena = arena, .source = source, .diagnostics = diagnostics, .tokens = tokens, .ambient = std.mem.endsWith(u8, source.path, ".d.ts") };
     return parser.program();
 }
 
@@ -357,6 +360,9 @@ fn statement(this: *Parser) Error!*Stmt {
             if (starts_declaration and this.isContextual(tok, "type")) {
                 return this.typeAlias();
             }
+            if (starts_declaration and this.ambient and this.isContextual(tok, "declare")) {
+                return this.declaration();
+            }
             for ([_][]const u8{ "declare", "namespace", "module", "abstract", "async" }) |word| {
                 if (starts_declaration and this.isContextual(tok, word)) {
                     return this.unsupported(tok.start, "'{s}' declarations are", .{word});
@@ -642,6 +648,34 @@ fn typeAlias(this: *Parser) Error!*Stmt {
     return this.newStmt(start, .{ .type_alias = node });
 }
 
+/// `declare var x: T;`, `declare const x: T;` or `declare function f(x: T): R;`, in a `.d.ts`
+/// file.
+fn declaration(this: *Parser) Error!*Stmt {
+    const start = this.advance().start;
+    const keyword = this.advance();
+    const is_function = switch (keyword.tag) {
+        .kw_var, .kw_let, .kw_const => false,
+        .kw_function => true,
+        else => return this.unsupported(keyword.start, "'declare {s}' declarations are", .{this.tokenText(keyword)}),
+    };
+    const name = try this.expect(.identifier);
+    const t = if (is_function) blk: {
+        const at = this.current().start;
+        const type_parameters = try this.genericParameters(false);
+        const parameters = try this.typeParameters();
+        _ = try this.expect(.colon);
+        const returns = try this.returnType();
+        break :blk try this.newType(at, .{ .function = .{ .type_parameters = type_parameters, .parameters = parameters, .returns = returns } });
+    } else blk: {
+        _ = try this.expect(.colon);
+        break :blk try this.typeNode();
+    };
+    try this.semicolon();
+    const node = try this.arena.create(ast.Declare);
+    node.* = .{ .name = this.tokenText(name), .start = name.start, .type = t, .function = is_function };
+    return this.newStmt(start, .{ .declare = node });
+}
+
 /// The name of an interface or type alias, which can't be one of the built-in types' names.
 fn declarationName(this: *Parser, comptime what: []const u8) Error!Token {
     const name = this.current();
@@ -671,15 +705,48 @@ fn typeMembers(this: *Parser) Error![]const ast.TypeMember {
         if ((this.isContextual(tok, "get") or this.isContextual(tok, "set")) and startsPropertyName(this.peekToken(1).tag)) {
             return this.unsupported(tok.start, "Accessors are", .{});
         }
+        if (tok.tag == .l_paren or tok.tag == .less or (tok.tag == .kw_new and (this.peekToken(1).tag == .l_paren or this.peekToken(1).tag == .less))) {
+            const construct = tok.tag == .kw_new;
+            if (construct) {
+                _ = this.advance();
+            }
+            const start = this.current().start;
+            const type_parameters = try this.genericParameters(false);
+            const parameters = try this.typeParameters();
+            const returns = if (this.eat(.colon)) try this.returnType() else null;
+            const signature = try this.newType(start, .{ .function = .{ .type_parameters = type_parameters, .parameters = parameters, .returns = returns } });
+            try members.append(this.arena, .{ .name = "", .start = tok.start, .optional = false, .readonly = readonly, .method = true, .type = signature, .signature = if (construct) .construct else .call });
+            try this.memberSeparator();
+            continue;
+        }
+        if (tok.tag == .l_bracket and this.startsIndexSignature()) {
+            _ = this.advance();
+            const key_name = this.advance();
+            _ = try this.expect(.colon);
+            const key = try this.typeNode();
+            _ = try this.expect(.r_bracket);
+            _ = try this.expect(.colon);
+            const value = try this.typeNode();
+            try members.append(this.arena, .{ .name = this.tokenText(key_name), .start = tok.start, .optional = false, .readonly = readonly, .method = false, .type = value, .signature = .{ .index = key } });
+            try this.memberSeparator();
+            continue;
+        }
         const name: []const u8 = switch (tok.tag) {
             .identifier => this.tokenText(tok),
             .string => try Lexer.cook(this.arena, this.source.text, tok),
             .number => try number.toString(this.arena, number.parseLiteral(this.tokenText(tok))),
-            .l_bracket => return this.unsupported(tok.start, "Index signatures and computed property names are", .{}),
-            .l_paren, .less => return this.unsupported(tok.start, "Call signatures are", .{}),
-            else => if (tok.tag == .kw_new and (this.peekToken(1).tag == .l_paren or this.peekToken(1).tag == .less))
-                return this.unsupported(tok.start, "Construct signatures are", .{})
-            else if (tok.tag.isKeyword())
+            .l_bracket => blk: {
+                // A well-known symbol like `[Symbol.iterator]`, which the builtins need.
+                if (this.ambient and this.isContextual(this.peekToken(1), "Symbol") and this.peekToken(2).tag == .dot and this.peekToken(3).tag == .identifier and this.peekToken(4).tag == .r_bracket) {
+                    const symbol = this.peekToken(3);
+                    for (0..4) |_| {
+                        _ = this.advance();
+                    }
+                    break :blk try std.fmt.allocPrint(this.arena, "[Symbol.{s}]", .{this.tokenText(symbol)});
+                }
+                return this.unsupported(tok.start, "Computed property names are", .{});
+            },
+            else => if (tok.tag.isKeyword())
                 this.tokenText(tok)
             else
                 return this.fail(tok.start, .ts(1131), "Property or signature expected.", .{}),
@@ -692,7 +759,7 @@ fn typeMembers(this: *Parser) Error![]const ast.TypeMember {
                 const start = this.current().start;
                 const type_parameters = try this.genericParameters(false);
                 const parameters = try this.typeParameters();
-                const returns = if (this.eat(.colon)) try this.typeNode() else null;
+                const returns = if (this.eat(.colon)) try this.returnType() else null;
                 member.method = true;
                 member.type = try this.newType(start, .{ .function = .{ .type_parameters = type_parameters, .parameters = parameters, .returns = returns } });
             },
@@ -703,15 +770,48 @@ fn typeMembers(this: *Parser) Error![]const ast.TypeMember {
             else => {},
         }
         try members.append(this.arena, member);
-        if (!this.eat(.semicolon) and !this.eat(.comma)) {
-            const next = this.current();
-            if (next.tag != .r_brace and !next.newline_before) {
-                return this.fail(next.start, .ts(1005), "';' expected.", .{});
-            }
-        }
+        try this.memberSeparator();
     }
     _ = this.advance();
     return members.items;
+}
+
+/// What a `[Symbol.iterator]` member is named, which no identifier or string key can be.
+pub const symbol_iterator = "[Symbol.iterator]";
+
+/// The `;` or `,` after a member, which a line break can stand in for.
+fn memberSeparator(this: *Parser) Error!void {
+    if (!this.eat(.semicolon) and !this.eat(.comma)) {
+        const next = this.current();
+        if (next.tag != .r_brace and !next.newline_before) {
+            return this.fail(next.start, .ts(1005), "';' expected.", .{});
+        }
+    }
+}
+
+/// Whether the `[` at the current token starts an index signature, `[key: string]: T`.
+fn startsIndexSignature(this: *const Parser) bool {
+    const name = this.peekToken(1);
+    return (name.tag == .identifier or name.tag.isKeyword()) and this.peekToken(2).tag == .colon;
+}
+
+/// A return type annotation, which can be a type predicate: `x is T`.
+fn returnType(this: *Parser) Error!*const ast.TypeNode {
+    const tok = this.current();
+    const next = this.peekToken(1);
+    if ((tok.tag == .identifier or tok.tag == .kw_this) and this.isContextual(next, "is") and !next.newline_before) {
+        if (tok.tag == .kw_this) {
+            return this.unsupported(tok.start, "'this' type predicates are", .{});
+        }
+        _ = this.advance();
+        _ = this.advance();
+        const t = try this.typeNode();
+        return this.newType(tok.start, .{ .predicate = .{ .parameter = this.tokenText(tok), .type = t } });
+    }
+    if (this.isContextual(tok, "asserts") and (next.tag == .identifier or next.tag == .kw_this) and !next.newline_before) {
+        return this.unsupported(tok.start, "Assertion signatures are", .{});
+    }
+    return this.typeNode();
 }
 
 /// Whether a token can start a property name, as after `readonly` or `get`.
@@ -725,6 +825,13 @@ fn startsPropertyName(tag: Tag) bool {
 /// annotation starts (the `:`, or a parameter's `?`), for `Program.type_spans`.
 fn typeAnnotation(this: *Parser, span_start: u32) Error!*const ast.TypeNode {
     const node = try this.typeNode();
+    try this.type_spans.append(this.arena, .{ .start = span_start, .end = this.previousEnd() });
+    return node;
+}
+
+/// A function's return type annotation, after its `:`; see `typeAnnotation`.
+fn returnAnnotation(this: *Parser, span_start: u32) Error!*const ast.TypeNode {
+    const node = try this.returnType();
     try this.type_spans.append(this.arena, .{ .start = span_start, .end = this.previousEnd() });
     return node;
 }
@@ -744,16 +851,33 @@ fn typeNode(this: *Parser) Error!*const ast.TypeNode {
     if (this.current().tag == .ampersand) {
         return this.unsupported(this.current().start, "Union and intersection types are", .{});
     }
-    const first = try this.unionMember(leading);
+    const first = try this.intersection(leading);
     if (this.current().tag != .pipe) {
         return first;
     }
     var members: std.ArrayList(*const ast.TypeNode) = .empty;
     try members.append(this.arena, first);
     while (this.eat(.pipe)) {
-        try members.append(this.arena, try this.unionMember(true));
+        try members.append(this.arena, try this.intersection(true));
     }
     return this.newType(start, .{ .@"union" = members.items });
+}
+
+/// `A & B`, which binds tighter than `|`. Only a `.d.ts` file can have one so far.
+fn intersection(this: *Parser, in_union: bool) Error!*const ast.TypeNode {
+    const first = try this.unionMember(in_union);
+    if (this.current().tag != .ampersand) {
+        return first;
+    }
+    if (!this.ambient) {
+        return this.unsupported(this.current().start, "Intersection types are", .{});
+    }
+    var members: std.ArrayList(*const ast.TypeNode) = .empty;
+    try members.append(this.arena, first);
+    while (this.eat(.ampersand)) {
+        try members.append(this.arena, try this.unionMember(false));
+    }
+    return this.newType(first.start, .{ .intersection = members.items });
 }
 
 /// One member of a union type. A function type there has to be parenthesized (TS1385).
@@ -785,7 +909,11 @@ fn primaryType(this: *Parser) Error!*const ast.TypeNode {
                 }
                 switch (operand.data) {
                     .array => {},
-                    .tuple => return this.unsupported(tok.start, "Readonly tuple types are", .{}),
+                    // A `.d.ts` file only has them as parameters, where they're the same as
+                    // mutable ones for anything we can pass.
+                    .tuple => if (this.ambient) {
+                        return operand;
+                    } else return this.unsupported(tok.start, "Readonly tuple types are", .{}),
                     else => {
                         try this.report(tok.start, .ts(1354), "'readonly' type modifier is only permitted on array and tuple literal types.", .{});
                         return operand;
@@ -868,7 +996,6 @@ fn primaryType(this: *Parser) Error!*const ast.TypeNode {
                 _ = try this.expect(.r_bracket);
                 node = try this.newType(node.start, .{ .indexed = .{ .object = node, .index = index } });
             },
-            .ampersand => return this.unsupported(next.start, "Intersection types are", .{}),
             else => break,
         }
     }
@@ -921,7 +1048,7 @@ fn functionType(this: *Parser) Error!*const ast.TypeNode {
     const type_parameters = try this.genericParameters(false);
     const parameters = try this.typeParameters();
     _ = try this.expect(.arrow);
-    const returns = try this.typeNode();
+    const returns = try this.returnType();
     return this.newType(start, .{ .function = .{ .type_parameters = type_parameters, .parameters = parameters, .returns = returns } });
 }
 
@@ -1153,7 +1280,7 @@ fn function(this: *Parser, kind: ast.Function.Kind, start: u32) Error!*ast.Funct
     if (this.current().tag == .colon) {
         const colon = this.advance();
         returns_start = this.current().start;
-        returns = try this.typeAnnotation(colon.start);
+        returns = try this.returnAnnotation(colon.start);
     }
     if (this.current().tag != .l_brace and kind == .declaration) {
         return this.unsupported(start, "Function overloads are", .{});
@@ -1362,7 +1489,7 @@ fn arrowHead(this: *Parser) Error!?ArrowHead {
     if (this.current().tag == .colon) {
         const colon = this.advance();
         returns_start = this.current().start;
-        returns = try this.typeAnnotation(colon.start);
+        returns = try this.returnAnnotation(colon.start);
     }
     if (this.current().tag != .arrow) {
         return null;
@@ -1902,7 +2029,14 @@ fn arguments(this: *Parser) Error![]const *Expr {
     var args: std.ArrayList(*Expr) = .empty;
     while (this.current().tag != .r_paren) {
         switch (this.current().tag) {
-            .ellipsis => return this.unsupported(this.current().start, "Spread arguments are", .{}),
+            .ellipsis => {
+                const start = this.advance().start;
+                try args.append(this.arena, try this.newExpr(start, .{ .spread = try this.assignment() }));
+                if (!this.eat(.comma)) {
+                    break;
+                }
+                continue;
+            },
             .r_brace, .r_bracket, .semicolon, .eof => return this.fail(this.current().start, .ts(1135), "Argument expression expected.", .{}),
             else => {},
         }
@@ -1958,7 +2092,7 @@ fn primary(this: *Parser) Error!*Expr {
             return this.newExpr(tok.start, .{ .function = try this.function(.expression, tok.start) });
         },
         .kw_class => return this.unsupported(tok.start, "Class expressions are", .{}),
-        .kw_new => return this.unsupported(tok.start, "'new' expressions are", .{}),
+        .kw_new => return this.newExpression(),
         .kw_this => return this.unsupported(tok.start, "'this' is", .{}),
         .kw_super => return this.unsupported(tok.start, "'super' is", .{}),
         .kw_import => return this.unsupported(tok.start, "Dynamic import is", .{}),
@@ -1966,6 +2100,47 @@ fn primary(this: *Parser) Error!*Expr {
         .invalid => return error.Syntax, // already reported by the lexer
         else => return this.fail(tok.start, .ts(1109), "Expression expected.", .{}),
     }
+}
+
+/// `new C(arguments)`, `new C<T>(arguments)` or `new C`. What's constructed is a member expression
+/// without calls: `new a.b()` constructs `a.b`.
+fn newExpression(this: *Parser) Error!*Expr {
+    const start = this.advance().start;
+    if (this.current().tag == .dot) {
+        return this.unsupported(start, "'new.target' is", .{});
+    }
+    var callee = if (this.current().tag == .kw_new) try this.newExpression() else try this.primary();
+    while (true) {
+        const tok = this.current();
+        switch (tok.tag) {
+            .dot => {
+                _ = this.advance();
+                const name = this.current();
+                if (name.tag != .identifier and !name.tag.isKeyword()) {
+                    return this.fail(name.start, .ts(1003), "Identifier expected.", .{});
+                }
+                _ = this.advance();
+                callee = try this.newExpr(callee.start, .{ .member = .{ .object = callee, .property = this.tokenText(name), .property_start = name.start } });
+            },
+            .l_bracket => {
+                _ = this.advance();
+                const index = try this.expression();
+                _ = try this.expect(.r_bracket);
+                callee = try this.newExpr(callee.start, .{ .index = .{ .object = callee, .index = index } });
+            },
+            .question_dot => return this.fail(tok.start, .ts(1209), "Invalid optional chain from new expression. Did you mean to call '{s}()'?", .{this.source.text[callee.start..this.previousEnd()]}),
+            else => break,
+        }
+    }
+    var type_arguments: []const *const ast.TypeNode = &.{};
+    if (this.current().tag == .less) {
+        type_arguments = try this.callTypeArguments() orelse &.{};
+    }
+    var args: []const *Expr = &.{};
+    if (this.eat(.l_paren)) {
+        args = try this.arguments();
+    }
+    return this.newExpr(start, .{ .new = .{ .callee = callee, .type_arguments = type_arguments, .arguments = args } });
 }
 
 fn arrayLiteral(this: *Parser) Error!*Expr {
@@ -2102,6 +2277,19 @@ const testing = std.testing;
 /// Renders an expression fully parenthesized, so tests can check precedence and associativity.
 fn sexpr(writer: *std.Io.Writer, expr: *const Expr) std.Io.Writer.Error!void {
     switch (expr.data) {
+        .new => |n| {
+            try writer.writeAll("(new ");
+            try sexpr(writer, n.callee);
+            for (n.arguments) |a| {
+                try writer.writeAll(" ");
+                try sexpr(writer, a);
+            }
+            try writer.writeAll(")");
+        },
+        .spread => |inner| {
+            try writer.writeAll("...");
+            try sexpr(writer, inner);
+        },
         .number => |n| try number.format(writer, n),
         .string => |s| try writer.print("\"{s}\"", .{s}),
         .template => |t| {
@@ -2337,6 +2525,16 @@ fn renderFunction(writer: *std.Io.Writer, f: *const ast.Function) std.Io.Writer.
 
 fn renderType(writer: *std.Io.Writer, t: *const ast.TypeNode) std.Io.Writer.Error!void {
     switch (t.data) {
+        .intersection => |ms| for (ms, 0..) |m, i| {
+            if (i > 0) {
+                try writer.writeAll(" & ");
+            }
+            try renderType(writer, m);
+        },
+        .predicate => |p| {
+            try writer.print("{s} is ", .{p.parameter});
+            try renderType(writer, p.type);
+        },
         .keyword => |k| try writer.print("{t}", .{k}),
         .reference => |r| {
             try writer.writeAll(r.name);
@@ -2429,6 +2627,23 @@ fn renderType(writer: *std.Io.Writer, t: *const ast.TypeNode) std.Io.Writer.Erro
 fn renderMembers(writer: *std.Io.Writer, members: []const ast.TypeMember) std.Io.Writer.Error!void {
     try writer.writeAll("{");
     for (members) |m| {
+        switch (m.signature) {
+            .none => {},
+            .call, .construct => {
+                try writer.writeAll(if (m.signature == .call) " " else " new ");
+                try renderType(writer, m.type.?);
+                try writer.writeAll(";");
+                continue;
+            },
+            .index => |key| {
+                try writer.print(" {s}[{s}: ", .{ if (m.readonly) "readonly " else "", m.name });
+                try renderType(writer, key);
+                try writer.writeAll("]: ");
+                try renderType(writer, m.type.?);
+                try writer.writeAll(";");
+                continue;
+            },
+        }
         try writer.print(" {s}{s}{s}", .{ if (m.readonly) "readonly " else "", m.name, if (m.optional) "?" else "" });
         if (m.type) |t| {
             try writer.writeAll(if (m.method) "" else ": ");
@@ -2536,6 +2751,10 @@ fn renderStmt(writer: *std.Io.Writer, stmt: *const Stmt) std.Io.Writer.Error!voi
         .type_alias => |a| {
             try writer.print("type {s} = ", .{a.name});
             try renderType(writer, a.type);
+        },
+        .declare => |d| {
+            try writer.print("declare {s} {s}: ", .{ if (d.function) "function" else "var", d.name });
+            try renderType(writer, d.type);
         },
         .throw => |e| {
             try writer.writeAll("throw ");
@@ -2762,7 +2981,8 @@ test "unsupported syntax is reported and skipped" {
     try expectErrors("[1, , 2]", &.{9001});
     try expectErrors("({ get a() { return 1 } })", &.{9001});
     try expectErrors("let a: [number?]", &.{9001});
-    try expectErrors("let a: { [k: string]: number }", &.{9001});
+    try expectErrors("let a: { [Symbol.iterator](): void }", &.{9001});
+    try expectErrors("declare const x: number;", &.{9001});
     // A multi-line declaration is skipped as one unit.
     const parsed: *Parsed = try .init("class A {\n  x = 1;\n}\nconsole.log(2)");
     defer parsed.deinit();
@@ -2825,7 +3045,10 @@ test "type declarations" {
     try expectParse("type T = { a: [number, string][] }", "type T = { a: [number, string][]; }\n");
     try expectParse("let readonly: number; type\nx", "let readonly#0: number\ntype\nx\n");
     try expectErrors("type number = string", &.{2457});
-    try expectErrors("interface I { (): void }", &.{9001});
+    try expectParse("interface I { (x: number): void; new (): I; readonly [k: string]: number }", "interface I { (x: number) => void; new () => I; readonly [k: string]: number; }\n");
+    try expectParse("function f(x: unknown): x is string { return true }", "(fn f#0 (x#1: unknown): x is string { return true })\n");
+    try expectParse("new Map<string, number>(...xs)", "(new Map ...xs)\n");
+    try expectParse("new a.B", "(new (. a B))\n");
     try expectParse("type T = | 1 | -2 | \"a\" | true | null | string[]", "type T = 1 | -2 | \"a\" | true | null | string[]\n");
     try expectParse("type T = (A | B)[] | (() => C | D)", "type T = A | B[] | () => C | D\n");
     try expectErrors("type T = A | () => void", &.{1385});

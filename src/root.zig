@@ -33,5 +33,6 @@ test {
     std.testing.refAllDecls(syntax);
     std.testing.refAllDecls(check);
     std.testing.refAllDecls(runtime);
-    _ = @import("runtime/builtins/console.zig");
+    _ = @import("runtime/builtins.zig");
+    _ = @import("runtime/fdlibm.zig");
 }

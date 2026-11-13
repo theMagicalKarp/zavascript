@@ -20,27 +20,34 @@ $ echo 'console.log("a" * 2)' | zavascript
 > [!NOTE]
 > zavascript is early. Today it runs `let` and `const`, every operator
 > including assignment, `in`, `delete`, optional chaining and `??`, `if`, the
-> loops (including `for...of` over arrays and `for...in`), `switch`, labeled
-> `break`/`continue`, `throw`, functions (declarations, expressions and
-> arrows, with closures, default, optional and rest parameters, and
-> recursion), object and array literals (with shorthand, computed keys,
-> methods and spread), destructuring with defaults and rest in declarations
-> and parameters, and `console.log`, which prints nested values the way node
-> does. The checker covers primitive, literal, union, array, tuple, object and
-> function types, interfaces (with `extends`) and type aliases, optional and
-> `readonly` properties, structural assignability with tsc's excess and
-> missing property checks, definite assignment, contextual typing, `as`,
-> `as const`, `satisfies` and `!`, and tsc's narrowing: by assignment,
-> truthiness, `===`/`==`, `typeof`, `in`, discriminant properties, `switch`
-> and control flow (`return`, `throw` and calls of functions returning
-> `never`), for variables and their properties alike. Generic functions,
-> interfaces and type aliases work too, with constraints, defaults, explicit
-> type arguments and tsc's inference from arguments, callbacks and the
-> expected return type, as do `keyof`, indexed access types, `typeof` in
-> types, mapped types, `readonly` arrays, and `Partial`, `Required`,
-> `Readonly`, `Pick` and `Record` (declared in `lib.d.ts`). Classes and the
-> builtins are coming. Anything not supported yet is a compile error
-> (`ZV9001`), never a silent misbehavior.
+> loops (including `for...of` over arrays, strings, maps, sets and iterators,
+> and `for...in`), `switch`, labeled `break`/`continue`, `throw`, functions
+> (declarations, expressions and arrows, with closures, default, optional and
+> rest parameters, spread arguments, and recursion), object and array literals
+> (with shorthand, computed keys, methods and spread), and destructuring with
+> defaults and rest in declarations and parameters. The checker covers
+> primitive, literal, union, array, tuple, object and function types,
+> interfaces (with `extends`, call, construct and index signatures) and type
+> aliases, optional and `readonly` properties, structural assignability with
+> tsc's excess and missing property checks, definite assignment, contextual
+> typing, `as`, `as const`, `satisfies` and `!`, and tsc's narrowing: by
+> assignment, truthiness, `===`/`==`, `typeof`, `in`, discriminant properties,
+> `switch`, control flow, and type guards (written as `x is T`, or inferred
+> the way tsc 5.5 does, so `xs.filter((x) => x !== null)` narrows). Generic
+> functions, interfaces and type aliases work too, with constraints, defaults,
+> explicit type arguments and tsc's inference, as do `keyof`, indexed access
+> types, `typeof` in types, mapped types, `readonly` arrays, `Partial`,
+> `Required`, `Readonly`, `Pick` and `Record`.
+>
+> The builtins are declared in [`lib.d.ts`](src/lib/lib.d.ts), following
+> TypeScript's ES2022 library (overloads and all), and implemented natively:
+> `Array.prototype`, `String.prototype` (with UTF-16 indices), `Math` (with
+> V8's fdlibm results), `Number`, `Boolean`, `Object` (`keys`, `values`,
+> `entries`, `assign`, `freeze`, `fromEntries`, `hasOwn`), `JSON`, `Map`,
+> `Set`, their iterators, and `console` (`log` and friends with format
+> specifiers, `group`, `count`, `assert`, `dir`), all printing the way node
+> does. Classes are coming. Anything not supported yet, like `Date` or
+> `RegExp`, is a compile error (`ZV9001`), never a silent misbehavior.
 
 ## Usage
 

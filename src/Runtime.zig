@@ -38,6 +38,8 @@ pub const Options = struct {
     /// How much of the calling thread's stack the interpreter may use, in bytes. Deeper
     /// recursion throws a RangeError, as in node. Keep it well below the thread's stack size.
     max_stack: usize = 4 * 1024 * 1024,
+    /// Where `Math.random` starts. The same seed gives the same numbers.
+    random_seed: u64 = 0,
 };
 
 pub const Error = error{
@@ -62,12 +64,15 @@ pub fn init(gpa: std.mem.Allocator, options: Options) error{ OutOfMemory, WriteF
     errdefer gpa.destroy(arena);
     arena.* = .init(gpa);
     errdefer arena.deinit();
-    return .{
+    var runtime: Runtime = .{
         .gpa = gpa,
         .arena = arena,
         .diagnostics = .init(gpa),
-        .interpreter = try .init(arena.allocator(), options.stdout, options.stderr, options.max_stack),
+        .interpreter = try .init(arena.allocator(), options.stdout, options.stderr, options.max_stack, options.random_seed),
     };
+    errdefer runtime.diagnostics.deinit();
+    try runtime.declareLibrary();
+    return runtime;
 }
 
 pub fn deinit(this: *Runtime) void {
@@ -107,9 +112,6 @@ pub fn compile(this: *Runtime, path: []const u8, text: []const u8) Error!Program
     if (this.diagnostics.items().len > 0) {
         return error.CompileError;
     }
-    if (this.session.library == null) {
-        try this.declareLibrary();
-    }
     const resolved = try Checker.check(arena, source, &this.diagnostics, &this.session, program);
     if (this.diagnostics.items().len > 0) {
         // Like tsc, in source order; functions can be checked out of order.
@@ -120,7 +122,7 @@ pub fn compile(this: *Runtime, path: []const u8, text: []const u8) Error!Program
 }
 
 /// Declares what `lib.d.ts` does, for every program after.
-fn declareLibrary(this: *Runtime) Error!void {
+fn declareLibrary(this: *Runtime) error{OutOfMemory}!void {
     const arena = this.arena.allocator();
     const source = try arena.create(Source);
     source.* = try .init(arena, "lib.d.ts", @embedFile("lib/lib.d.ts"));
@@ -231,11 +233,28 @@ test "runtime errors" {
     try expectThrows("function g() { y = console.log('evaluated first'); } g(); let y: void;", "Uncaught ReferenceError: Cannot access 'y' before initialization");
     try expectThrows("let a: any = 1; a()", "Uncaught TypeError: a is not a function");
     try expectThrows("let a: any = undefined; a.b", "Uncaught TypeError: Cannot read properties of undefined (reading 'b')");
-    try expectThrows("let a: any = 1; a.b", "error ZV9001: Reading the property 'b' of a number is not supported yet.");
+    try expectThrows("let a: any = 1; a.toLocaleString()", "error ZV9001: 'toLocaleString' of a number is not supported yet.");
+    try expectThrows("let a: any = 1; a.b.c", "Uncaught TypeError: Cannot read properties of undefined (reading 'c')");
+    try expectThrows("const a: any = Map; a()", "Uncaught TypeError: Constructor Map requires 'new'");
+    try expectThrows("const a: any = Number; new a()", "error ZV9001: Constructing 'Number' is not supported yet.");
     try expectThrows("function f(x: number | null) { if (x === null) { throw 'no ' + x; } return x; } f(null)", "Uncaught no null");
     try expectThrows("throw { code: 1 }", "Uncaught { code: 1 }");
     // A non-null assertion checks nothing.
     try expectThrows("const a: { b: number } | undefined = undefined as { b: number } | undefined; a!.b", "Uncaught TypeError: Cannot read properties of undefined (reading 'b')");
+}
+
+test "string methods remember the last long string" {
+    var stdout: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stdout.deinit();
+    var runtime: Runtime = try .init(testing.allocator, .{ .stdout = &stdout.writer, .stderr = &stdout.writer });
+    defer runtime.deinit();
+    // A loop that indexes a long string would otherwise convert or scan all of it each time round.
+    _ = try runtime.run("test.ts", "const s = 'é'.repeat(300); let n = 0; for (let i = 0; i < s.length; i++) { n += s.charCodeAt(i); }");
+    const state = &runtime.interpreter.builtin_state;
+    try testing.expectEqual(600, state.text.bytes.len);
+    try testing.expectEqual(300, state.text.units.?.len);
+    try testing.expectEqual(600, state.length.bytes.len);
+    try testing.expectEqual(300, state.length.units);
 }
 
 test "union narrowing between runs" {
@@ -283,6 +302,47 @@ test "keeps types and objects between runs" {
     try testing.expectError(error.CompileError, runtime.run("repl", "let u: T"));
     try testing.expectEqual(2304, runtime.diagnostics.items()[0].code.number);
     _ = try runtime.run("repl", "type T = string");
+}
+
+test "runtime errors in builtins" {
+    try expectThrows("([] as number[]).reduce((a, b) => a + b)", "Uncaught TypeError: Reduce of empty array with no initial value");
+    try expectThrows("(Object.freeze([1]) as number[]).push(2)", "Uncaught TypeError: Cannot add property 1, object is not extensible");
+    try expectThrows("JSON.parse('{a')", "Uncaught SyntaxError: Expected property name or '}' in JSON at position 1 (line 1 column 2)");
+    try expectThrows("JSON.parse('')", "Uncaught SyntaxError: Unexpected end of JSON input");
+    try expectThrows("JSON.parse('[1,]')", "Uncaught SyntaxError: Unexpected token ']', \"[1,]\" is not valid JSON");
+    try expectThrows("JSON.parse('abcdefghijklmnopqrstuvwxyz')", "Uncaught SyntaxError: Unexpected token 'a', \"abcdefghij\"... is not valid JSON");
+    try expectThrows("JSON.parse('1 2')", "Uncaught SyntaxError: Unexpected non-whitespace character after JSON at position 2 (line 1 column 3)");
+    try expectThrows("const o: any = { a: { b: {} } }; o.a.b.c = o; JSON.stringify(o)",
+        \\Uncaught TypeError: Converting circular structure to JSON
+        \\    --> starting at object with constructor 'Object'
+        \\    |     property 'a' -> object with constructor 'Object'
+        \\    |     property 'b' -> object with constructor 'Object'
+        \\    --- property 'c' closes the circle
+    );
+    try expectThrows("(1).toFixed(101)", "Uncaught RangeError: toFixed() digits argument must be between 0 and 100");
+    try expectThrows("(255).toString(1)", "Uncaught RangeError: toString() radix argument must be between 2 and 36");
+    try expectThrows("'a'.repeat(-1)", "Uncaught RangeError: Invalid count value: -1");
+    try expectThrows("String.fromCodePoint(-1)", "Uncaught RangeError: Invalid code point -1");
+    try expectThrows("new Map([1] as any)", "Uncaught TypeError: Iterator value 1 is not an entry object");
+    try expectThrows("new Set(5 as any)", "Uncaught TypeError: number 5 is not iterable (cannot read property Symbol(Symbol.iterator))");
+    try expectThrows("[1].map(5 as any)", "Uncaught TypeError: number 5 is not a function");
+    try expectThrows("[1].sort(5 as any)", "Uncaught TypeError: The comparison function must be either a function or undefined: 5");
+    try expectThrows("Object.keys(undefined as any)", "Uncaught TypeError: Cannot convert undefined or null to object");
+    try expectThrows("JSON.parse('\"\\\\u+041\"')", "Uncaught SyntaxError: Bad Unicode escape in JSON at position 3 (line 1 column 4)");
+    try expectThrows("JSON.parse('\"\\\\u0_41\"')", "Uncaught SyntaxError: Bad Unicode escape in JSON at position 4 (line 1 column 5)");
+    // Recursing on a value's depth runs out of stack the way calls do.
+    try expectThrows("let a: any[] = []; for (let i = 0; i < 1e6; i++) { a = [a]; } String(a)", "Uncaught RangeError: Maximum call stack size exceeded");
+    try expectThrows("let a: any[] = []; for (let i = 0; i < 1e6; i++) { a = [a]; } `${[a]}`", "Uncaught RangeError: Maximum call stack size exceeded");
+    try expectThrows("let a: any[] = []; for (let i = 0; i < 1e6; i++) { a = [a]; } a.join('-')", "Uncaught RangeError: Maximum call stack size exceeded");
+    try expectThrows("let a: any[] = []; for (let i = 0; i < 1e6; i++) { a = [a]; } [a].map(String)", "Uncaught RangeError: Maximum call stack size exceeded");
+    try expectThrows("JSON.parse('['.repeat(1e6) + ']'.repeat(1e6))", "Uncaught RangeError: Maximum call stack size exceeded");
+    try expectThrows("let a: any[] = []; for (let i = 0; i < 1e6; i++) { a = [a]; } JSON.stringify(a)", "Uncaught RangeError: Maximum call stack size exceeded");
+    try expectThrows("const a: any[] = []; a.push(a); a.flat(Infinity)", "Uncaught RangeError: Maximum call stack size exceeded");
+    try expectThrows("Object.assign(Object.freeze([1]) as any, { 0: 5 })", "Uncaught TypeError: Cannot assign to read only property '0' of object '[object Array]'");
+    try expectThrows("Object.assign(Object.freeze([1]) as any, { 1: 5 })", "Uncaught TypeError: Cannot add property 1, object is not extensible");
+    try expectThrows("Object.assign(Object.freeze({ a: 1 }) as any, { b: 5 })", "Uncaught TypeError: Cannot add property b, object is not extensible");
+    try expectThrows("'ά'.toUpperCase()", "error ZV9001: Changing the case of 'ά' is not supported yet.");
+    try expectThrows("const a: any = [1]; a.copyWithin(0, 0)", "error ZV9001: 'copyWithin' of a object is not supported yet.");
 }
 
 test "runtime errors on objects" {

@@ -72,7 +72,9 @@ fn mainThread(init: std.process.Init) !void {
     var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
 
-    var runtime: zavascript.Runtime = try .init(gpa, .{ .stdout = stdout, .stderr = stderr, .max_stack = thread_stack - 4 * 1024 * 1024 });
+    var seed: u64 = undefined;
+    io.random(std.mem.asBytes(&seed));
+    var runtime: zavascript.Runtime = try .init(gpa, .{ .stdout = stdout, .stderr = stderr, .max_stack = thread_stack - 4 * 1024 * 1024, .random_seed = seed });
     defer runtime.deinit();
 
     const stdin = std.Io.File.stdin();

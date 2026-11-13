@@ -53,7 +53,19 @@ pub const Stmt = struct {
         interface: *const Interface,
         type_alias: *const TypeAlias,
         throw: *Expr,
+        /// `declare var x: T;` or `declare function f(): T;`, only in a `.d.ts` file.
+        declare: *const Declare,
     };
+};
+
+/// A declaration of a value that exists without the program creating it, like the builtins in
+/// `lib.d.ts`. A function declared more than once is overloaded.
+pub const Declare = struct {
+    name: []const u8,
+    start: u32,
+    /// A variable's type annotation, or a function's signature as a function type.
+    type: *const TypeNode,
+    function: bool,
 };
 
 /// `{ ... }`, which is a scope of its own.
@@ -262,8 +274,9 @@ pub const GenericParameter = struct {
     default: ?*const TypeNode = null,
 };
 
-/// A property or method in an interface or an object type.
+/// A property or method in an interface or an object type, or one of its signatures.
 pub const TypeMember = struct {
+    /// Empty for a call or construct signature; an index signature's parameter name.
     name: []const u8,
     start: u32,
     optional: bool,
@@ -272,6 +285,18 @@ pub const TypeMember = struct {
     method: bool,
     /// Null for a property without a type, which is `any` (and TS7008).
     type: ?*const TypeNode,
+    signature: Signature = .none,
+
+    pub const Signature = union(enum) {
+        /// A property or method.
+        none,
+        /// `(a: T): R`, whose `type` is the function type.
+        call,
+        /// `new (a: T): R`, whose `type` is the function type.
+        construct,
+        /// `[key: K]: T`, with the key's type; `type` is the value's.
+        index: *const TypeNode,
+    };
 };
 
 /// A type annotation: a primitive keyword, a name, a literal, an array, tuple, object, function
@@ -305,6 +330,15 @@ pub const TypeNode = struct {
         query: Query,
         /// `{ readonly [P in K]?: T }`
         mapped: *const Mapped,
+        /// `A & B`, with at least two members. Only in a `.d.ts` file so far.
+        intersection: []const *const TypeNode,
+        /// `x is T`, as a function's return type.
+        predicate: Predicate,
+    };
+
+    pub const Predicate = struct {
+        parameter: []const u8,
+        type: *const TypeNode,
     };
 
     pub const Indexed = struct {
@@ -332,7 +366,7 @@ pub const TypeNode = struct {
         readonly: Modifier,
     };
 
-    pub const Keyword = enum { any, unknown, never, void, undefined, null, boolean, number, string };
+    pub const Keyword = enum { any, unknown, never, void, undefined, null, boolean, number, string, object };
 
     pub const Literal = union(enum) {
         number: f64,
@@ -462,7 +496,17 @@ pub const Expr = struct {
         /// Kept so that `(a ?? b) || c` can be told apart from `a ?? b || c`, which is an error, and
         /// so syntactic checks see through parentheses the way tsc does.
         paren: *Expr,
+        /// `new C(arguments)`
+        new: New,
+        /// `...e`, only as a call's argument.
+        spread: *Expr,
     };
+};
+
+pub const New = struct {
+    callee: *Expr,
+    type_arguments: []const *const TypeNode = &.{},
+    arguments: []const *Expr,
 };
 
 pub const Identifier = struct {

@@ -18,6 +18,11 @@
 //! narrowed the way tsc 5.4 does it: by what was known where the closure was created, if nothing
 //! assigns the variable after that.
 //!
+//! The builtins are what `lib.d.ts` declares: its `declare`d values are the globals, and a
+//! primitive or an array has the members of its library interface (`String`, `Array<T>`), its
+//! apparent type. A call of an overloaded function is resolved the way tsc's `chooseOverload`
+//! does it, to the first signature the arguments fit.
+//!
 //! It also resolves every identifier, and lays out where each variable lives at runtime: a slot
 //! that outlives the program for top-level variables, the call's frame for a function's own
 //! variables, or an environment for variables a closure captures. The interpreter reads this from
@@ -35,6 +40,7 @@ const Expr = ast.Expr;
 const Stmt = ast.Stmt;
 
 const Checker = @This();
+const Parser = @import("../syntax/Parser.zig");
 
 arena: std.mem.Allocator,
 source: *const Source,
@@ -107,6 +113,13 @@ late: std.ArrayList(Late) = .empty,
 const_context: bool = false,
 /// The generic call whose arguments are being inferred from, while one of them is checked.
 argument_of: ?ArgumentOf = null,
+/// Resolving something `lib.d.ts` declares, where methods can be overloaded.
+ambient: bool = false,
+/// The signature each call (or `new`) was resolved to, for narrowing by type guards.
+call_signatures: std.AutoHashMapUnmanaged(*const Expr, *const types.Function) = .empty,
+/// While set, diagnostics aren't reported, but where they are is kept here: for where an
+/// overload's argument fails.
+capture: ?*std.ArrayList(u32) = null,
 
 const ConstraintCheck = struct {
     at: u32,
@@ -186,13 +199,32 @@ pub const Session = struct {
     types: std.StringHashMapUnmanaged(*TypeDecl) = .empty,
     /// The scope of `lib.d.ts`'s declarations, which every program sees behind its own.
     library: ?*Scope = null,
+    /// The values `lib.d.ts` declares, the builtins.
+    library_values: std.StringHashMapUnmanaged(*LibraryValue) = .empty,
 };
 
-/// Declares the types in `lib.d.ts`, which has nothing but interfaces and type aliases.
+/// A value `lib.d.ts` declares, whose type is resolved the first time it's used.
+const LibraryValue = struct {
+    /// More than one for an overloaded function.
+    declarations: std.ArrayList(*const ast.Declare) = .empty,
+    resolved: ?*const Type = null,
+};
+
+/// Declares what `lib.d.ts` does: interfaces, type aliases and `declare`d values.
 pub fn declareLibrary(arena: std.mem.Allocator, session: *Session, program: ast.Program) Error!void {
     const scope = try arena.create(Scope);
     scope.* = .{ .parent = null, .kind = .block, .function = null };
     for (program.statements) |stmt| {
+        if (stmt.data == .declare) {
+            const d = stmt.data.declare;
+            const entry = try session.library_values.getOrPut(arena, d.name);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = try arena.create(LibraryValue);
+                entry.value_ptr.*.* = .{};
+            }
+            try entry.value_ptr.*.declarations.append(arena, d);
+            continue;
+        }
         const decl = try arena.create(TypeDecl);
         decl.* = switch (stmt.data) {
             .interface => |i| .{ .name = i.name, .start = i.start, .node = .{ .interface = i }, .scope = scope },
@@ -320,6 +352,14 @@ const Context = struct {
     returns: std.ArrayList(*const Type) = .empty,
     /// It has a `return;` without a value.
     empty_return: bool = false,
+    /// Its first returned expression, where it's returned, for inferring a type predicate.
+    first_return: ?ReturnSite = null,
+};
+
+const ReturnSite = struct {
+    expr: *const Expr,
+    flow: Flow,
+    scope: ?*Scope,
 };
 
 const FunctionInfo = struct {
@@ -503,6 +543,9 @@ pub fn check(arena: std.mem.Allocator, source: *const Source, diagnostics: *diag
         .functions = functions,
         .program = program.statements,
     };
+    const saved_library = types.library;
+    types.library = .{ .context = &checker, .apparent = apparentHook };
+    defer types.library = saved_library;
     const errors_before = diagnostics.items().len;
     try checker.prescan(program.statements);
     for (program.statements) |stmt| {
@@ -584,6 +627,13 @@ fn layout(this: *Checker, program: ast.Program) Error!Resolved {
 }
 
 fn report(this: *Checker, at: u32, code: diagnostic.Code, comptime fmt: []const u8, args: anytype) Error!void {
+    if (this.ambient) {
+        // The library is known to be right, and its diagnostics would be in the wrong file.
+        return;
+    }
+    if (this.capture) |list| {
+        return list.append(this.arena, at);
+    }
     if (this.declaring > 0) {
         return this.late.append(this.arena, .{ .at = at, .code = code, .message = try std.fmt.allocPrint(this.arena, fmt, args) });
     }
@@ -911,13 +961,13 @@ fn instantiateDecl(this: *Checker, decl: *TypeDecl, arguments: []const *const Ty
     }
     if (generic.* == .object and generic.object.generic == @as(*const anyopaque, decl)) {
         const object = try this.arena.create(types.Object);
-        object.* = .{ .name = generic.object.name, .properties = &.{}, .type_arguments = arguments, .generic = decl };
+        object.* = .{ .name = generic.object.name, .properties = &.{}, .type_arguments = arguments, .generic = decl, .interface = generic.object.interface };
         const t = try this.newType(.{ .object = object });
         try decl.instances.append(this.arena, .{ .arguments = arguments, .type = t });
         if (decl.resolving) {
             try decl.waiting.append(this.arena, object);
         } else {
-            object.properties = try this.instantiateProperties(generic.object.properties, decl.parameters, arguments);
+            try this.instantiateMembers(object, generic.object, decl.parameters, arguments);
         }
         return t;
     }
@@ -928,6 +978,24 @@ fn instantiateDecl(this: *Checker, decl: *TypeDecl, arguments: []const *const Ty
     const t = try this.instantiate(generic, decl.parameters, arguments);
     try decl.instances.append(this.arena, .{ .arguments = arguments, .type = t });
     return t;
+}
+
+/// Gives `object`, an instantiation of the generic `generic`, its members.
+fn instantiateMembers(this: *Checker, object: *types.Object, generic: *const types.Object, from: []const *const Type, to: []const *const Type) Error!void {
+    object.properties = try this.instantiateProperties(generic.properties, from, to);
+    object.calls = try this.instantiateSignatures(generic.calls, from, to);
+    object.constructs = try this.instantiateSignatures(generic.constructs, from, to);
+    object.string_index = if (generic.string_index) |i| .{ .type = try this.instantiate(i.type, from, to), .readonly = i.readonly } else null;
+    object.number_index = if (generic.number_index) |i| .{ .type = try this.instantiate(i.type, from, to), .readonly = i.readonly } else null;
+}
+
+fn instantiateSignatures(this: *Checker, signatures: []const *const types.Function, from: []const *const Type, to: []const *const Type) Error![]const *const types.Function {
+    const list = try this.arena.alloc(*const types.Function, signatures.len);
+    for (signatures, list) |f, *x| {
+        const t = try this.instantiate(try this.newType(.{ .function = f }), from, to);
+        x.* = t.function;
+    }
+    return list;
 }
 
 fn instantiateProperties(this: *Checker, properties: []const types.Property, from: []const *const Type, to: []const *const Type) Error![]const types.Property {
@@ -962,13 +1030,16 @@ fn resolveDecl(this: *Checker, decl: *TypeDecl) Error!*const Type {
         return types.any;
     }
     const saved_scope = this.scope;
+    const saved_ambient = this.ambient;
     this.scope = decl.scope;
+    this.ambient = this.isLibraryScope(decl.scope);
     this.declaring += 1;
     decl.resolving = true;
     decl.deferred_at = this.deferred;
     try this.resolving_decls.append(this.arena, decl);
     defer {
         this.scope = saved_scope;
+        this.ambient = saved_ambient;
         this.declaring -= 1;
         decl.resolving = false;
         _ = this.resolving_decls.pop();
@@ -999,7 +1070,7 @@ fn resolveDecl(this: *Checker, decl: *TypeDecl) Error!*const Type {
     // Instantiations made while it was resolved can be filled in now.
     if (t.* == .object and !decl.circular) {
         for (decl.waiting.items) |instance| {
-            instance.properties = try this.instantiateProperties(t.object.properties, decl.parameters, instance.type_arguments);
+            try this.instantiateMembers(instance, t.object, decl.parameters, instance.type_arguments);
         }
     }
     decl.waiting.clearRetainingCapacity();
@@ -1024,7 +1095,7 @@ fn declObject(this: *Checker, decl: *TypeDecl) Error!?*types.Object {
     // tsc shows an object type alias by the alias's name.
     const generic: ?*const anyopaque = if (decl.parameters.len > 0) decl else null;
     const object = try this.arena.create(types.Object);
-    object.* = .{ .name = name, .properties = &.{}, .type_arguments = decl.parameters, .generic = generic };
+    object.* = .{ .name = name, .properties = &.{}, .type_arguments = decl.parameters, .generic = generic, .interface = decl.node == .interface };
     decl.resolved = try this.newType(.{ .object = object });
     return object;
 }
@@ -1036,6 +1107,13 @@ fn resolveDeclType(this: *Checker, decl: *TypeDecl, object: ?*types.Object) Erro
             const t = decl.resolved.?;
             var properties: std.ArrayList(types.Property) = .empty;
             var bases: std.ArrayList(*const types.Object) = .empty;
+            var calls: std.ArrayList(*const types.Function) = .empty;
+            var constructs: std.ArrayList(*const types.Function) = .empty;
+            const own = try this.members(i.members);
+            var string_index = own.string_index;
+            var number_index = own.number_index;
+            try calls.appendSlice(this.arena, own.calls);
+            try constructs.appendSlice(this.arena, own.constructs);
             for (i.extends) |base| {
                 const bt = try this.resolveReference(base.start, base);
                 if (bt.* != .object) {
@@ -1048,9 +1126,17 @@ fn resolveDeclType(this: *Checker, decl: *TypeDecl, object: ?*types.Object) Erro
                 for (bt.object.properties) |p| {
                     try putProperty(this.arena, &properties, p);
                 }
+                try calls.appendSlice(this.arena, bt.object.calls);
+                try constructs.appendSlice(this.arena, bt.object.constructs);
+                string_index = string_index orelse bt.object.string_index;
+                number_index = number_index orelse bt.object.number_index;
             }
-            for (try this.members(i.members)) |p| {
-                for (bases.items) |base| {
+            object.?.calls = calls.items;
+            object.?.constructs = constructs.items;
+            object.?.string_index = string_index;
+            object.?.number_index = number_index;
+            for (own.properties) |p| {
+                for (if (this.ambient) &.{} else bases.items) |base| {
                     const inherited = base.find(p.name) orelse continue;
                     if (!types.assignable(p.type, inherited.type)) {
                         try this.report(i.start, .ts(2430), "Interface '{s}' incorrectly extends interface '{s}'.\n  Types of property '{s}' are incompatible.\n    Type '{f}' is not assignable to type '{f}'.", .{ i.name, base.name, p.name, p.type, inherited.type });
@@ -1063,7 +1149,12 @@ fn resolveDeclType(this: *Checker, decl: *TypeDecl, object: ?*types.Object) Erro
         },
         .alias => |a| {
             if (object) |o| {
-                o.properties = try this.members(a.type.data.object);
+                const own = try this.members(a.type.data.object);
+                o.properties = own.properties;
+                o.calls = own.calls;
+                o.constructs = own.constructs;
+                o.string_index = own.string_index;
+                o.number_index = own.number_index;
                 return decl.resolved.?;
             }
             const t = try this.resolveType(a.type);
@@ -1086,12 +1177,44 @@ fn putProperty(arena: std.mem.Allocator, properties: *std.ArrayList(types.Proper
     try properties.append(arena, p);
 }
 
+const Members = struct {
+    properties: []const types.Property,
+    calls: []const *const types.Function = &.{},
+    constructs: []const *const types.Function = &.{},
+    string_index: ?types.Object.Index = null,
+    number_index: ?types.Object.Index = null,
+};
+
 /// The members of an interface or object type.
-fn members(this: *Checker, list: []const ast.TypeMember) Error![]const types.Property {
+fn members(this: *Checker, list: []const ast.TypeMember) Error!Members {
     var properties: std.ArrayList(types.Property) = .empty;
+    var calls: std.ArrayList(*const types.Function) = .empty;
+    var constructs: std.ArrayList(*const types.Function) = .empty;
+    var result: Members = .{ .properties = &.{} };
     // Where each property is declared, and whether a duplicate of it has been reported there.
     var starts: std.ArrayList(struct { u32, bool }) = .empty;
     for (list) |m| {
+        switch (m.signature) {
+            .none => {},
+            .call, .construct => {
+                const t = try this.resolveType(m.type.?);
+                if (m.type.?.data.function.returns == null) {
+                    try this.report(m.start, .ts(if (m.signature == .call) 7020 else 7013), "{s} signature, which lacks return-type annotation, implicitly has an 'any' return type.", .{if (m.signature == .call) "Call" else "Construct"});
+                }
+                try (if (m.signature == .call) &calls else &constructs).append(this.arena, t.function);
+                continue;
+            },
+            .index => |key_node| {
+                const key = try this.resolveType(key_node);
+                const index: types.Object.Index = .{ .type = try this.resolveType(m.type.?), .readonly = m.readonly };
+                switch (key.*) {
+                    .string => result.string_index = index,
+                    .number => result.number_index = index,
+                    else => try this.report(key_node.start, .ts(1268), "An index signature parameter type must be 'string', 'number', 'symbol', or a template literal type.", .{}),
+                }
+                continue;
+            },
+        }
         var t = types.any;
         if (m.type) |node| {
             if (m.method and node.data.function.returns == null) {
@@ -1112,7 +1235,22 @@ fn members(this: *Checker, list: []const ast.TypeMember) Error![]const types.Pro
         if (duplicate) |i| {
             const first = properties.items[i];
             if (m.method and first.method) {
-                try this.unsupported(m.start, "Method overloads are not supported yet.", .{});
+                if (!this.ambient) {
+                    try this.unsupported(m.start, "Method overloads are not supported yet.", .{});
+                    continue;
+                }
+                // Another overload: the method's type is an object type with a call signature for
+                // each.
+                var overloads: std.ArrayList(*const types.Function) = .empty;
+                switch (first.type.*) {
+                    .function => |f| try overloads.append(this.arena, f),
+                    .object => |o| try overloads.appendSlice(this.arena, o.calls),
+                    else => unreachable,
+                }
+                try overloads.append(this.arena, t.function);
+                const object = try this.arena.create(types.Object);
+                object.* = .{ .properties = &.{}, .calls = overloads.items };
+                properties.items[i].type = try this.newType(.{ .object = object });
                 continue;
             }
             if (!starts.items[i][1]) {
@@ -1128,28 +1266,104 @@ fn members(this: *Checker, list: []const ast.TypeMember) Error![]const types.Pro
         try properties.append(this.arena, .{ .name = m.name, .type = t, .optional = m.optional, .readonly = m.readonly, .method = m.method });
         try starts.append(this.arena, .{ m.start, false });
     }
-    return properties.items;
+    result.properties = properties.items;
+    result.calls = calls.items;
+    result.constructs = constructs.items;
+    return result;
 }
+
+fn isLibraryScope(this: *const Checker, scope: ?*Scope) bool {
+    var s = scope;
+    while (s) |x| : (s = x.parent) {
+        if (x == this.session.library) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The library's declaration of the type `name`, if it has one.
+fn libraryType(this: *const Checker, name: []const u8) ?*TypeDecl {
+    const library = this.session.library orelse return null;
+    return library.types.get(name);
+}
+
+/// The type of the global `name`: one of the values `lib.d.ts` declares, or `undefined`. Null if
+/// there's no such global.
+fn globalType(this: *Checker, name: []const u8) Error!?*const Type {
+    if (std.mem.eql(u8, name, "undefined")) {
+        return types.undefined;
+    }
+    const v = this.session.library_values.get(name) orelse return null;
+    if (v.resolved) |t| {
+        return t;
+    }
+    const saved_scope = this.scope;
+    const saved_ambient = this.ambient;
+    this.scope = this.session.library;
+    this.ambient = true;
+    this.muted += 1;
+    defer {
+        this.scope = saved_scope;
+        this.ambient = saved_ambient;
+        this.muted -= 1;
+    }
+    const declarations = v.declarations.items;
+    if (declarations.len == 1) {
+        v.resolved = try this.resolveType(declarations[0].type);
+        return v.resolved;
+    }
+    const calls = try this.arena.alloc(*const types.Function, declarations.len);
+    for (declarations, calls) |d, *f| {
+        f.* = (try this.resolveType(d.type)).function;
+    }
+    const object = try this.arena.create(types.Object);
+    object.* = .{ .properties = &.{}, .calls = calls };
+    v.resolved = try this.newType(.{ .object = object });
+    return v.resolved;
+}
+
+/// Globals that tsc's `lib.es2022.d.ts` declares and we don't have yet.
+const unsupported_globals = std.StaticStringMap(void).initComptime(.{
+    .{"Date"},           .{"RegExp"},       .{"Error"},        .{"TypeError"},            .{"RangeError"},
+    .{"ReferenceError"}, .{"SyntaxError"},  .{"EvalError"},    .{"URIError"},             .{"AggregateError"},
+    .{"Promise"},        .{"Symbol"},       .{"WeakMap"},      .{"WeakSet"},              .{"WeakRef"},
+    .{"Proxy"},          .{"Reflect"},      .{"globalThis"},   .{"Function"},             .{"BigInt"},
+    .{"Intl"},           .{"ArrayBuffer"},  .{"DataView"},     .{"SharedArrayBuffer"},    .{"Atomics"},
+    .{"Int8Array"},      .{"Uint8Array"},   .{"Int16Array"},   .{"Uint16Array"},          .{"Int32Array"},
+    .{"Uint32Array"},    .{"Float32Array"}, .{"Float64Array"}, .{"Uint8ClampedArray"},    .{"BigInt64Array"},
+    .{"BigUint64Array"}, .{"encodeURI"},    .{"decodeURI"},    .{"encodeURIComponent"},   .{"decodeURIComponent"},
+    .{"escape"},         .{"unescape"},     .{"eval"},         .{"FinalizationRegistry"},
+});
 
 /// Names of types the standard library has, which aren't supported yet.
 const library_types = std.StaticStringMap(void).initComptime(.{
-    .{"Omit"},         .{"Exclude"},      .{"Extract"},              .{"NonNullable"},      .{"ReturnType"},
-    .{"Parameters"},   .{"InstanceType"}, .{"Awaited"},              .{"Number"},           .{"String"},
-    .{"Boolean"},      .{"Object"},       .{"Function"},             .{"Symbol"},           .{"BigInt"},
-    .{"Map"},          .{"Set"},          .{"WeakMap"},              .{"WeakSet"},          .{"Error"},
-    .{"TypeError"},    .{"RangeError"},   .{"ReferenceError"},       .{"SyntaxError"},      .{"Promise"},
-    .{"PromiseLike"},  .{"Date"},         .{"RegExp"},               .{"Math"},             .{"JSON"},
-    .{"Console"},      .{"Iterable"},     .{"Iterator"},             .{"IterableIterator"}, .{"ArrayLike"},
-    .{"PropertyKey"},  .{"Uppercase"},    .{"Lowercase"},            .{"Capitalize"},       .{"Uncapitalize"},
-    .{"ThisType"},     .{"NoInfer"},      .{"IArguments"},           .{"Generator"},        .{"ArrayBuffer"},
-    .{"object"},       .{"symbol"},       .{"bigint"},               .{"Int8Array"},        .{"Uint8Array"},
-    .{"Float64Array"}, .{"DataView"},     .{"TemplateStringsArray"},
+    .{"Omit"},              .{"Exclude"},           .{"Extract"},               .{"NonNullable"},      .{"ReturnType"},
+    .{"Parameters"},        .{"InstanceType"},      .{"Awaited"},               .{"Function"},         .{"Symbol"},
+    .{"BigInt"},            .{"WeakMap"},           .{"WeakSet"},               .{"Error"},            .{"TypeError"},
+    .{"RangeError"},        .{"ReferenceError"},    .{"SyntaxError"},           .{"Promise"},          .{"PromiseLike"},
+    .{"Date"},              .{"RegExp"},            .{"Uppercase"},             .{"Lowercase"},        .{"Capitalize"},
+    .{"Uncapitalize"},      .{"ThisType"},          .{"NoInfer"},               .{"IArguments"},       .{"Generator"},
+    .{"ArrayBuffer"},       .{"symbol"},            .{"bigint"},                .{"Int8Array"},        .{"Uint8Array"},
+    .{"Float64Array"},      .{"DataView"},          .{"TemplateStringsArray"},  .{"ArrayConstructor"}, .{"PropertyDescriptor"},
+    .{"ThisParameterType"}, .{"OmitThisParameter"}, .{"ConstructorParameters"},
 });
+
+/// `type T = intrinsic`, which the checker computes.
+fn isIntrinsic(a: *const ast.TypeAlias) bool {
+    return a.type.data == .reference and std.mem.eql(u8, a.type.data.reference.name, "intrinsic");
+}
 
 /// A type name in an annotation, with its type arguments.
 fn resolveReference(this: *Checker, at: u32, reference: ast.TypeReference) Error!*const Type {
     const name = reference.name;
-    const found = this.lookupType(name);
+    var found = this.lookupType(name);
+    if (found) |decl| {
+        // The library's `Array` and `ReadonlyArray` are what arrays have, not what `Array<T>` is.
+        if (decl.scope == this.session.library and (std.mem.eql(u8, name, "Array") or std.mem.eql(u8, name, "ReadonlyArray"))) {
+            found = null;
+        }
+    }
     const arguments = try this.arena.alloc(*const Type, reference.arguments.len);
     {
         // A type alias's type arguments are resolved with it, anything else's lazily.
@@ -1161,6 +1375,14 @@ fn resolveReference(this: *Checker, at: u32, reference: ast.TypeReference) Error
         }
     }
     if (found) |decl| {
+        if (decl.scope == this.session.library and decl.node == .alias and isIntrinsic(decl.node.alias)) {
+            // Only `FlatArray`.
+            if (arguments.len != 2) {
+                try this.report(at, .ts(2314), "Generic type '{s}' requires 2 type argument(s).", .{name});
+                return types.any;
+            }
+            return types.intrinsic(this.arena, .flat_array, arguments);
+        }
         const t = try this.resolveDecl(decl);
         if (decl.circular) {
             if (arguments.len > 0) {
@@ -1194,7 +1416,7 @@ fn resolveReference(this: *Checker, at: u32, reference: ast.TypeReference) Error
     }
     if (library_types.has(name)) {
         try this.unsupported(at, "The type '{s}' is not supported yet.", .{name});
-    } else if (this.lookup(name) != null or global(name) != null) {
+    } else if (this.lookup(name) != null or try this.globalType(name) != null) {
         try this.report(at, .ts(2749), "'{s}' refers to a value, but is being used as a type here. Did you mean 'typeof {s}'?", .{ name, name });
     } else {
         try this.report(at, .ts(2304), "Cannot find name '{s}'.", .{name});
@@ -1405,8 +1627,20 @@ fn resolveType(this: *Checker, node: *const ast.TypeNode) Error!*const Type {
             .boolean => types.boolean,
             .number => types.number,
             .string => types.string,
+            .object => &non_primitive,
         },
         .reference => |r| this.resolveReference(node.start, r),
+        .intersection => |ms| blk: {
+            const resolved = try this.arena.alloc(*const Type, ms.len);
+            for (ms, resolved) |m, *t| {
+                t.* = try this.resolveType(m);
+            }
+            break :blk types.intersectionOf(this.arena, resolved);
+        },
+        .predicate => blk: {
+            try this.report(node.start, .ts(1228), "A type predicate is only allowed in return type position for functions and methods.", .{});
+            break :blk types.boolean;
+        },
         .keyof => |operand| blk: {
             const t = try this.resolveType(operand);
             break :blk try types.keyOf(this.arena, t) orelse {
@@ -1445,8 +1679,9 @@ fn resolveType(this: *Checker, node: *const ast.TypeNode) Error!*const Type {
             break :blk this.newType(.{ .tuple = resolved });
         },
         .object => |list| blk: {
+            const own = try this.members(list);
             const object = try this.arena.create(types.Object);
-            object.* = .{ .properties = try this.members(list) };
+            object.* = .{ .properties = own.properties, .calls = own.calls, .constructs = own.constructs, .string_index = own.string_index, .number_index = own.number_index };
             break :blk this.newType(.{ .object = object });
         },
         .function => |f| blk: {
@@ -1482,12 +1717,42 @@ fn resolveType(this: *Checker, node: *const ast.TypeNode) Error!*const Type {
                 }
             }
             const function = try this.arena.create(types.Function);
-            function.* = .{ .type_parameters = type_parameters, .parameters = parameters.items, .rest = rest, .returns = if (f.returns) |r| try this.resolveType(r) else types.any };
+            function.* = .{ .type_parameters = type_parameters, .parameters = parameters.items, .rest = rest, .returns = types.any };
+            if (f.returns) |r| {
+                if (r.data == .predicate) {
+                    function.returns = types.boolean;
+                    function.predicate = try this.predicate(r, f.parameters);
+                } else {
+                    function.returns = try this.resolveType(r);
+                }
+            }
             const t = try this.arena.create(Type);
             t.* = .{ .function = function };
             break :blk t;
         },
     };
+}
+
+/// tsc's `object`.
+const non_primitive: Type = .non_primitive;
+
+/// The type predicate a return type annotation `x is T` makes, for a function with these
+/// parameters (`ast.Parameter`s or `ast.TypeParameter`s). Null if no parameter is called that
+/// (TS1225), or if it is a rest parameter (TS1229).
+fn predicate(this: *Checker, node: *const ast.TypeNode, parameters: anytype) Error!?types.Function.Predicate {
+    const p = node.data.predicate;
+    const t = try this.resolveType(p.type);
+    for (parameters, 0..) |parameter, i| {
+        if (std.mem.eql(u8, parameter.name, p.parameter)) {
+            if (parameter.rest) {
+                try this.report(node.start, .ts(1229), "A type predicate cannot reference a rest parameter.", .{});
+                return null;
+            }
+            return .{ .index = i, .name = p.parameter, .type = t };
+        }
+    }
+    try this.report(node.start, .ts(1225), "Cannot find parameter '{s}'.", .{p.parameter});
+    return null;
 }
 
 /// `T[K]`
@@ -1529,7 +1794,7 @@ fn typeQuery(this: *Checker, at: u32, q: ast.TypeNode.Query) Error!*const Type {
                 t = narrowed;
             }
         }
-    } else if (global(q.name)) |g| {
+    } else if (try this.globalType(q.name)) |g| {
         t = g;
     } else {
         try this.report(at + @as(u32, "typeof ".len), .ts(2304), "Cannot find name '{s}'.", .{q.name});
@@ -1662,6 +1927,7 @@ fn labeledStatement(this: *Checker, stmt: *const Stmt, labels: []const []const u
         .interface, .type_alias => if (this.type_decls.get(stmt)) |decl| {
             _ = try this.resolveDecl(decl);
         },
+        .declare => try this.unsupported(stmt.start, "'declare' declarations are not supported yet.", .{}),
         .@"while", .do_while, .@"for", .for_each, .@"switch", .labeled => unreachable,
     }
     if (labels.len > 0) {
@@ -1876,7 +2142,7 @@ fn bindPattern(this: *Checker, pattern: *const ast.Pattern, source: ?*const Type
         .array => |a| {
             var from = source;
             if (source) |s| {
-                if (!try this.checkIterable(s, pattern.start, "Destructuring a string")) {
+                if (!try this.checkIterable(s, pattern.start)) {
                     from = types.any;
                 }
             }
@@ -1952,22 +2218,70 @@ fn removeUndefined(this: *Checker, t: *const Type) Error!*const Type {
 
 /// Whether `t` can be iterated (spread, destructured with `[...]` or looped over with
 /// `for...of`), reporting it if not. `what` names a use of a string, which isn't supported yet.
-fn checkIterable(this: *Checker, t: *const Type, at: u32, comptime what: []const u8) Error!bool {
-    var buffer: [1]*const Type = undefined;
-    for (t.members(&buffer)) |m| {
-        switch (m.*) {
-            .any, .never, .array, .tuple, .readonly_array => {},
-            else => {
-                if (types.isStringLike(m)) {
-                    try this.unsupported(at, what ++ " is not supported yet.", .{});
-                } else {
-                    try this.report(at, .ts(2488), "Type '{f}' must have a '[Symbol.iterator]()' method that returns an iterator.", .{t});
-                }
-                return false;
-            },
-        }
+/// Whether `for...of` and spreading can go through a value of type `t`, reporting TS2488 if not.
+fn checkIterable(this: *Checker, t: *const Type, at: u32) Error!bool {
+    if (try this.iteratedType(t) != null) {
+        return true;
     }
-    return true;
+    try this.report(at, .ts(2488), "Type '{f}' must have a '[Symbol.iterator]()' method that returns an iterator.", .{t});
+    return false;
+}
+
+/// What iterating over a value of type `t` gives (tsc's `getIterationTypesOfIterable`): an
+/// array's elements, or the values the iterator its `[Symbol.iterator]()` returns yields. Null if
+/// it isn't iterable.
+fn iteratedType(this: *Checker, t: *const Type) Error!?*const Type {
+    switch (t.*) {
+        .any, .never => return t,
+        .array, .readonly_array => |e| return e,
+        .tuple => |es| return try types.unionOf(this.arena, es),
+        .@"union" => |ms| {
+            const parts = try this.arena.alloc(*const Type, ms.len);
+            for (ms, parts) |m, *p| {
+                p.* = try this.iteratedType(m) orelse return null;
+            }
+            return try types.unionOf(this.arena, parts);
+        },
+        .param => {
+            const base = types.baseConstraint(t);
+            return if (base == t or base.* == .unknown) null else this.iteratedType(base);
+        },
+        else => {},
+    }
+    this.muted += 1;
+    defer this.muted -= 1;
+    const method = try this.property(t, Parser.symbol_iterator, 0) orelse return null;
+    const iterator = (callReturns(method.type) orelse return null);
+    const next = try this.property(iterator, "next", 0) orelse return null;
+    const result = callReturns(next.type) orelse return null;
+    // The values of the results that aren't `done`.
+    var values: std.ArrayList(*const Type) = .empty;
+    var buffer: [1]*const Type = undefined;
+    for (result.members(&buffer)) |r| {
+        if (r.* != .object) {
+            return null;
+        }
+        if (r.object.property("done")) |done| {
+            if (done.* == .literal and done.literal.value == .boolean and done.literal.value.boolean) {
+                continue;
+            }
+        }
+        try values.append(this.arena, r.object.property("value") orelse return null);
+    }
+    return try types.unionOf(this.arena, values.items);
+}
+
+/// What calling a value of type `t` without arguments returns, if it can be.
+fn callReturns(t: *const Type) ?*const Type {
+    return switch (t.*) {
+        .function => |f| if (f.minArguments() == 0) f.returns else null,
+        .object => |o| for (o.calls) |f| {
+            if (f.minArguments() == 0) {
+                break f.returns;
+            }
+        } else null,
+        else => null,
+    };
 }
 
 /// The type of the element at `index` when a value of type `t` (an iterable) is destructured.
@@ -1982,7 +2296,8 @@ fn elementOf(this: *Checker, t: *const Type, index: usize, at: u32, has_default:
                 try this.report(at, .ts(2493), "Tuple type '{f}' of length '{d}' has no element at index '{d}'.", .{ m, es.len, index });
                 break :blk types.undefined;
             },
-            else => m,
+            .any, .never => m,
+            else => try this.iteratedType(m) orelse m,
         });
     }
     return types.unionOf(this.arena, parts.items);
@@ -1994,7 +2309,8 @@ fn arrayRest(this: *Checker, t: *const Type, from: usize) Error!*const Type {
         .array => t,
         .readonly_array => |e| this.newType(.{ .array = e }),
         .tuple => |es| this.newType(.{ .tuple = es[@min(from, es.len)..] }),
-        else => types.any,
+        .any => types.any,
+        else => this.newType(.{ .array = try this.iteratedType(t) orelse types.any }),
     };
 }
 
@@ -2142,19 +2458,10 @@ fn loop(this: *Checker, stmt: *const Stmt, labels: []const []const u8) Error!voi
 /// The type of the values a `for...of` loops over.
 fn iterationType(this: *Checker, expr: *const Expr, t: *const Type) Error!*const Type {
     const iterable = try this.checkNonNull(expr, t);
-    if (!try this.checkIterable(iterable, expr.start, "Iterating over a string")) {
+    if (!try this.checkIterable(iterable, expr.start)) {
         return types.any;
     }
-    var parts: std.ArrayList(*const Type) = .empty;
-    var buffer: [1]*const Type = undefined;
-    for (iterable.members(&buffer)) |m| {
-        switch (m.*) {
-            .array, .readonly_array => |e| try parts.append(this.arena, e),
-            .tuple => |es| try parts.appendSlice(this.arena, es),
-            else => try parts.append(this.arena, m),
-        }
-    }
-    return types.unionOf(this.arena, parts.items);
+    return (try this.iteratedType(iterable)).?;
 }
 
 /// A `for...in` loops over property names, so its right side has to be an object.
@@ -2170,7 +2477,7 @@ fn isObjectType(t: *const Type) bool {
     var buffer: [1]*const Type = undefined;
     for (t.members(&buffer)) |m| {
         switch (m.*) {
-            .any, .never, .object, .array, .tuple, .readonly_array, .function => {},
+            .any, .never, .object, .array, .tuple, .readonly_array, .function, .non_primitive, .intersection => {},
             else => return false,
         }
     }
@@ -2416,37 +2723,6 @@ fn includesNullish(t: *const Type) bool {
     return false;
 }
 
-// Globals. These move to `lib.d.ts` once the checker can read declarations.
-
-const log_function: Type = .{ .function = &.{
-    .parameters = &.{},
-    .rest = .{ .name = "data", .type = types.any_array },
-    .returns = types.void,
-} };
-
-const console_object: types.Object = .{
-    .name = "Console",
-    .properties = &.{
-        .{ .name = "log", .type = &log_function },
-        .{ .name = "error", .type = &log_function },
-        .{ .name = "warn", .type = &log_function },
-        .{ .name = "info", .type = &log_function },
-        .{ .name = "debug", .type = &log_function },
-    },
-};
-
-const console_type: Type = .{ .object = &console_object };
-
-fn global(name: []const u8) ?*const Type {
-    const globals = std.StaticStringMap(*const Type).initComptime(.{
-        .{ "console", &console_type },
-        .{ "undefined", types.undefined },
-        .{ "NaN", types.number },
-        .{ "Infinity", types.number },
-    });
-    return globals.get(name);
-}
-
 // Identifiers
 
 const Resolution = struct {
@@ -2490,8 +2766,12 @@ fn resolve(this: *Checker, expr: *const Expr, id: ast.Identifier) Error!Resoluti
         try this.unsupported(expr.start, "'arguments' is not supported yet.", .{});
         return .{ .slot = null };
     }
-    if (global(id.name) == null) {
-        try this.report(expr.start, .ts(2304), "Cannot find name '{s}'.", .{id.name});
+    if (try this.globalType(id.name) == null) {
+        if (unsupported_globals.has(id.name)) {
+            try this.unsupported(expr.start, "The global '{s}' is not supported yet.", .{id.name});
+        } else {
+            try this.report(expr.start, .ts(2304), "Cannot find name '{s}'.", .{id.name});
+        }
     }
     return .{ .slot = null };
 }
@@ -2510,7 +2790,7 @@ fn read(this: *Checker, expr: *const Expr, id: ast.Identifier) Error!*const Type
 }
 
 fn readResolved(this: *Checker, expr: *const Expr, id: ast.Identifier, r: Resolution) Error!*const Type {
-    const slot = r.slot orelse return global(id.name) orelse types.any;
+    const slot = r.slot orelse return try this.globalType(id.name) orelse types.any;
     const declared = try this.declaredType(slot);
     if (this.variable(slot).kind == .function or !this.flow.reachable) {
         return declared;
@@ -2540,7 +2820,7 @@ fn writeTarget(this: *Checker, expr: *const Expr, id: ast.Identifier, r: Resolut
     const slot = r.slot orelse {
         if (std.mem.eql(u8, id.name, "undefined")) {
             try this.report(expr.start, .ts(2539), "Cannot assign to 'undefined' because it is not a variable.", .{});
-        } else if (global(id.name) != null) {
+        } else if (try this.globalType(id.name) != null) {
             try this.unsupported(expr.start, "Assigning to the global '{s}' is not supported yet.", .{id.name});
         }
         return null;
@@ -2719,7 +2999,7 @@ const AssignmentScan = struct {
                 }
             },
             .function => |f| this.function(f, true),
-            .interface, .type_alias => {},
+            .interface, .type_alias, .declare => {},
             .throw => |e| this.expr(e, outer, nested),
             .for_each => |f| {
                 switch (f.head) {
@@ -2808,9 +3088,15 @@ const AssignmentScan = struct {
             .template => |t| for (t.substitutions) |sub| {
                 this.expr(sub, outer, nested);
             },
-            .paren, .chain, .non_null => |inner| this.expr(inner, outer, nested),
+            .paren, .chain, .non_null, .spread => |inner| this.expr(inner, outer, nested),
             .assertion => |a| this.expr(a.expr, outer, nested),
             .unary => |u| this.expr(u.operand, outer, nested),
+            .new => |n| {
+                this.expr(n.callee, outer, nested);
+                for (n.arguments) |arg| {
+                    this.expr(arg, outer, nested);
+                }
+            },
             .update => |u| {
                 this.target(u.operand, outer, nested);
                 this.expr(u.operand, outer, nested);
@@ -2918,6 +3204,9 @@ fn expressionOf(this: *Checker, expr: *const Expr) Error!*const Type {
         .function => |f| this.checkFunction(f, null, .check),
         .object => |o| this.objectLiteral(o, null),
         .array => |a| this.arrayLiteral(expr.start, a, null),
+        .new => |n| this.newExpression(expr, n, null),
+        // Only an argument, which `arguments` checks.
+        .spread => unreachable,
     };
 }
 
@@ -2932,6 +3221,7 @@ fn contextual(this: *Checker, expr: *const Expr, context: ?*const Type) Error!*c
         .object => |o| this.objectLiteral(o, ctx),
         .array => |a| this.arrayLiteral(expr.start, a, ctx),
         .call => |c| this.callWith(expr, c, try this.calleeType(c), ctx),
+        .new => |n| this.newExpression(expr, n, ctx),
         else => this.expression(expr),
     };
 }
@@ -3077,7 +3367,9 @@ fn contextObject(context: ?*const Type) ?*const types.Object {
 /// by the discriminant properties the literal sets, as tsc's
 /// `discriminateContextualTypeByObjectMembers` does. Empty when there are none.
 fn contextObjects(this: *Checker, context: ?*const Type, literal: ast.ObjectLiteral) Error![]const *const Type {
-    const t = context orelse return &.{};
+    const given = context orelse return &.{};
+    // A type parameter gives what its constraint does, as `T extends { [k: string]: U }` does.
+    const t = if (given.* == .param) types.baseConstraint(given) else given;
     var objects: std.ArrayList(*const Type) = .empty;
     var buffer: [1]*const Type = undefined;
     for (t.members(&buffer)) |m| {
@@ -3134,6 +3426,10 @@ fn contextualProperty(this: *Checker, objects: []const *const Type, name: []cons
     for (objects) |o| {
         if (o.object.find(name)) |p| {
             try parts.append(this.arena, p.type);
+        } else if (o.object.number_index != null and types.isNumericName(name)) {
+            try parts.append(this.arena, o.object.number_index.?.type);
+        } else if (o.object.string_index) |index| {
+            try parts.append(this.arena, index.type);
         }
     }
     if (parts.items.len == 0) {
@@ -3145,7 +3441,7 @@ fn contextualProperty(this: *Checker, objects: []const *const Type, name: []cons
 /// The type of a property every one of `objects` has, or null.
 fn commonProperty(this: *Checker, objects: []const *const Type, name: []const u8) Error!?*const Type {
     for (objects) |o| {
-        if (o.object.find(name) == null) {
+        if (o.object.find(name) == null and o.object.string_index == null and !(o.object.number_index != null and types.isNumericName(name))) {
             return null;
         }
     }
@@ -3159,7 +3455,7 @@ const ArrayContext = union(enum) {
 };
 
 /// What a context expects of an array literal.
-fn arrayContext(context: ?*const Type) ArrayContext {
+fn arrayContext(this: *Checker, context: ?*const Type) Error!ArrayContext {
     const t = context orelse return .none;
     var found: ArrayContext = .none;
     var buffer: [1]*const Type = undefined;
@@ -3169,6 +3465,8 @@ fn arrayContext(context: ?*const Type) ArrayContext {
             .tuple => |es| .{ .tuple = es },
             .any, .unknown => .{ .element = m },
             .null, .undefined => continue,
+            // An iterable, like `Iterable<T>`, expects what it iterates over.
+            .object => .{ .element = try this.iteratedType(m) orelse return .none },
             else => return .none,
         };
         if (found != .none) {
@@ -3281,7 +3579,7 @@ fn arrayLiteral(this: *Checker, start: u32, a: ast.ArrayLiteral, context: ?*cons
         // That's a `readonly` tuple.
         try this.unsupported(start, "'as const' on an array literal is not supported yet.", .{});
     }
-    const ctx = arrayContext(context);
+    const ctx = try this.arrayContext(context);
     const has_spread = for (a.elements) |e| {
         if (e == .spread) {
             break true;
@@ -3305,18 +3603,11 @@ fn arrayLiteral(this: *Checker, start: u32, a: ast.ArrayLiteral, context: ?*cons
             .expr => |x| try parts.append(this.arena, try this.contextual(x, element_context)),
             .spread => |x| {
                 const t = try this.expression(x);
-                if (!try this.checkIterable(t, x.start, "Spreading a string")) {
+                if (!try this.checkIterable(t, x.start)) {
                     try parts.append(this.arena, types.any);
                     continue;
                 }
-                var buffer: [1]*const Type = undefined;
-                for (t.members(&buffer)) |m| {
-                    switch (m.*) {
-                        .array, .readonly_array => |element| try parts.append(this.arena, element),
-                        .tuple => |es| try parts.appendSlice(this.arena, es),
-                        else => try parts.append(this.arena, m),
-                    }
-                }
+                try parts.append(this.arena, (try this.iteratedType(t)).?);
             },
         }
     }
@@ -3356,7 +3647,8 @@ fn excessProperty(this: *Checker, expr: *const Expr, target: *const Type) Error!
                 return false;
             }
             for (objects) |t| {
-                if (t.object.properties.len == 0) {
+                // Anything goes in `{}`, or with an index signature.
+                if (t.object.properties.len == 0 or t.object.string_index != null) {
                     return false;
                 }
             }
@@ -3375,7 +3667,7 @@ fn excessProperty(this: *Checker, expr: *const Expr, target: *const Type) Error!
                 }
             }
         },
-        .array => |a| switch (arrayContext(target)) {
+        .array => |a| switch (try this.arrayContext(target)) {
             .none => {},
             .element => |t| for (a.elements) |element| {
                 if (element == .expr and try this.excessProperty(element.expr, t)) {
@@ -3436,7 +3728,8 @@ fn elaborateLiteral(this: *Checker, expr: *const Expr, source: *const Type, targ
             }
         },
         .array => |a| {
-            const ctx = arrayContext(target);
+            // tsc only elaborates into an array literal for an array or tuple type.
+            const ctx = if (types.arrayElement(try this.removeNullish(target)) != null or (try this.removeNullish(target)).* == .tuple) try this.arrayContext(target) else ArrayContext.none;
             if (ctx == .none or (ctx == .tuple and (source.* != .tuple or source.tuple.len != ctx.tuple.len))) {
                 return false;
             }
@@ -3522,8 +3815,23 @@ fn property(this: *Checker, object: *const Type, name: []const u8, at: u32) Erro
             return access;
         },
         .object => |o| {
-            const p = o.find(name) orelse return null;
-            return .{ .type = p.type, .name = name, .readonly = p.readonly };
+            if (o.find(name)) |p| {
+                return .{ .type = p.type, .name = name, .readonly = p.readonly };
+            }
+            if (o.number_index) |index| {
+                if (types.isNumericName(name)) {
+                    return .{ .type = index.type, .name = name, .readonly = index.readonly, .named = false };
+                }
+            }
+            if (o.string_index) |index| {
+                return .{ .type = index.type, .name = name, .readonly = index.readonly, .named = false };
+            }
+            if (this.libraryInterfaceName(o)) |interface| {
+                if (try this.missingMember(interface, object, name, at)) |access| {
+                    return access;
+                }
+            }
+            return this.objectMember(name);
         },
         .function => {
             if (std.mem.eql(u8, name, "name")) {
@@ -3532,7 +3840,37 @@ fn property(this: *Checker, object: *const Type, name: []const u8, at: u32) Erro
             if (std.mem.eql(u8, name, "length")) {
                 return .{ .type = types.number, .name = name, .readonly = true };
             }
-            return this.unsupportedProperty(name, at, object, &.{ "apply", "bind", "call", "toString", "prototype", "arguments", "caller" });
+            if (try this.missingMember("Function", object, name, at)) |access| {
+                return access;
+            }
+            return this.objectMember(name);
+        },
+        .non_primitive => return this.objectMember(name),
+        .intersection => |ms| {
+            for (ms) |m| {
+                this.muted += 1;
+                const found = try this.property(m, name, at);
+                this.muted -= 1;
+                if (found != null) {
+                    return this.property(m, name, at);
+                }
+            }
+            return null;
+        },
+        .string, .number, .boolean, .literal => {
+            const apparent = try this.apparentType(object) orelse return null;
+            if (apparent.object.find(name)) |p| {
+                return .{ .type = p.type, .name = name, .readonly = p.readonly };
+            }
+            if (apparent.object.number_index) |index| {
+                if (types.isNumericName(name)) {
+                    return .{ .type = index.type, .name = name, .readonly = index.readonly, .named = false };
+                }
+            }
+            if (try this.missingMember(apparent.object.name, object, name, at)) |access| {
+                return access;
+            }
+            return this.objectMember(name);
         },
         .array, .tuple, .readonly_array => {
             if (std.mem.eql(u8, name, "length")) {
@@ -3552,13 +3890,14 @@ fn property(this: *Checker, object: *const Type, name: []const u8, at: u32) Erro
                     else => unreachable,
                 };
             }
-            return this.unsupportedProperty(name, at, object, &.{
-                "toString",   "toLocaleString", "pop",        "push",     "concat",      "join",        "reverse",   "shift",
-                "slice",      "sort",           "splice",     "unshift",  "indexOf",     "lastIndexOf", "every",     "some",
-                "forEach",    "map",            "filter",     "reduce",   "reduceRight", "find",        "findIndex", "fill",
-                "copyWithin", "entries",        "keys",       "values",   "includes",    "flatMap",     "flat",      "at",
-                "findLast",   "findLastIndex",  "toReversed", "toSorted", "toSpliced",   "with",
-            });
+            const apparent = try this.apparentType(object) orelse return null;
+            if (apparent.object.find(name)) |p| {
+                return .{ .type = p.type, .name = name, .readonly = p.readonly };
+            }
+            if (try this.missingMember(apparent.object.name, object, name, at)) |access| {
+                return access;
+            }
+            return this.objectMember(name);
         },
         else => {
             try this.unsupported(at, "Properties of '{f}' are not supported yet.", .{try types.widen(this.arena, object)});
@@ -3578,9 +3917,101 @@ fn arrayIndex(name: []const u8) ?usize {
 /// `o.name`, with `o` already checked.
 fn memberAccess(this: *Checker, m: ast.Member, object: *const Type) Error!?Access {
     return try this.property(object, m.property, m.property_start) orelse {
-        try this.report(m.property_start, .ts(2339), "Property '{s}' does not exist on type '{f}'.", .{ m.property, object });
+        if (try this.spellingSuggestion(object, m.property)) |suggestion| {
+            try this.report(m.property_start, .ts(2551), "Property '{s}' does not exist on type '{f}'. Did you mean '{s}'?", .{ m.property, object, suggestion });
+        } else {
+            try this.report(m.property_start, .ts(2339), "Property '{s}' does not exist on type '{f}'.", .{ m.property, object });
+        }
         return null;
     };
+}
+
+/// tsc's `getSpellingSuggestion`: the property of `object` closest to `name` (by an edit distance
+/// where a difference of case is cheap), if one is close enough.
+fn spellingSuggestion(this: *Checker, object: *const Type, name: []const u8) Error!?[]const u8 {
+    var candidates: std.ArrayList([]const u8) = .empty;
+    var buffer: [1]*const Type = undefined;
+    const ms = object.members(&buffer);
+    for (ms, 0..) |m, i| {
+        const o: *const types.Object = switch (m.*) {
+            .object => |o| o,
+            else => if (try this.apparentType(m)) |a| a.object else return null,
+        };
+        for (o.properties) |p| {
+            if (p.name.len > 0 and p.name[0] == '[') {
+                continue;
+            }
+            // A union's properties are the ones every member has.
+            if (i == 0) {
+                try candidates.append(this.arena, p.name);
+            }
+        }
+        if (i > 0) {
+            var kept: std.ArrayList([]const u8) = .empty;
+            for (candidates.items) |c| {
+                if (o.find(c) != null) {
+                    try kept.append(this.arena, c);
+                }
+            }
+            candidates = kept;
+        }
+    }
+    const length_difference = @max(2, name.len * 34 / 100);
+    var best_distance: f64 = @floatFromInt(name.len * 4 / 10 + 1);
+    var best: ?[]const u8 = null;
+    for (candidates.items) |candidate| {
+        const difference = if (candidate.len > name.len) candidate.len - name.len else name.len - candidate.len;
+        if (difference > length_difference or std.mem.eql(u8, candidate, name)) {
+            continue;
+        }
+        // A short name only counts when it differs by case.
+        if (candidate.len < 3 and !std.ascii.eqlIgnoreCase(candidate, name)) {
+            continue;
+        }
+        const distance = try levenshtein(this.arena, name, candidate, best_distance - 0.1) orelse continue;
+        best_distance = distance;
+        best = candidate;
+    }
+    return best;
+}
+
+/// tsc's `levenshteinWithMax`, or null if the distance is more than `max`.
+fn levenshtein(arena: std.mem.Allocator, s1: []const u8, s2: []const u8, max: f64) Error!?f64 {
+    var previous = try arena.alloc(f64, s2.len + 1);
+    var current = try arena.alloc(f64, s2.len + 1);
+    const big = max + 0.01;
+    for (previous, 0..) |*p, i| {
+        p.* = @floatFromInt(i);
+    }
+    for (1..s1.len + 1) |i| {
+        const fi: f64 = @floatFromInt(i);
+        const min_j: usize = @intFromFloat(@ceil(if (fi > max) fi - max else 1));
+        const max_j: usize = @intFromFloat(@floor(if (@as(f64, @floatFromInt(s2.len)) > max + fi) max + fi else @as(f64, @floatFromInt(s2.len))));
+        current[0] = fi;
+        var column_min = fi;
+        for (1..@min(min_j, s2.len + 1)) |j| {
+            current[j] = big;
+        }
+        var j = min_j;
+        while (j <= max_j) : (j += 1) {
+            const substitution = if (std.ascii.toLower(s1[i - 1]) == std.ascii.toLower(s2[j - 1])) previous[j - 1] + 0.1 else previous[j - 1] + 2;
+            const distance = if (s1[i - 1] == s2[j - 1]) previous[j - 1] else @min(@min(previous[j] + 1, current[j - 1] + 1), substitution);
+            current[j] = distance;
+            column_min = @min(column_min, distance);
+        }
+        j = max_j + 1;
+        while (j <= s2.len) : (j += 1) {
+            current[j] = big;
+        }
+        if (column_min > max) {
+            return null;
+        }
+        const swap = previous;
+        previous = current;
+        current = swap;
+    }
+    const result = previous[s2.len];
+    return if (result > max) null else result;
 }
 
 /// `o[k]`. Null when that's an error, which has been reported.
@@ -3675,7 +4106,18 @@ fn indexWith(this: *Checker, expr: *const Expr, i: ast.Index, object: *const Typ
             .array => |e| return .{ .type = e, .named = false },
             .readonly_array => |e| return .{ .type = e, .named = false, .readonly = true },
             .tuple => |es| return .{ .type = try types.unionOf(this.arena, es), .named = false },
+            .object => |o| if (o.number_index orelse o.string_index) |index| {
+                return .{ .type = index.type, .named = false, .readonly = index.readonly };
+            },
+            .string, .literal => if (types.isStringLike(object)) {
+                return .{ .type = types.string, .named = false, .readonly = true };
+            },
             else => {},
+        }
+    }
+    if (types.isStringLike(k) and object.* == .object) {
+        if (object.object.string_index) |index| {
+            return .{ .type = index.type, .named = false, .readonly = index.readonly };
         }
     }
     if (!types.isStringLike(k) and !types.isNumberLike(k)) {
@@ -3793,6 +4235,18 @@ fn condition(this: *Checker, expr: *const Expr, if_body: ?*const Stmt, chain: ?*
     // What's tested is narrowed to what can pass or fail the test: after `while (b) {}`, `b` is
     // `false`.
     try this.narrowBranches(&branches, expr, .truthy, true);
+    // A type guard narrows what it's passed.
+    const e = ast.skipParens(expr);
+    if (e.data == .call) {
+        if (this.call_signatures.get(e)) |f| {
+            if (f.predicate) |p| {
+                const arguments = e.data.call.arguments;
+                if (p.index < arguments.len and arguments[p.index].data != .spread) {
+                    try this.narrowBranches(&branches, arguments[p.index], .{ .guard = p.type }, true);
+                }
+            }
+        }
+    }
     return branches;
 }
 
@@ -4000,7 +4454,7 @@ fn impliesPresent(test_: narrowing.Test, assume: bool) bool {
             break :blk true;
         },
         .typeof => |name| assume != std.mem.eql(u8, name, "undefined"),
-        .in => false,
+        .in, .guard => false,
     };
 }
 
@@ -4443,8 +4897,8 @@ const Operation = struct {
 fn operator(this: *Checker, op: ast.BinaryOp, left_expr: *const Expr, right_expr: *const Expr, given_left: *const Type, given_right: *const Type, compound: bool) Error!Operation {
     // Operators see a type parameter as its constraint: `x + 1` is fine for `x: T extends number`.
     const equality = op == .equal or op == .not_equal or op == .strict_equal or op == .strict_not_equal or op == .comma;
-    const left = if (equality) given_left else try this.apparentType(given_left);
-    const right = if (equality) given_right else try this.apparentType(given_right);
+    const left = if (equality) given_left else try this.constrainedType(given_left);
+    const right = if (equality) given_right else try this.constrainedType(given_right);
     switch (op) {
         .comma => return .{ .type = right },
         .in => {
@@ -4537,7 +4991,7 @@ fn operator(this: *Checker, op: ast.BinaryOp, left_expr: *const Expr, right_expr
 }
 
 /// `t` with its generic members replaced by their constraints, where they have one.
-fn apparentType(this: *Checker, t: *const Type) Error!*const Type {
+fn constrainedType(this: *Checker, t: *const Type) Error!*const Type {
     if (!types.isGeneric(t)) {
         return t;
     }
@@ -4601,14 +5055,144 @@ fn narrowedRead(this: *Checker, expr: *const Expr, declared: *const Type) Error!
 }
 
 /// A property that exists but isn't implemented yet (one of `known`), or null.
-fn unsupportedProperty(this: *Checker, name: []const u8, at: u32, object: *const Type, known: []const []const u8) Error!?Access {
-    for (known) |k| {
-        if (std.mem.eql(u8, k, name)) {
-            try this.unsupported(at, "The '{s}' property of '{f}' is not supported yet.", .{ name, object });
-            return .{ .type = types.any, .name = name, .named = false };
+/// A member of tsc's `Object` interface, which every object type has.
+fn objectMember(this: *Checker, name: []const u8) Error!?Access {
+    if (name.len > 0 and name[0] == '[') {
+        // `[Symbol.iterator]`, which only the library can name.
+        return null;
+    }
+    const decl = this.libraryType("Object") orelse return null;
+    const object = try this.resolveDecl(decl);
+    const p = object.object.find(name) orelse {
+        return null;
+    };
+    return .{ .type = p.type, .name = name, .readonly = p.readonly };
+}
+
+/// The name of the library interface `o` is (or instantiates), if it's one of the library's.
+fn libraryInterfaceName(this: *const Checker, o: *const types.Object) ?[]const u8 {
+    if (o.name.len == 0) {
+        return null;
+    }
+    if (o.generic) |g| {
+        const decl: *const TypeDecl = @ptrCast(@alignCast(g));
+        return if (decl.scope == this.session.library) decl.name else null;
+    }
+    const decl = this.libraryType(o.name) orelse return null;
+    const resolved = decl.resolved orelse return null;
+    return if (resolved.* == .object and resolved.object == o) decl.name else null;
+}
+
+/// Members tsc's library has that ours doesn't: ones we don't implement yet, and ones from a
+/// later edition than ES2022, which tsc reports with a hint to change `lib`.
+const missing_members = std.StaticStringMap([]const Missing).initComptime(.{
+    .{ "Array", &[_]Missing{
+        .{ "toLocaleString", null }, .{ "copyWithin", null },   .{ "findLast", "es2023" },  .{ "findLastIndex", "es2023" },
+        .{ "toReversed", "es2023" }, .{ "toSorted", "es2023" }, .{ "toSpliced", "es2023" }, .{ "with", "es2023" },
+    } },
+    .{ "ReadonlyArray", &[_]Missing{
+        .{ "toLocaleString", null }, .{ "findLast", "es2023" },  .{ "findLastIndex", "es2023" }, .{ "toReversed", "es2023" },
+        .{ "toSorted", "es2023" },   .{ "toSpliced", "es2023" }, .{ "with", "es2023" },
+    } },
+    .{ "String", &[_]Missing{
+        .{ "localeCompare", null },    .{ "match", null },             .{ "search", null },            .{ "normalize", null },
+        .{ "matchAll", null },         .{ "toLocaleLowerCase", null }, .{ "toLocaleUpperCase", null }, .{ "anchor", null },
+        .{ "big", null },              .{ "blink", null },             .{ "bold", null },              .{ "fixed", null },
+        .{ "fontcolor", null },        .{ "fontsize", null },          .{ "italics", null },           .{ "link", null },
+        .{ "small", null },            .{ "strike", null },            .{ "sub", null },               .{ "sup", null },
+        .{ "isWellFormed", "es2024" }, .{ "toWellFormed", "es2024" },
+    } },
+    .{ "Number", &[_]Missing{.{ "toLocaleString", null }} },
+    .{ "Object", &[_]Missing{ .{ "constructor", null }, .{ "toLocaleString", null }, .{ "isPrototypeOf", null }, .{ "propertyIsEnumerable", null } } },
+    .{ "ObjectConstructor", &[_]Missing{
+        .{ "getPrototypeOf", null }, .{ "getOwnPropertyDescriptor", null },  .{ "getOwnPropertyNames", null },   .{ "create", null },
+        .{ "defineProperty", null }, .{ "defineProperties", null },          .{ "seal", null },                  .{ "preventExtensions", null },
+        .{ "isSealed", null },       .{ "isExtensible", null },              .{ "getOwnPropertySymbols", null }, .{ "is", null },
+        .{ "setPrototypeOf", null }, .{ "getOwnPropertyDescriptors", null }, .{ "prototype", null },             .{ "groupBy", "es2024" },
+    } },
+    .{ "NumberConstructor", &[_]Missing{.{ "prototype", null }} },
+    .{ "StringConstructor", &[_]Missing{ .{ "prototype", null }, .{ "raw", null } } },
+    .{ "BooleanConstructor", &[_]Missing{.{ "prototype", null }} },
+    .{ "ArrayConstructor", &[_]Missing{ .{ "prototype", null }, .{ "fromAsync", "esnext" } } },
+    .{ "MapConstructor", &[_]Missing{ .{ "prototype", null }, .{ "groupBy", "es2024" } } },
+    .{ "SetConstructor", &[_]Missing{.{ "prototype", null }} },
+    .{ "Math", &[_]Missing{.{ "f16round", "es2025" }} },
+    .{ "Set", &set_methods },
+    .{ "ReadonlySet", &set_methods },
+    .{ "ArrayIterator", &iterator_helpers },
+    .{ "MapIterator", &iterator_helpers },
+    .{ "SetIterator", &iterator_helpers },
+    .{ "StringIterator", &iterator_helpers },
+    .{ "Function", &[_]Missing{
+        .{ "apply", null },     .{ "bind", null },      .{ "call", null },   .{ "toString", null },
+        .{ "prototype", null }, .{ "arguments", null }, .{ "caller", null },
+    } },
+});
+
+/// A member we don't have, and the edition of the library that has it, if it's a later one.
+const Missing = struct { []const u8, ?[]const u8 };
+
+const set_methods = [_]Missing{
+    .{ "union", "es2025" },      .{ "intersection", "es2025" }, .{ "difference", "es2025" },     .{ "symmetricDifference", "es2025" },
+    .{ "isSubsetOf", "es2025" }, .{ "isSupersetOf", "es2025" }, .{ "isDisjointFrom", "es2025" },
+};
+
+const iterator_helpers = [_]Missing{
+    .{ "map", "es2025" },     .{ "filter", "es2025" }, .{ "take", "es2025" },    .{ "drop", "es2025" },
+    .{ "flatMap", "es2025" }, .{ "reduce", "es2025" }, .{ "toArray", "es2025" }, .{ "forEach", "es2025" },
+    .{ "some", "es2025" },    .{ "every", "es2025" },  .{ "find", "es2025" },    .{ "return", null },
+    .{ "throw", null },
+};
+
+/// Reports a member of a library interface that tsc has and we don't, if `name` is one: ZV9001
+/// for one we don't implement yet, and tsc's TS2550 for one from a later edition. The access is
+/// then `any`, so nothing more is reported.
+fn missingMember(this: *Checker, interface: []const u8, object: *const Type, name: []const u8, at: u32) Error!?Access {
+    const list = missing_members.get(interface) orelse return null;
+    for (list) |m| {
+        if (!std.mem.eql(u8, m[0], name)) {
+            continue;
         }
+        if (m[1]) |lib| {
+            try this.report(at, .ts(2550), "Property '{s}' does not exist on type '{f}'. Do you need to change your target library? Try changing the 'lib' compiler option to '{s}' or later.", .{ name, object, lib });
+        } else {
+            try this.unsupported(at, "'{s}.{s}' is not supported yet.", .{ interface, name });
+        }
+        return .{ .type = types.any, .name = name, .named = false };
     }
     return null;
+}
+
+/// The library interface whose members a value of type `t` has, for primitives and arrays:
+/// `String` for `string`, `Array<T>` for `T[]`. Null for other types.
+fn apparentType(this: *Checker, t: *const Type) Error!?*const Type {
+    const name: []const u8, const argument: ?*const Type = switch (t.*) {
+        .string => .{ "String", null },
+        .number => .{ "Number", null },
+        .boolean => .{ "Boolean", null },
+        .literal => |l| .{ switch (l.value) {
+            .string => "String",
+            .number => "Number",
+            .boolean => "Boolean",
+        }, null },
+        .array => |e| .{ "Array", e },
+        .readonly_array => |e| .{ "ReadonlyArray", e },
+        .tuple => |es| .{ "Array", try types.unionOf(this.arena, es) },
+        else => return null,
+    };
+    const decl = this.libraryType(name) orelse return null;
+    if (argument) |a| {
+        return try this.instantiateDecl(decl, try this.arena.dupe(*const Type, &.{a}));
+    }
+    return try this.resolveDecl(decl);
+}
+
+/// `apparentType` for `types.library`, which can't fail.
+fn apparentHook(context: *anyopaque, t: *const Type) ?*const Type {
+    const this: *Checker = @ptrCast(@alignCast(context));
+    this.muted += 1;
+    defer this.muted -= 1;
+    return this.apparentType(t) catch null;
 }
 
 fn call(this: *Checker, expr: *const Expr, c: ast.Call) Error!*const Type {
@@ -4662,20 +5246,105 @@ fn calleeExpression(this: *Checker, c: ast.Call) Error!*const Type {
     return this.expression(c.callee);
 }
 
+/// A call or `new` expression, as overload resolution sees it.
+const CallSite = struct {
+    expr: *const Expr,
+    callee: *const Expr,
+    type_arguments: []const *const ast.TypeNode,
+    arguments: []const Argument,
+
+    /// The first spread argument that stands for any number of arguments.
+    fn spreadIndex(this: CallSite) ?usize {
+        for (this.arguments, 0..) |arg, i| {
+            if (arg.spread) {
+                return i;
+            }
+        }
+        return null;
+    }
+};
+
+/// One argument of a call: an expression, or part of what a spread argument spreads.
+const Argument = struct {
+    expr: *const Expr,
+    /// Where it's reported: a spread argument's `...`.
+    at: u32,
+    /// For a spread argument, the type of what it gives: one element of a tuple, or (when
+    /// `spread`) the elements of an array, any number of them.
+    type: ?*const Type = null,
+    spread: bool = false,
+};
+
+/// The arguments of a call, with spread arguments checked and tuples spread out.
+fn callSite(this: *Checker, expr: *const Expr, callee: *const Expr, type_arguments: []const *const ast.TypeNode, arguments: []const *Expr) Error!CallSite {
+    var list: std.ArrayList(Argument) = .empty;
+    for (arguments) |arg| {
+        if (arg.data != .spread) {
+            try list.append(this.arena, .{ .expr = arg, .at = arg.start });
+            continue;
+        }
+        const operand = arg.data.spread;
+        const t = try this.expression(operand);
+        if (t.* == .tuple) {
+            for (t.tuple) |element| {
+                try list.append(this.arena, .{ .expr = operand, .at = arg.start, .type = element });
+            }
+            continue;
+        }
+        const element = if (try this.checkIterable(t, operand.start)) try this.iteratedType(t) orelse types.any else types.any;
+        try list.append(this.arena, .{ .expr = operand, .at = arg.start, .type = element, .spread = true });
+    }
+    return .{ .expr = expr, .callee = callee, .type_arguments = type_arguments, .arguments = list.items };
+}
+
+/// Checks the arguments of a call that isn't resolved to a signature, which have no context.
+fn checkArguments(this: *Checker, site: CallSite) Error!void {
+    for (site.type_arguments) |node| {
+        _ = try this.resolveType(node);
+    }
+    for (site.arguments) |arg| {
+        if (arg.type == null) {
+            _ = try this.expression(arg.expr);
+        }
+    }
+}
+
+/// Library constructors whose call (`Object()`) or construct (`new Number()`) signatures we
+/// don't have yet.
+fn unsupportedSignature(this: *const Checker, o: *const types.Object, construct: bool) bool {
+    const name = this.libraryInterfaceName(o) orelse return false;
+    if (std.mem.eql(u8, name, "ObjectConstructor") or std.mem.eql(u8, name, "ArrayConstructor")) {
+        return true;
+    }
+    return construct and (std.mem.eql(u8, name, "NumberConstructor") or std.mem.eql(u8, name, "StringConstructor") or std.mem.eql(u8, name, "BooleanConstructor"));
+}
+
 /// A call of something of type `callee`, which has been checked. `context` is the type the call's
 /// surroundings expect it to return, which type arguments can be inferred from.
 fn callWith(this: *Checker, expr: *const Expr, c: ast.Call, callee_type: *const Type, context: ?*const Type) Error!*const Type {
-    if (callee_type.* == .function) {
-        return this.callFunction(expr, c, callee_type.function, context);
+    const site = try this.callSite(expr, c.callee, c.type_arguments, c.arguments);
+    switch (callee_type.*) {
+        .function => |f| return this.resolveCall(site, &.{f}, context),
+        .object => |o| {
+            if (o.calls.len > 0) {
+                return this.resolveCall(site, o.calls, context);
+            }
+            if (this.unsupportedSignature(o, false)) {
+                try this.checkArguments(site);
+                try this.unsupported(c.callee.start, "Calling '{f}' is not supported yet.", .{callee_type});
+                return types.any;
+            }
+            if (o.constructs.len > 0) {
+                try this.checkArguments(site);
+                try this.report(c.callee.start, .ts(2348), "Value of type '{f}' is not callable. Did you mean to include 'new'?", .{callee_type});
+                return types.any;
+            }
+        },
+        else => {},
     }
-    for (c.type_arguments) |node| {
-        _ = try this.resolveType(node);
-    }
+    try this.checkArguments(site);
     if (c.type_arguments.len > 0 and callee_type.* != .any) {
         try this.report(c.type_arguments[0].start, .ts(2558), "Expected 0 type arguments, but got {d}.", .{c.type_arguments.len});
-    }
-    for (c.arguments) |arg| {
-        _ = try this.expression(arg);
     }
     switch (callee_type.*) {
         .any => return types.any,
@@ -4696,59 +5365,257 @@ fn callWith(this: *Checker, expr: *const Expr, c: ast.Call, callee_type: *const 
     }
 }
 
-fn callFunction(this: *Checker, expr: *const Expr, c: ast.Call, generic: *const types.Function, context: ?*const Type) Error!*const Type {
+/// `new C(arguments)`.
+fn newExpression(this: *Checker, expr: *const Expr, n: ast.New, context: ?*const Type) Error!*const Type {
+    const callee_type = try this.checkNonNull(n.callee, try this.expression(n.callee));
+    const site = try this.callSite(expr, n.callee, n.type_arguments, n.arguments);
+    switch (callee_type.*) {
+        .any => {
+            try this.checkArguments(site);
+            return types.any;
+        },
+        .object => |o| {
+            if (o.constructs.len > 0) {
+                return this.resolveCall(site, o.constructs, context);
+            }
+            if (this.unsupportedSignature(o, true)) {
+                try this.checkArguments(site);
+                try this.unsupported(n.callee.start, "Constructing '{f}' is not supported yet.", .{callee_type});
+                return types.any;
+            }
+        },
+        .function => {
+            try this.checkArguments(site);
+            try this.unsupported(n.callee.start, "Calling a function with 'new' is not supported yet.", .{});
+            return types.any;
+        },
+        else => {},
+    }
+    try this.checkArguments(site);
+    try this.report(n.callee.start, .ts(2351), "This expression is not constructable.\n  Type '{s}' has no construct signatures.", .{try this.apparentName(callee_type)});
+    return types.any;
+}
+
+/// How checking a call against one signature went: what it returns, or where the first argument
+/// that doesn't fit is.
+const Outcome = union(enum) {
+    ok: *const Type,
+    failed: u32,
+};
+
+/// Resolves a call to one of `signatures`, the way tsc's `chooseOverload` does: the first whose
+/// parameters the arguments fit is the one, and it's checked again, reporting what's wrong
+/// inside the arguments. Returns what it returns.
+fn resolveCall(this: *Checker, site: CallSite, signatures: []const *const types.Function, context: ?*const Type) Error!*const Type {
+    if (signatures.len == 1) {
+        return (try this.callSignature(site, signatures[0], context, true)).ok;
+    }
+    if (site.type_arguments.len > 0) {
+        // tsc's TS2743: none of them takes that many type arguments.
+        var below: ?usize = null;
+        var above: ?usize = null;
+        for (signatures) |f| {
+            const count = site.type_arguments.len;
+            if (count >= requiredTypeParameters(f) and count <= f.type_parameters.len) {
+                break;
+            }
+            if (f.type_parameters.len < count) {
+                below = @max(below orelse 0, f.type_parameters.len);
+            } else {
+                above = @min(above orelse f.type_parameters.len, requiredTypeParameters(f));
+            }
+        } else {
+            try this.checkArguments(site);
+            const at = site.type_arguments[0].start;
+            if (below != null and above != null) {
+                try this.report(at, .ts(2743), "No overload expects {d} type arguments, but overloads do exist that expect either {d} or {d} type arguments.", .{ site.type_arguments.len, below.?, above.? });
+            } else {
+                try this.report(at, .ts(2558), "Expected {d} type arguments, but got {d}.", .{ below orelse above.?, site.type_arguments.len });
+            }
+            return types.any;
+        }
+    }
+    var failures: std.ArrayList(u32) = .empty;
+    var failed: ?*const types.Function = null;
+    for (signatures) |f| {
+        if (arityMismatch(site, f)) {
+            continue;
+        }
+        if (site.type_arguments.len > 0 and (site.type_arguments.len > f.type_parameters.len or site.type_arguments.len < requiredTypeParameters(f))) {
+            continue;
+        }
+        switch (try this.callSignature(site, f, context, false)) {
+            .ok => return (try this.callSignature(site, f, context, true)).ok,
+            .failed => |at| {
+                try failures.append(this.arena, at);
+                failed = f;
+            },
+        }
+    }
+    if (failures.items.len == 0) {
+        try this.checkArguments(site);
+        try this.reportArity(site, signatures);
+        return types.any;
+    }
+    if (failures.items.len == 1) {
+        // The only one that takes as many arguments: what's wrong is reported as for it alone.
+        _ = try this.callSignature(site, failed.?, context, true);
+        return types.any;
+    }
+    // Where each overload failed, if they all failed at the same argument; otherwise the callee.
+    var at = failures.items[0];
+    for (failures.items[1..]) |other| {
+        if (other != at) {
+            at = switch (site.callee.data) {
+                .member => |m| m.property_start,
+                else => site.callee.start,
+            };
+            break;
+        }
+    }
+    try this.report(at, .ts(2769), "No overload matches this call.", .{});
+    return types.any;
+}
+
+fn requiredTypeParameters(f: *const types.Function) usize {
+    var required: usize = 0;
+    for (f.type_parameters, 0..) |p, i| {
+        if (p.param.default == null) {
+            required = i + 1;
+        }
+    }
+    return required;
+}
+
+/// tsc's `hasCorrectArity`: whether a signature can take as many arguments as the call passes.
+fn arityMismatch(site: CallSite, f: *const types.Function) bool {
+    if (site.spreadIndex()) |i| {
+        return !(i >= f.minArguments() and (f.rest != null or i < f.parameters.len));
+    }
+    const count = site.arguments.len;
+    return count < f.minArguments() or (f.rest == null and count > f.parameters.len);
+}
+
+/// Reports passing the wrong number of arguments to every one of `signatures`.
+fn reportArity(this: *Checker, site: CallSite, signatures: []const *const types.Function) Error!void {
+    var min: usize = std.math.maxInt(usize);
+    var max: usize = 0;
+    var rest = false;
+    for (signatures) |f| {
+        min = @min(min, f.minArguments());
+        max = @max(max, f.parameters.len);
+        rest = rest or f.rest != null;
+    }
+    const count = site.arguments.len;
+    if (site.spreadIndex()) |i| {
+        return this.report(site.arguments[i].at, .ts(2556), "A spread argument must either have a tuple type or be passed to a rest parameter.", .{});
+    }
+    if (signatures.len > 1 and count >= min and count <= max and !rest) {
+        // Between the overloads' arities: tsc names the closest ones.
+        var below: usize = 0;
+        var above: usize = max;
+        for (signatures) |f| {
+            if (f.parameters.len < count) {
+                below = @max(below, f.parameters.len);
+            }
+            if (f.minArguments() > count) {
+                above = @min(above, f.minArguments());
+            }
+        }
+        return this.report(site.expr.start, .ts(2575), "No overload expects {d} arguments, but overloads do exist that expect either {d} or {d} arguments.", .{ count, below, above });
+    }
+    // Too few is reported at what's called, or the name of the method.
+    const at = if (count > max and !rest) site.arguments[max].at else switch (site.callee.data) {
+        .member => |m| m.property_start,
+        else => site.expr.start,
+    };
+    if (rest) {
+        try this.report(at, .ts(2555), "Expected at least {d} arguments, but got {d}.", .{ min, count });
+    } else if (min == max) {
+        try this.report(at, .ts(2554), "Expected {d} arguments, but got {d}.", .{ min, count });
+    } else {
+        try this.report(at, .ts(2554), "Expected {d}-{d} arguments, but got {d}.", .{ min, max, count });
+    }
+}
+
+/// Checks a call against one signature. With `report`, what's wrong is reported and the outcome
+/// is always `ok`; without it, nothing is, and the first argument that doesn't fit fails it.
+fn callSignature(this: *Checker, site: CallSite, generic: *const types.Function, context: ?*const Type, reporting: bool) Error!Outcome {
+    if (!reporting) {
+        this.muted += 1;
+    }
+    defer if (!reporting) {
+        this.muted -= 1;
+    };
     if (generic.pending and generic.type_parameters.len > 0) {
         // tsc gives a call to a generic function whose return type is being worked out `never`,
         // rather than reporting it (TS7023), so `return f(x)` adds nothing to it.
-        for (c.arguments) |arg| {
-            _ = try this.contextual(arg, null);
+        for (site.arguments) |arg| {
+            if (arg.type == null) {
+                _ = try this.contextual(arg.expr, null);
+            }
         }
-        return types.never;
+        return .{ .ok = types.never };
     }
     var f = generic;
     var args: std.ArrayList(*const Type) = .empty;
-    if (c.type_arguments.len > 0) {
-        f = try this.explicitInstantiation(c, generic);
+    if (site.type_arguments.len > 0) {
+        f = try this.explicitInstantiation(site, generic);
     } else if (generic.type_parameters.len > 0) {
-        f = try this.inferCall(c, generic, context, &args);
+        f = try this.inferCall(site, generic, context, &args);
     }
     if (args.items.len == 0) {
-        for (c.arguments, 0..) |arg, i| {
-            try args.append(this.arena, try this.contextual(arg, f.parameterType(i)));
+        for (site.arguments, 0..) |arg, i| {
+            try args.append(this.arena, arg.type orelse try this.contextual(arg.expr, f.parameterType(i)));
         }
     }
     if (f.pending) {
         // Its return type is what's being worked out.
         this.markCircular(f);
-        return types.any;
+        return .{ .ok = types.any };
     }
-    const min = f.minArguments();
-    const max = f.parameters.len;
-    const count = args.items.len;
-    if (count < min or (f.rest == null and count > max)) {
-        const at = if (count > max) c.arguments[max].start else expr.start;
-        if (f.rest != null) {
-            try this.report(at, .ts(2555), "Expected at least {d} arguments, but got {d}.", .{ min, count });
-        } else if (min == max) {
-            try this.report(at, .ts(2554), "Expected {d} arguments, but got {d}.", .{ min, count });
-        } else {
-            try this.report(at, .ts(2554), "Expected {d}-{d} arguments, but got {d}.", .{ min, max, count });
+    if (arityMismatch(site, f)) {
+        if (!reporting) {
+            return .{ .failed = site.expr.start };
         }
-        return f.returns;
+        try this.reportArity(site, &.{f});
+        return .{ .ok = f.returns };
     }
-    for (args.items, c.arguments, 0..) |arg_type, arg, i| {
-        var param = f.parameterType(i).?;
+    for (args.items, site.arguments, 0..) |arg_type, arg, i| {
+        var param = f.parameterType(i) orelse continue;
         // `undefined` can be passed for any optional parameter.
         if (i < f.parameters.len and f.parameters[i].optional) {
             param = try types.unionOf(this.arena, &.{ param, types.undefined });
         }
         const source = try this.instantiateInContext(arg_type, param);
-        if (try this.excessProperty(arg, param) or types.assignable(source, param) or try this.elaborateLiteral(arg, source, param)) {
-            continue;
+        // Where an overload's argument fails is where it would be reported.
+        var captured: std.ArrayList(u32) = .empty;
+        const saved_capture = this.capture;
+        defer this.capture = saved_capture;
+        if (!reporting) {
+            this.capture = &captured;
         }
-        try this.reportNotAssignable(arg, source, f.parameterType(i).?, arg.start, .argument);
+        const failed = blk: {
+            if (arg.type == null and try this.excessProperty(arg.expr, param)) {
+                break :blk true;
+            }
+            if (types.assignable(source, param)) {
+                break :blk false;
+            }
+            if (arg.type == null and try this.elaborateLiteral(arg.expr, source, param)) {
+                break :blk true;
+            }
+            try this.reportNotAssignable(arg.expr, source, f.parameterType(i).?, arg.at, .argument);
+            break :blk true;
+        };
+        if (failed and !reporting) {
+            return .{ .failed = if (captured.items.len > 0) captured.items[0] else arg.at };
+        }
     }
-    return f.returns;
+    if (reporting) {
+        try this.call_signatures.put(this.arena, site.expr, f);
+    }
+    return .{ .ok = f.returns };
 }
 
 /// `f` without type parameters, with `arguments` for them.
@@ -4761,7 +5628,7 @@ fn instantiateSignature(this: *Checker, f: *const types.Function, arguments: []c
 }
 
 /// `f<A, B>(...)`: the signature with the type arguments given.
-fn explicitInstantiation(this: *Checker, c: ast.Call, f: *const types.Function) Error!*const types.Function {
+fn explicitInstantiation(this: *Checker, c: CallSite, f: *const types.Function) Error!*const types.Function {
     const arguments = try this.arena.alloc(*const Type, c.type_arguments.len);
     for (c.type_arguments, arguments) |node, *t| {
         t.* = try this.resolveType(node);
@@ -4792,7 +5659,7 @@ fn explicitInstantiation(this: *Checker, c: ast.Call, f: *const types.Function) 
 /// from the arguments that don't need a contextual type, then from the ones that do (functions
 /// with untyped parameters), each typed by what's been inferred so far. The arguments' types are
 /// added to `args`, since checking them again would report their errors twice.
-fn inferCall(this: *Checker, c: ast.Call, f: *const types.Function, context: ?*const Type, args: *std.ArrayList(*const Type)) Error!*const types.Function {
+fn inferCall(this: *Checker, c: CallSite, f: *const types.Function, context: ?*const Type, args: *std.ArrayList(*const Type)) Error!*const types.Function {
     var inferences = try inference.Context.init(this.arena, f.type_parameters, this.mapper(&.{}, &.{}));
     // What the call's context expects it to return is a weaker source of inferences, only used
     // for type parameters the arguments say nothing about.
@@ -4808,11 +5675,16 @@ fn inferCall(this: *Checker, c: ast.Call, f: *const types.Function, context: ?*c
     const arg_types = try this.arena.alloc(?*const Type, c.arguments.len);
     @memset(arg_types, null);
     for (c.arguments, arg_types, 0..) |arg, *t, i| {
+        if (arg.type) |given| {
+            t.* = given;
+        }
         const param = f.parameterType(i) orelse continue;
-        if (isContextSensitive(arg)) {
+        if (t.* == null and isContextSensitive(arg.expr)) {
             continue;
         }
-        t.* = try this.contextual(arg, param);
+        if (t.* == null) {
+            t.* = try this.contextual(arg.expr, param);
+        }
         try inferences.infer(t.*.?, param);
     }
     for (c.arguments, arg_types, 0..) |arg, *t, i| {
@@ -4820,12 +5692,12 @@ fn inferCall(this: *Checker, c: ast.Call, f: *const types.Function, context: ?*c
             continue;
         }
         const param = f.parameterType(i) orelse {
-            t.* = try this.expression(arg);
+            t.* = try this.expression(arg.expr);
             continue;
         };
         try inferences.fix(param, f.returns, &from_return);
         const so_far = try inferences.inferredTypes(f.returns, &from_return);
-        t.* = try this.contextual(arg, try this.instantiate(param, f.type_parameters, so_far));
+        t.* = try this.contextual(arg.expr, try this.instantiate(param, f.type_parameters, so_far));
         try inferences.infer(t.*.?, param);
     }
     for (arg_types) |t| {
@@ -5197,7 +6069,22 @@ fn checkFunction(this: *Checker, f: *const ast.Function, context_type: ?*const T
     }
     signature.parameters = parameters;
 
-    const declared_return = if (f.returns) |r| try this.resolveType(r) else null;
+    var declared_return: ?*const Type = null;
+    if (f.returns) |r| {
+        if (r.data == .predicate) {
+            // A type guard returns `boolean`.
+            declared_return = types.boolean;
+            signature.predicate = try this.predicate(r, f.parameters);
+            if (signature.predicate) |p| {
+                const parameter_type = parameters[p.index].type;
+                if (!types.assignable(p.type, parameter_type)) {
+                    try this.report(r.data.predicate.type.start, .ts(2677), "A type predicate's type must be assignable to its parameter's type.\n  Type '{f}' is not assignable to type '{f}'.", .{ p.type, parameter_type });
+                }
+            }
+        } else {
+            declared_return = try this.resolveType(r);
+        }
+    }
     ctx.declared_return = declared_return;
     if (declared_return) |r| {
         // Nothing needs the body to know what it returns.
@@ -5214,6 +6101,9 @@ fn checkFunction(this: *Checker, f: *const ast.Function, context_type: ?*const T
             this.popScope();
         },
         .expression => |e| {
+            if (declared_return == null) {
+                ctx.first_return = .{ .expr = e, .flow = try this.copyFlow(this.flow), .scope = this.scope };
+            }
             const t = try this.contextual(e, declared_return orelse ctx.contextual_return);
             if (declared_return) |r| {
                 try this.checkAssignable(e, t, r, e.start, .assignment);
@@ -5241,6 +6131,9 @@ fn checkFunction(this: *Checker, f: *const ast.Function, context_type: ?*const T
         const t = try types.unionOf(this.arena, ctx.returns.items);
         const literal_context = if (ctx.contextual_return) |c| types.couldHaveSingletons(c) else false;
         returns = if (literal_context) t else try types.widenFresh(this.arena, t);
+        if (ctx.returns.items.len == 1 and !end_reachable and !ctx.empty_return and returns.* == .boolean) {
+            signature.predicate = try this.inferPredicate(f, ctx.first_return.?);
+        }
     }
     if (keep) {
         if (info.circular and mode == .check) {
@@ -5260,6 +6153,51 @@ fn checkFunction(this: *Checker, f: *const ast.Function, context_type: ?*const T
     signature.returns = returns;
     signature.pending = false;
     return self_type;
+}
+
+/// The type predicate tsc 5.5 infers for a function that returns a test of a parameter, like
+/// `(x: string | null) => x !== null`: `x is T` when the test passing means `x` is a `T`, and its
+/// failing means it isn't (tsc's `getTypePredicateFromBody`).
+fn inferPredicate(this: *Checker, f: *const ast.Function, site: ReturnSite) Error!?types.Function.Predicate {
+    const saved_flow = this.flow;
+    const saved_scope = this.scope;
+    // Checked again where it's returned, its names meaning what they did there.
+    this.muted += 1;
+    this.aliased += 1;
+    defer {
+        this.flow = saved_flow;
+        this.scope = saved_scope;
+        this.muted -= 1;
+        this.aliased -= 1;
+    }
+    for (f.parameters, 0..) |p, i| {
+        if (p.pattern != null or p.rest) {
+            continue;
+        }
+        const slot = this.slot_base + p.binding;
+        const declared = this.variable(slot).declared orelse continue;
+        if (declared.* == .boolean or try this.lastAssignment(slot) != .never) {
+            // Refining `x: boolean` to `x is true` isn't useful.
+            continue;
+        }
+        this.scope = site.scope;
+        this.flow = try this.copyFlow(site.flow);
+        const branches = try this.condition(site.expr, null, null);
+        const narrowed = if (branches.when_true.reachable) branches.when_true.vars[slot].type orelse declared else types.never;
+        if (narrowed == declared or narrowed.eql(declared)) {
+            continue;
+        }
+        // "x is T" means x is a T if and only if it returns true: starting from a T, failing the
+        // test has to leave nothing.
+        this.flow = try this.copyFlow(site.flow);
+        this.flow.vars[slot].type = narrowed;
+        const again = try this.condition(site.expr, null, null);
+        const rest = if (again.when_false.reachable) again.when_false.vars[slot].type orelse narrowed else types.never;
+        if (rest.* == .never) {
+            return .{ .index = i, .name = p.name, .type = try types.regular(this.arena, narrowed) };
+        }
+    }
+    return null;
 }
 
 fn reportCircular(this: *Checker, f: *const ast.Function, name: ?ast.Function.Name) Error!void {
@@ -5368,6 +6306,9 @@ fn returnStatement(this: *Checker, stmt: *const Stmt, value: ?*const Expr) Error
         return;
     };
     if (value) |v| {
+        if (ctx.returns.items.len == 0 and ctx.declared_return == null) {
+            ctx.first_return = .{ .expr = v, .flow = try this.copyFlow(this.flow), .scope = this.scope };
+        }
         const t = try this.contextual(v, ctx.declared_return orelse ctx.contextual_return);
         if (ctx.declared_return) |r| {
             try this.checkAssignable(v, t, r, stmt.start, .assignment);
@@ -5465,7 +6406,17 @@ fn elaborate(this: *Checker, source: *const Type, target: *const Type) Error![]c
         const mismatch = types.objectMismatch(source, object, null) orelse return "";
         const shown = target_shown(target, object);
         return switch (mismatch) {
-            .not_object, .missing => "",
+            .not_object, .missing, .signature, .index => "",
+            .index_missing => |kind| std.fmt.allocPrint(this.arena, "\n  Index signature for type '{s}' is missing in type '{f}'.", .{ kind, source }),
+            .index_property => |name| blk: {
+                if (source.* != .object) {
+                    break :blk "";
+                }
+                const from = source.object.property(name).?;
+                const index = if (types.isNumericName(name)) object.number_index orelse object.string_index else object.string_index;
+                const to = index.?.type;
+                break :blk std.fmt.allocPrint(this.arena, "\n  Property '{s}' is incompatible with index signature.\n    Type '{f}' is not assignable to type '{f}'.", .{ name, try this.shownSource(from, to), to });
+            },
             .optional => |name| std.fmt.allocPrint(this.arena, "\n  Property '{s}' is optional in type '{f}' but required in type '{f}'.", .{ name, source, shown }),
             .property => |name| blk: {
                 if (source.* != .object) {
@@ -5791,9 +6742,14 @@ fn uses(this: *const Checker, expr: *const Expr, target: *const Expr) bool {
                 break true;
             }
         } else false,
-        .paren, .chain, .non_null => |inner| this.uses(inner, target),
+        .paren, .chain, .non_null, .spread => |inner| this.uses(inner, target),
         .assertion => |a| this.uses(a.expr, target),
         .unary => |u| this.uses(u.operand, target),
+        .new => |n| this.uses(n.callee, target) or for (n.arguments) |arg| {
+            if (this.uses(arg, target)) {
+                break true;
+            }
+        } else false,
         .update => |u| this.uses(u.operand, target),
         .assign => |a| this.uses(a.target, target) or this.uses(a.value, target),
         .binary => |b| this.uses(b.left, target) or this.uses(b.right, target),
@@ -5859,7 +6815,7 @@ fn usesInStatement(this: *const Checker, stmt: *const Stmt, target: *const Expr)
             (if (f.update) |u| this.uses(u, target) else false) or
             this.usesInStatement(f.body, target),
         .labeled => |l| this.usesInStatement(l.body, target),
-        .interface, .type_alias => false,
+        .interface, .type_alias, .declare => false,
         .throw => |e| this.uses(e, target),
         .for_each => |f| (f.head == .target and this.uses(f.head.target, target)) or this.uses(f.right, target) or this.usesInStatement(f.body, target),
         .@"switch" => |sw| this.uses(sw.discriminant, target) or for (sw.clauses) |clause| {
