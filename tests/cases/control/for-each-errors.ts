@@ -5,7 +5,7 @@ for (const k in 5) { //! TS2407
 let n = 0;
 for (n of ["a"]) { //! TS2322
 }
-for (const c of "abc") { //! ZV9001
+for (const c of { a: 1 }) { //! TS2488
 }
 const o = { a: 1 };
 for (o.a of [1]) { //! ZV9001

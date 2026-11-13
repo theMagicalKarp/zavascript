@@ -19,6 +19,8 @@ pub const Test = union(enum) {
     typeof: []const u8,
     /// `name in x`.
     in: []const u8,
+    /// A call of a type guard, `(x: unknown) => x is T`, with `x`.
+    guard: *const Type,
 };
 
 /// The type of something of type `t` once `test` is known to be `assume`. Null when the narrowed
@@ -29,7 +31,51 @@ pub fn narrow(arena: std.mem.Allocator, t: *const Type, test_: Test, assume: boo
         .equal => |e| try equality(arena, t, e.value, e.loose, assume),
         .typeof => |name| typeOf(arena, t, name, assume),
         .in => |name| inKeyword(arena, t, name, assume),
+        .guard => |candidate| guard(arena, t, candidate, assume),
     };
+}
+
+/// tsc's `getNarrowedType` for a type guard: when it passes, the members of `t` that are a `T`
+/// (or `T` itself, for a member it's part of); when it fails, the members that aren't.
+fn guard(arena: std.mem.Allocator, t: *const Type, candidate: *const Type, assume: bool) Error!?*const Type {
+    if (!assume) {
+        if (t.* == .any) {
+            return t;
+        }
+        var kept: std.ArrayList(*const Type) = .empty;
+        for (try types.expandedMembers(arena, t)) |m| {
+            if (!types.assignable(m, candidate)) {
+                try kept.append(arena, m);
+            }
+        }
+        return try types.unionOf(arena, kept.items);
+    }
+    if (t.* == .any or t.* == .unknown) {
+        return candidate;
+    }
+    var kept: std.ArrayList(*const Type) = .empty;
+    var c_buffer: [1]*const Type = undefined;
+    for (candidate.members(&c_buffer)) |c| {
+        for (try types.expandedMembers(arena, t)) |m| {
+            if (types.assignable(m, c)) {
+                try kept.append(arena, m);
+            } else if (types.assignable(c, m)) {
+                try kept.append(arena, c);
+            }
+        }
+    }
+    const narrowed = try types.unionOf(arena, kept.items);
+    if (narrowed.* != .never) {
+        return narrowed;
+    }
+    if (types.assignable(candidate, t)) {
+        return candidate;
+    }
+    if (types.assignable(t, candidate)) {
+        return t;
+    }
+    // That'd be an intersection.
+    return null;
 }
 
 /// `null` or `undefined` taken out: what tsc's `NEUndefinedOrNull` facts leave.
@@ -136,9 +182,9 @@ fn equality(arena: std.mem.Allocator, t: *const Type, value_type: *const Type, l
         if (!loose and (t.* == .unknown or has_empty)) {
             switch (value.*) {
                 .void, .undefined, .null, .boolean, .number, .string, .bigint, .literal => return value,
-                .object, .function, .array, .tuple, .readonly_array => return if (types.isEmptyObject(value)) value else null,
+                .object, .function, .array, .tuple, .readonly_array, .non_primitive, .intersection => return if (types.isEmptyObject(value)) value else null,
                 // That'd be an intersection with the type parameter.
-                .param, .keyof, .indexed, .mapped => return null,
+                .param, .keyof, .indexed, .mapped, .intrinsic => return null,
                 // A union, `any`, `unknown` or `never` says nothing tsc keeps: what can be
                 // compared with it stays.
                 .@"union", .any, .unknown, .never => if (t.* == .unknown) return t,
@@ -217,9 +263,9 @@ fn typeofName(t: *const Type) ?[]const u8 {
         },
         .undefined, .void => "undefined",
         .null, .array, .tuple, .readonly_array, .mapped => "object",
-        .object => if (types.isEmptyObject(t)) null else "object",
+        .object => |o| if (o.calls.len > 0 or o.constructs.len > 0) "function" else if (types.isEmptyObject(t)) null else "object",
         .function => "function",
-        .any, .unknown, .never, .@"union", .param, .keyof, .indexed => null,
+        .any, .unknown, .never, .@"union", .param, .keyof, .indexed, .non_primitive, .intersection, .intrinsic => null,
     };
 }
 

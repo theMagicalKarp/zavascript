@@ -15,5 +15,5 @@ const arr: number[] = [1, "x", 3]; //! TS2322
 const nested: number[][] = [[1], ["a"]]; //! TS2322
 pair.length = 3; //! TS2322
 xs.length = 0; //! ZV9001
-xs.push(4); //! ZV9001
+xs.push("4"); //! TS2345
 let empty = []; //! ZV9001

@@ -35,6 +35,30 @@ pub const Type = union(enum) {
     indexed: Indexed,
     /// `{ [P in K]: X }`, when `K` is generic.
     mapped: *const Mapped,
+    /// tsc's `object`: anything but a primitive.
+    non_primitive,
+    /// `A & B`, with at least two members. Only the library has these so far.
+    intersection: []const *const Type,
+    /// A type the checker computes from its arguments, like `FlatArray<A, D>`, while they're
+    /// still generic.
+    intrinsic: Intrinsic,
+
+    pub const Intrinsic = struct {
+        kind: IntrinsicKind,
+        arguments: []const *const Type,
+
+        pub const IntrinsicKind = enum {
+            /// `FlatArray<A, D>`: the elements of the array type `A` flattened `D` levels deep, as
+            /// `flat` returns them.
+            flat_array,
+
+            pub fn name(this: IntrinsicKind) []const u8 {
+                return switch (this) {
+                    .flat_array => "FlatArray",
+                };
+            }
+        };
+    };
 
     pub const Indexed = struct {
         object: *const Type,
@@ -76,6 +100,16 @@ pub const Type = union(enum) {
             .mapped => false,
             .tuple => |es| b.* == .tuple and es.len == b.tuple.len and for (es, b.tuple) |x, y| {
                 if (!x.eql(y)) {
+                    break false;
+                }
+            } else true,
+            .intersection => |ms| b.* == .intersection and ms.len == b.intersection.len and for (ms, b.intersection) |x, y| {
+                if (!x.eql(y)) {
+                    break false;
+                }
+            } else true,
+            .intrinsic => |x| b.* == .intrinsic and x.kind == b.intrinsic.kind and for (x.arguments, b.intrinsic.arguments) |p, q| {
+                if (!p.eql(q)) {
                     break false;
                 }
             } else true,
@@ -144,6 +178,17 @@ pub const Type = union(enum) {
                     try writer.print("{s}{f}", .{ if (i > 0) ", " else "", e });
                 }
                 try writer.writeAll("]");
+            },
+            .non_primitive => try writer.writeAll("object"),
+            .intersection => |ms| for (ms, 0..) |m, i| {
+                if (i > 0) {
+                    try writer.writeAll(" & ");
+                }
+                try m.formatParenthesized(writer, m.* == .function or m.* == .@"union");
+            },
+            .intrinsic => |x| {
+                try writer.writeAll(x.kind.name());
+                try formatArguments(writer, x.arguments);
             },
             else => try writer.writeAll(@tagName(this.*)),
         }
@@ -223,6 +268,17 @@ pub const Object = struct {
     /// by its members and compared structurally; a named one is only equal to itself.
     name: []const u8 = "",
     properties: []const Property,
+    /// Call signatures, `(x: T): R`, in the order overloads are tried.
+    calls: []const *const Function = &.{},
+    /// Construct signatures, `new (x: T): R`.
+    constructs: []const *const Function = &.{},
+    /// `[key: string]: T`
+    string_index: ?Index = null,
+    /// `[key: number]: T`
+    number_index: ?Index = null,
+    /// Declared by an interface, which (unlike an object literal or a type literal) doesn't get
+    /// an implicit index signature: it isn't assignable to `{ [key: string]: T }`.
+    interface: bool = false,
     /// For an instantiation of a generic interface or type alias (`Box<number>`), its type
     /// arguments; for the generic declaration itself, its own type parameters.
     type_arguments: []const *const Type = &.{},
@@ -244,9 +300,37 @@ pub const Object = struct {
         return null;
     }
 
+    pub const Index = struct {
+        type: *const Type,
+        readonly: bool = false,
+    };
+
+    /// Whether it's callable or constructable, or has index signatures.
+    pub fn hasSignatures(this: *const Object) bool {
+        return this.calls.len > 0 or this.constructs.len > 0 or this.string_index != null or this.number_index != null;
+    }
+
     fn eql(a: *const Object, b: *const Object) bool {
         if (a.name.len > 0 or b.name.len > 0 or a.properties.len != b.properties.len) {
             return false;
+        }
+        if (a.hasSignatures() or b.hasSignatures()) {
+            if (a.calls.len != b.calls.len or a.constructs.len != b.constructs.len) {
+                return false;
+            }
+            for (a.calls, b.calls) |x, y| {
+                if (!x.eql(y)) {
+                    return false;
+                }
+            }
+            for (a.constructs, b.constructs) |x, y| {
+                if (!x.eql(y)) {
+                    return false;
+                }
+            }
+            if (!indexEql(a.string_index, b.string_index) or !indexEql(a.number_index, b.number_index)) {
+                return false;
+            }
         }
         for (a.properties) |p| {
             const q = b.find(p.name) orelse return false;
@@ -263,10 +347,31 @@ pub const Object = struct {
             try formatArguments(writer, this.type_arguments);
             return;
         }
-        if (this.properties.len == 0) {
+        if (this.properties.len == 0 and !this.hasSignatures()) {
             return writer.writeAll("{}");
         }
+        // tsc shows an object type with nothing but one call signature as a function type.
+        if (this.properties.len == 0 and this.calls.len == 1 and this.constructs.len == 0 and this.string_index == null and this.number_index == null) {
+            return this.calls[0].format(writer);
+        }
         try writer.writeAll("{ ");
+        for (this.calls) |f| {
+            try f.formatParameters(writer);
+            try writer.writeAll(": ");
+            try f.formatReturns(writer);
+            try writer.writeAll("; ");
+        }
+        for (this.constructs) |f| {
+            try writer.writeAll("new ");
+            try f.formatParameters(writer);
+            try writer.print(": {f}; ", .{f.returns});
+        }
+        if (this.string_index) |index| {
+            try writer.print("{s}[x: string]: {f}; ", .{ if (index.readonly) "readonly " else "", index.type });
+        }
+        if (this.number_index) |index| {
+            try writer.print("{s}[x: number]: {f}; ", .{ if (index.readonly) "readonly " else "", index.type });
+        }
         for (this.properties) |p| {
             if (p.readonly) {
                 try writer.writeAll("readonly ");
@@ -274,7 +379,9 @@ pub const Object = struct {
             try writer.print("{s}{s}", .{ p.name, if (p.optional) "?" else "" });
             if (p.method and p.type.* == .function) {
                 try p.type.function.formatParameters(writer);
-                try writer.print(": {f}; ", .{p.type.function.returns});
+                try writer.writeAll(": ");
+                try p.type.function.formatReturns(writer);
+                try writer.writeAll("; ");
             } else {
                 try writer.print(": {f}; ", .{p.type});
             }
@@ -290,6 +397,13 @@ pub const Parameter = struct {
     /// It has a `?` or a default value, so an argument for it can be left out.
     optional: bool = false,
 };
+
+fn indexEql(a: ?Object.Index, b: ?Object.Index) bool {
+    if (a == null or b == null) {
+        return a == null and b == null;
+    }
+    return a.?.readonly == b.?.readonly and a.?.type.eql(b.?.type);
+}
 
 fn formatArguments(writer: *std.Io.Writer, arguments: []const *const Type) std.Io.Writer.Error!void {
     if (arguments.len == 0) {
@@ -313,6 +427,15 @@ pub const Function = struct {
     /// The return type is still being inferred from the body, and is `any` until it is. A call
     /// in the meantime is a circular reference (TS7023).
     pending: bool = false,
+    /// A type guard's `x is T`; it returns `boolean`.
+    predicate: ?Predicate = null,
+
+    pub const Predicate = struct {
+        /// The parameter it's about.
+        index: usize,
+        name: []const u8,
+        type: *const Type,
+    };
 
     /// How many arguments a call must pass.
     pub fn minArguments(this: *const Function) usize {
@@ -354,6 +477,14 @@ pub const Function = struct {
                 return false;
             }
         }
+        if ((a.predicate == null) != (b.predicate == null)) {
+            return false;
+        }
+        if (a.predicate) |p| {
+            if (p.index != b.predicate.?.index or !p.type.eql(b.predicate.?.type)) {
+                return false;
+            }
+        }
         if (a.rest) |r| {
             if (!std.mem.eql(u8, r.name, b.rest.?.name) or !r.type.eql(b.rest.?.type)) {
                 return false;
@@ -364,10 +495,18 @@ pub const Function = struct {
 
     pub fn format(this: *const Function, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try this.formatParameters(writer);
-        try writer.print(" => {f}", .{this.returns});
+        try writer.writeAll(" => ");
+        try this.formatReturns(writer);
     }
 
-    fn formatParameters(this: *const Function, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    pub fn formatReturns(this: *const Function, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (this.predicate) |p| {
+            return writer.print("{s} is {f}", .{ p.name, p.type });
+        }
+        try writer.print("{f}", .{this.returns});
+    }
+
+    pub fn formatParameters(this: *const Function, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         if (this.type_parameters.len > 0) {
             try writer.writeAll("<");
             for (this.type_parameters, 0..) |t, i| {
@@ -606,7 +745,7 @@ fn printRank(t: *const Type) u8 {
             else => 5,
         },
         .void => 6,
-        .object, .function, .array, .tuple, .readonly_array, .param, .keyof, .indexed, .mapped => 7,
+        .object, .function, .array, .tuple, .readonly_array, .param, .keyof, .indexed, .mapped, .non_primitive, .intersection, .intrinsic => 7,
         .null => 8,
         .undefined => 9,
         .any, .unknown, .never, .@"union" => 10,
@@ -733,7 +872,7 @@ fn overlaps(x: *const Type, y: *const Type, nullish_with_anything: bool) bool {
 
 fn isObjectLike(t: *const Type) bool {
     return switch (t.*) {
-        .object, .function, .array, .tuple, .readonly_array, .mapped => true,
+        .object, .function, .array, .tuple, .readonly_array, .mapped, .non_primitive, .intersection => true,
         else => false,
     };
 }
@@ -973,6 +1112,23 @@ fn assignableIn(source: *const Type, target: *const Type, assumed: ?*const Assum
         }
         return false;
     }
+    if (target.* == .intersection) {
+        for (target.intersection) |m| {
+            if (!assignableIn(source, m, assumed)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (source.* == .intersection) {
+        for (source.intersection) |m| {
+            if (assignableIn(m, target, assumed)) {
+                return true;
+            }
+        }
+        // Together, the members can have what an object type needs.
+        return target.* == .object and objectMismatch(source, target.object, assumed) == null;
+    }
     return switch (target.*) {
         .number => isNumberLike(source),
         .string => isStringLike(source),
@@ -994,10 +1150,63 @@ fn assignableIn(source: *const Type, target: *const Type, assumed: ?*const Assum
                 break false;
             }
         } else true,
-        .function => |f| source.* == .function and functionMismatchIn(source.function, f, assumed) == null,
+        .function => |f| switch (source.*) {
+            .function => |sf| functionMismatchIn(sf, f, assumed) == null,
+            // One of an overloaded function's signatures has to do.
+            .object => |o| for (o.calls) |sf| {
+                if (functionMismatchIn(sf, f, assumed) == null) {
+                    break true;
+                }
+            } else false,
+            else => false,
+        },
         .object => |o| objectMismatch(source, o, assumed) == null,
+        .non_primitive => isNonPrimitive(source),
         else => false,
     };
+}
+
+/// Whether every value of type `t` is an object, so `t` is assignable to `object`.
+fn isNonPrimitive(t: *const Type) bool {
+    return switch (t.*) {
+        .object, .function, .array, .tuple, .readonly_array, .non_primitive, .mapped => true,
+        .intersection => |ms| for (ms) |m| {
+            if (isNonPrimitive(m)) {
+                break true;
+            }
+        } else false,
+        else => false,
+    };
+}
+
+/// What the checker knows about `lib.d.ts`, for relating primitives, arrays and functions to
+/// object types by their apparent types: `string` to `{ length: number }`, or `number[]` to
+/// `Iterable<number>`. Set while a program is checked; without it, only `length` is known.
+pub threadlocal var library: ?Library = null;
+
+pub const Library = struct {
+    context: *anyopaque,
+    /// The interface instantiation whose members `t` has: `String` for `string`, `Array<T>` for
+    /// `T[]`. Null if there's none.
+    apparent: *const fn (context: *anyopaque, t: *const Type) ?*const Type,
+};
+
+/// The object type of the members a primitive, array or function has, if the library says.
+pub fn apparentObject(t: *const Type) ?*const Object {
+    const l = library orelse return null;
+    const a = l.apparent(l.context, t) orelse return null;
+    return if (a.* == .object) a.object else null;
+}
+
+/// A property of an intersection: the first member's that has it.
+fn intersectionProperty(members_: []const *const Type, name: []const u8) ?*const Property {
+    for (members_) |m| {
+        switch (m.*) {
+            .object => |o| if (o.find(name)) |p| return p,
+            else => if (apparentObject(m)) |o| if (o.find(name)) |p| return p,
+        }
+    }
+    return null;
 }
 
 /// Why `source` isn't assignable to the object type `target`, for tsc's elaborations, or null if
@@ -1011,6 +1220,15 @@ pub const ObjectMismatch = union(enum) {
     optional: []const u8,
     /// The types of this property don't match.
     property: []const u8,
+    /// Its call or construct signatures don't match.
+    signature,
+    /// It has no index signature for keys of this type (`"string"` or `"number"`), and can't have
+    /// an implicit one.
+    index_missing: []const u8,
+    /// Its index signature doesn't match the index signature for keys of this type.
+    index: []const u8,
+    /// This property of the source doesn't match the target's index signature.
+    index_property: []const u8,
 };
 
 pub fn objectMismatch(source: *const Type, target: *const Object, assumed: ?*const Assumption) ?ObjectMismatch {
@@ -1042,8 +1260,134 @@ pub fn objectMismatch(source: *const Type, target: *const Object, assumed: ?*con
                     return .{ .optional = p.name };
                 }
             }
+            return signatureMismatch(s, target, &link);
+        },
+        .intersection => |ms| {
+            for (target.properties) |p| {
+                const sp = intersectionProperty(ms, p.name) orelse if (p.optional) continue else return .missing;
+                if (!assignableIn(sp.type, p.type, assumed)) {
+                    return .{ .property = p.name };
+                }
+            }
             return null;
         },
+        .function => |f| {
+            if (target.calls.len > 0) {
+                for (target.calls) |tf| {
+                    if (functionMismatchIn(f, tf, assumed) != null) {
+                        return .signature;
+                    }
+                }
+            }
+            if (target.constructs.len > 0) {
+                return .signature;
+            }
+            return primitiveMismatch(source, target, assumed);
+        },
+        .non_primitive => {
+            for (target.properties) |p| {
+                if (!p.optional) {
+                    return .missing;
+                }
+            }
+            return if (target.hasSignatures()) .signature else null;
+        },
+        else => return primitiveMismatch(source, target, assumed),
+    }
+}
+
+/// Whether the call, construct and index signatures of `source` do what `target`'s need.
+fn signatureMismatch(source: *const Object, target: *const Object, assumed: ?*const Assumption) ?ObjectMismatch {
+    for (target.calls) |tf| {
+        const found = for (source.calls) |sf| {
+            if (functionMismatchIn(sf, tf, assumed) == null) {
+                break true;
+            }
+        } else false;
+        if (!found) {
+            return .signature;
+        }
+    }
+    for (target.constructs) |tf| {
+        const found = for (source.constructs) |sf| {
+            if (functionMismatchIn(sf, tf, assumed) == null) {
+                break true;
+            }
+        } else false;
+        if (!found) {
+            return .signature;
+        }
+    }
+    if (target.string_index) |index| {
+        if (source.string_index) |si| {
+            if (!assignableIn(si.type, index.type, assumed)) {
+                return .{ .index = "string" };
+            }
+        } else if (source.interface) {
+            return .{ .index_missing = "string" };
+        }
+        if (source.number_index) |si| {
+            if (!assignableIn(si.type, index.type, assumed)) {
+                return .{ .index = "string" };
+            }
+        }
+        for (source.properties) |p| {
+            if (!assignableIn(propertyValueType(p), index.type, assumed)) {
+                return .{ .index_property = p.name };
+            }
+        }
+    }
+    if (target.number_index) |index| {
+        if (source.number_index orelse source.string_index) |si| {
+            if (!assignableIn(si.type, index.type, assumed)) {
+                return .{ .index = "number" };
+            }
+        } else if (source.interface) {
+            return .{ .index_missing = "number" };
+        }
+        for (source.properties) |p| {
+            if (isNumericName(p.name) and !assignableIn(propertyValueType(p), index.type, assumed)) {
+                return .{ .index_property = p.name };
+            }
+        }
+    }
+    return null;
+}
+
+/// What a property contributes to an implicit index signature: an optional one's type without
+/// the `undefined` its optionality adds.
+fn propertyValueType(p: Property) *const Type {
+    if (!p.optional or p.type.* != .@"union") {
+        return p.type;
+    }
+    for (p.type.@"union") |m| {
+        if (m.* == .undefined) {
+            // Only two members: the declared type and `undefined`.
+            if (p.type.@"union".len == 2) {
+                return if (p.type.@"union"[0] == m) p.type.@"union"[1] else p.type.@"union"[0];
+            }
+        }
+    }
+    return p.type;
+}
+
+/// tsc's `isNumericLiteralName`: a name a number turns into, like `0` or `1.5`.
+pub fn isNumericName(name: []const u8) bool {
+    const n = std.fmt.parseFloat(f64, name) catch return false;
+    var buffer: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buffer);
+    @import("../runtime/number.zig").format(&w, n) catch return false;
+    return std.mem.eql(u8, w.buffered(), name);
+}
+
+/// A primitive, array or function, related to an object type through its apparent type.
+fn primitiveMismatch(source: *const Type, target: *const Object, assumed: ?*const Assumption) ?ObjectMismatch {
+    if (apparentObject(source)) |apparent| {
+        const a: Type = .{ .object = apparent };
+        // An array's apparent type has the array's index signature.
+        return objectMismatch(&a, target, assumed);
+    }
+    switch (source.*) {
         else => {
             // Primitives, arrays and functions: of the properties they have, only `length` is
             // known so far.
@@ -1060,7 +1404,7 @@ pub fn objectMismatch(source: *const Type, target: *const Object, assumed: ?*con
                     return .{ .property = p.name };
                 }
             }
-            return null;
+            return if (target.hasSignatures()) .signature else null;
         },
     }
 }
@@ -1074,8 +1418,11 @@ pub fn missingProperties(arena: std.mem.Allocator, source: *const Type, target: 
         }
         const has = switch (source.*) {
             .object => |s| s.find(p.name) != null,
-            .array, .readonly_array, .tuple, .function => std.mem.eql(u8, p.name, "length"),
-            else => false,
+            .intersection => |ms| intersectionProperty(ms, p.name) != null,
+            else => if (apparentObject(source)) |o| o.find(p.name) != null else switch (source.*) {
+                .array, .readonly_array, .tuple, .function => std.mem.eql(u8, p.name, "length"),
+                else => false,
+            },
         };
         if (!has) {
             try missing.append(arena, p.name);
@@ -1130,6 +1477,13 @@ fn functionMismatchIn(source: *const Function, target: *const Function, outer: ?
     }
     if (target.returns.* != .void and !assignableIn(source.returns, target.returns, assumed)) {
         return .returns;
+    }
+    // A type guard has to guard what the target's does, with a type assignable to its.
+    if (target.predicate) |tp| {
+        const sp = source.predicate orelse return .returns;
+        if (sp.index != tp.index or !assignableIn(sp.type, tp.type, assumed)) {
+            return .returns;
+        }
     }
     return null;
 }
@@ -1188,8 +1542,8 @@ pub fn couldHaveSingletons(t: *const Type) bool {
 /// (an object with an `a`) is known.
 pub fn isGeneric(t: *const Type) bool {
     return switch (t.*) {
-        .param, .keyof, .indexed, .mapped => true,
-        .@"union" => |ms| for (ms) |m| {
+        .param, .keyof, .indexed, .mapped, .intrinsic => true,
+        .@"union", .intersection => |ms| for (ms) |m| {
             if (isGeneric(m)) {
                 break true;
             }
@@ -1202,8 +1556,8 @@ pub fn isGeneric(t: *const Type) bool {
 /// as, and nor do the members of named types other than their type arguments).
 pub fn mentionsParameters(t: *const Type) bool {
     return switch (t.*) {
-        .param, .keyof, .indexed, .mapped => true,
-        .@"union", .tuple => |ms| for (ms) |m| {
+        .param, .keyof, .indexed, .mapped, .intrinsic => true,
+        .@"union", .tuple, .intersection => |ms| for (ms) |m| {
             if (mentionsParameters(m)) {
                 break true;
             }
@@ -1217,14 +1571,31 @@ pub fn mentionsParameters(t: *const Type) bool {
             if (mentionsParameters(p.type)) {
                 break true;
             }
-        } else false,
-        .function => |f| mentionsParameters(f.returns) or (if (f.rest) |r| mentionsParameters(r.type) else false) or for (f.parameters) |p| {
-            if (mentionsParameters(p.type)) {
+        } else for (o.calls) |f| {
+            if (functionMentionsParameters(f)) {
                 break true;
             }
-        } else false,
+        } else for (o.constructs) |f| {
+            if (functionMentionsParameters(f)) {
+                break true;
+            }
+        } else (if (o.string_index) |i| mentionsParameters(i.type) else false) or (if (o.number_index) |i| mentionsParameters(i.type) else false),
+        .function => |f| functionMentionsParameters(f),
         else => false,
     };
+}
+
+fn functionMentionsParameters(f: *const Function) bool {
+    if (f.predicate) |p| {
+        if (mentionsParameters(p.type)) {
+            return true;
+        }
+    }
+    return mentionsParameters(f.returns) or (if (f.rest) |r| mentionsParameters(r.type) else false) or for (f.parameters) |p| {
+        if (mentionsParameters(p.type)) {
+            break true;
+        }
+    } else false;
 }
 
 /// What a generic type is known to be, whatever it's instantiated with (tsc's
@@ -1358,34 +1729,96 @@ pub fn instantiate(arena: std.mem.Allocator, t: *const Type, mapper: *const Mapp
                 x.type = try instantiate(arena, p.type, mapper);
                 changed = changed or x.type != p.type;
             }
+            const calls = try instantiateSignatures(arena, o.calls, mapper, &changed);
+            const constructs = try instantiateSignatures(arena, o.constructs, mapper, &changed);
+            var string_index = o.string_index;
+            if (string_index) |*i| {
+                const x = try instantiate(arena, i.type, mapper);
+                changed = changed or x != i.type;
+                i.type = x;
+            }
+            var number_index = o.number_index;
+            if (number_index) |*i| {
+                const x = try instantiate(arena, i.type, mapper);
+                changed = changed or x != i.type;
+                i.type = x;
+            }
             if (!changed) {
                 break :blk t;
             }
             const object = try arena.create(Object);
-            object.* = .{ .properties = properties };
+            object.* = o.*;
+            object.properties = properties;
+            object.calls = calls;
+            object.constructs = constructs;
+            object.string_index = string_index;
+            object.number_index = number_index;
             break :blk asPtr(.{ .object = object }, arena);
+        },
+        .intersection => |ms| blk: {
+            var changed = false;
+            const list = try arena.alloc(*const Type, ms.len);
+            for (ms, list) |m, *x| {
+                x.* = try instantiate(arena, m, mapper);
+                changed = changed or x.* != m;
+            }
+            break :blk if (changed) intersectionOf(arena, list) else t;
+        },
+        .intrinsic => |x| blk: {
+            var changed = false;
+            const list = try arena.alloc(*const Type, x.arguments.len);
+            for (x.arguments, list) |a, *y| {
+                y.* = try instantiate(arena, a, mapper);
+                changed = changed or y.* != a;
+            }
+            break :blk if (changed) intrinsic(arena, x.kind, list) else t;
         },
         .function => |f| blk: {
             var changed = false;
+            // A generic method of a generic interface, like `filter<S extends T>` of `Array<T>`,
+            // gets type parameters of its own whose constraints are instantiated too.
+            var type_parameters = f.type_parameters;
+            var inner = mapper.*;
+            if (f.type_parameters.len > 0 and constraintsMention(f.type_parameters, mapper)) {
+                const fresh = try arena.alloc(*const Type, f.type_parameters.len);
+                const params = try arena.alloc(Param, f.type_parameters.len);
+                for (f.type_parameters, params, fresh) |old, *p, *x| {
+                    p.* = .{ .name = old.param.name };
+                    x.* = try asPtr(.{ .param = p }, arena);
+                }
+                inner = mapper.with(try std.mem.concat(arena, *const Type, &.{ mapper.from, f.type_parameters }), try std.mem.concat(arena, *const Type, &.{ mapper.to, fresh }));
+                for (f.type_parameters, params) |old, *p| {
+                    p.constraint = if (old.param.constraint) |c| try instantiate(arena, c, &inner) else null;
+                    p.default = if (old.param.default) |d| try instantiate(arena, d, &inner) else null;
+                }
+                type_parameters = fresh;
+                changed = true;
+            }
             const parameters = try arena.alloc(Parameter, f.parameters.len);
             for (f.parameters, parameters) |p, *x| {
                 x.* = p;
-                x.type = try instantiate(arena, p.type, mapper);
+                x.type = try instantiate(arena, p.type, &inner);
                 changed = changed or x.type != p.type;
             }
             var rest = f.rest;
             if (rest) |*r| {
-                const x = try instantiate(arena, r.type, mapper);
+                const x = try instantiate(arena, r.type, &inner);
                 changed = changed or x != r.type;
                 r.type = x;
             }
-            const returns = try instantiate(arena, f.returns, mapper);
+            const returns = try instantiate(arena, f.returns, &inner);
             changed = changed or returns != f.returns;
+            var predicate = f.predicate;
+            if (predicate) |*p| {
+                const x = try instantiate(arena, p.type, &inner);
+                changed = changed or x != p.type;
+                p.type = x;
+            }
             if (!changed) {
                 break :blk t;
             }
             const function = try arena.create(Function);
-            function.* = .{ .type_parameters = f.type_parameters, .parameters = parameters, .rest = rest, .returns = returns };
+            function.* = .{ .type_parameters = type_parameters, .parameters = parameters, .rest = rest, .returns = returns, .predicate = predicate };
             break :blk asPtr(.{ .function = function }, arena);
         },
         .keyof => |e| blk: {
@@ -1430,6 +1863,143 @@ pub fn instantiate(arena: std.mem.Allocator, t: *const Type, mapper: *const Mapp
     };
 }
 
+/// Whether the constraints or defaults of `parameters` mention what `mapper` maps.
+fn constraintsMention(parameters: []const *const Type, mapper: *const Mapper) bool {
+    for (parameters) |p| {
+        for ([_]?*const Type{ p.param.constraint, p.param.default }) |c| {
+            const t = c orelse continue;
+            for (mapper.from) |from| {
+                if (refersToParameter(t, from)) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+/// Whether `t` mentions the type parameter `parameter`, looking only as far as
+/// `mentionsParameters` does.
+fn refersToParameter(t: *const Type, parameter: *const Type) bool {
+    return switch (t.*) {
+        .param => t == parameter,
+        .keyof => |e| refersToParameter(e, parameter),
+        .indexed => |x| refersToParameter(x.object, parameter) or refersToParameter(x.index, parameter),
+        .@"union", .tuple, .intersection => |ms| for (ms) |m| {
+            if (refersToParameter(m, parameter)) {
+                break true;
+            }
+        } else false,
+        .array, .readonly_array => |e| refersToParameter(e, parameter),
+        .object => |o| for (o.type_arguments) |a| {
+            if (refersToParameter(a, parameter)) {
+                break true;
+            }
+        } else for (o.properties) |p| {
+            if (refersToParameter(p.type, parameter)) {
+                break true;
+            }
+        } else (if (o.string_index) |i| refersToParameter(i.type, parameter) else false),
+        .function => |f| refersToParameter(f.returns, parameter) or for (f.parameters) |p| {
+            if (refersToParameter(p.type, parameter)) {
+                break true;
+            }
+        } else false,
+        else => false,
+    };
+}
+
+fn instantiateSignatures(arena: std.mem.Allocator, signatures: []const *const Function, mapper: *const Mapper, changed: *bool) Error![]const *const Function {
+    if (signatures.len == 0) {
+        return signatures;
+    }
+    const list = try arena.alloc(*const Function, signatures.len);
+    for (signatures, list) |f, *x| {
+        const t: Type = .{ .function = f };
+        const instantiated = try instantiate(arena, &t, mapper);
+        x.* = instantiated.function;
+        changed.* = changed.* or x.* != f;
+    }
+    return list;
+}
+
+/// `A & B`: the members flattened, without duplicates or `unknown`, or `never` if one is `never`.
+pub fn intersectionOf(arena: std.mem.Allocator, parts: []const *const Type) Error!*const Type {
+    var list: std.ArrayList(*const Type) = .empty;
+    for (parts) |part| {
+        if (part.* == .never) {
+            return never;
+        }
+        if (part.* == .any) {
+            return any;
+        }
+        const ms: []const *const Type = if (part.* == .intersection) part.intersection else &.{part};
+        for (ms) |m| {
+            if (m.* == .unknown) {
+                continue;
+            }
+            const duplicate = for (list.items) |existing| {
+                if (existing.eql(m)) {
+                    break true;
+                }
+            } else false;
+            if (!duplicate) {
+                try list.append(arena, m);
+            }
+        }
+    }
+    return switch (list.items.len) {
+        0 => unknown,
+        1 => list.items[0],
+        else => asPtr(.{ .intersection = list.items }, arena),
+    };
+}
+
+/// An intrinsic type applied to `arguments`: computed if they're known, deferred if not. Null
+/// for arguments it can't be computed for yet.
+pub fn intrinsic(arena: std.mem.Allocator, kind: Type.Intrinsic.IntrinsicKind, arguments: []const *const Type) Error!*const Type {
+    for (arguments) |a| {
+        if (mentionsParameters(a)) {
+            return asPtr(.{ .intrinsic = .{ .kind = kind, .arguments = arguments } }, arena);
+        }
+    }
+    return switch (kind) {
+        .flat_array => {
+            const depth = arguments[1];
+            // A depth that isn't a literal, or is one of more than 20, flattens to a union of
+            // every depth in tsc, which isn't worth having.
+            if (depth.* != .literal or depth.literal.value != .number) {
+                return any;
+            }
+            const d = depth.literal.value.number;
+            if (d != @trunc(d) or d < -1 or d > 20) {
+                return any;
+            }
+            return flatArray(arena, arguments[0], @intFromFloat(d));
+        },
+    };
+}
+
+/// tsc's `FlatArray<A, D>`, without the conditional types: `A` itself at a depth of -1, or else
+/// its elements flattened one level less deep (each member of a union on its own).
+fn flatArray(arena: std.mem.Allocator, t: *const Type, depth: i32) Error!*const Type {
+    if (depth == -1) {
+        return t;
+    }
+    switch (t.*) {
+        .array, .readonly_array => |e| return flatArray(arena, e, depth - 1),
+        .tuple => |es| return flatArray(arena, try unionOf(arena, es), depth - 1),
+        .@"union" => |ms| {
+            const list = try arena.alloc(*const Type, ms.len);
+            for (ms, list) |m, *x| {
+                x.* = try flatArray(arena, m, depth);
+            }
+            return unionOf(arena, list);
+        },
+        else => return t,
+    }
+}
+
 /// `keyof t`, deferred when `t` is generic. Null when it isn't supported yet: the keys of
 /// primitives and arrays are their methods.
 pub fn keyOf(arena: std.mem.Allocator, t: *const Type) Error!?*const Type {
@@ -1441,7 +2011,16 @@ pub fn keyOf(arena: std.mem.Allocator, t: *const Type) Error!?*const Type {
         .mapped => |m| return m.constraint,
         .object => |o| {
             var keys: std.ArrayList(*const Type) = .empty;
+            if (o.string_index != null) {
+                try keys.appendSlice(arena, &.{ string, number });
+            } else if (o.number_index != null) {
+                try keys.append(arena, number);
+            }
             for (o.properties) |p| {
+                if (std.mem.startsWith(u8, p.name, "[")) {
+                    // `[Symbol.iterator]`, a symbol.
+                    continue;
+                }
                 try keys.append(arena, try keyLiteral(arena, p.name));
             }
             return try unionOf(arena, keys.items);
@@ -1530,9 +2109,30 @@ pub fn indexedAccess(arena: std.mem.Allocator, object: *const Type, index: *cons
             }
         },
         .object => |o| {
-            const name = try keyName(arena, index) orelse return null;
-            const p = o.find(name) orelse return null;
-            return p.type;
+            const name = try keyName(arena, index) orelse {
+                if (isNumberLike(index)) {
+                    if (o.number_index orelse o.string_index) |i| {
+                        return i.type;
+                    }
+                } else if (isStringLike(index)) {
+                    if (o.string_index) |i| {
+                        return i.type;
+                    }
+                }
+                return null;
+            };
+            if (o.find(name)) |p| {
+                return p.type;
+            }
+            if (isNumericName(name)) {
+                if (o.number_index) |i| {
+                    return i.type;
+                }
+            }
+            if (o.string_index) |i| {
+                return i.type;
+            }
+            return null;
         },
         else => {},
     }
@@ -1570,8 +2170,27 @@ pub fn resolveMapped(arena: std.mem.Allocator, m: *const Mapped, mapper: *const 
         }
     }
     var properties: std.ArrayList(Property) = .empty;
+    var string_index: ?Object.Index = null;
+    var number_index: ?Object.Index = null;
     var buffer: [1]*const Type = undefined;
     for (m.constraint.members(&buffer)) |key| {
+        if (key.* == .string or key.* == .number) {
+            // `{ [P in string]: X }` is an index signature, `{ [x: string]: X }`.
+            if (key.* == .number and string_index != null) {
+                continue;
+            }
+            var t = try instantiate(arena, m.template, &mapper.with(&.{m.parameter}, &.{key}));
+            if (m.optional == .add) {
+                t = try unionOf(arena, &.{ t, @"undefined" });
+            }
+            const index: Object.Index = .{ .type = t, .readonly = m.readonly == .add };
+            if (key.* == .string) {
+                string_index = index;
+            } else {
+                number_index = index;
+            }
+            continue;
+        }
         const name = try keyName(arena, key) orelse return deferred;
         var t = try instantiate(arena, m.template, &mapper.with(&.{m.parameter}, &.{key}));
         var optional = false;
@@ -1603,7 +2222,7 @@ pub fn resolveMapped(arena: std.mem.Allocator, m: *const Mapped, mapper: *const 
         try properties.append(arena, .{ .name = name, .type = t, .optional = optional, .readonly = readonly, .method = method });
     }
     const object = try arena.create(Object);
-    object.* = .{ .properties = properties.items };
+    object.* = .{ .properties = properties.items, .string_index = string_index, .number_index = number_index };
     return asPtr(.{ .object = object }, arena);
 }
 

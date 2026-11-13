@@ -3,7 +3,7 @@ function f<T>(x: T) {
   if (typeof x === "string") { //! ZV9001
   }
 }
-const r: Record<string, number> = {}; //! ZV9001
+type E = Exclude<1 | 2, 1>; //! ZV9001
 type K = keyof number[]; //! ZV9001
 type O = Omit<{ a: 1 }, "a">; //! ZV9001
 type Tree<T> = Node<T>; //! ZV9001

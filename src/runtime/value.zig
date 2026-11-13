@@ -85,9 +85,9 @@ pub const Value = union(enum) {
 
     /// ToPrimitive (§7.1.1). There are no user-defined `valueOf`/`toString` methods yet, so every
     /// object becomes its default string.
-    pub fn toPrimitive(this: Value, allocator: std.mem.Allocator) error{OutOfMemory}!Value {
+    pub fn toPrimitive(this: Value, allocator: std.mem.Allocator) ConvertError!Value {
         return switch (this) {
-            .object => .{ .string = "[object Object]" },
+            .object => |o| .{ .string = objectString(o) },
             .native_function => |f| .{ .string = f.source },
             .function => |f| .{ .string = try f.sourceText(allocator) },
             .array => |a| .{ .string = try a.join(allocator) },
@@ -96,7 +96,7 @@ pub const Value = union(enum) {
     }
 
     /// ToString (§7.1.17), allocating only when the result isn't already a string.
-    pub fn toString(this: Value, allocator: std.mem.Allocator) error{OutOfMemory}![]const u8 {
+    pub fn toString(this: Value, allocator: std.mem.Allocator) ConvertError![]const u8 {
         return switch (this) {
             .undefined => "undefined",
             .null => "null",
@@ -125,7 +125,7 @@ pub const Value = union(enum) {
     }
 
     /// IsLooselyEqual (`==`, §7.2.14).
-    pub fn looseEquals(a: Value, b: Value, allocator: std.mem.Allocator) error{OutOfMemory}!bool {
+    pub fn looseEquals(a: Value, b: Value, allocator: std.mem.Allocator) ConvertError!bool {
         const a_nullish = a == .undefined or a == .null;
         const b_nullish = b == .undefined or b == .null;
         if (a_nullish or b_nullish) {
@@ -155,9 +155,32 @@ pub const Object = struct {
     properties: std.StringArrayHashMapUnmanaged(Value) = .empty,
     /// Shown by `console.log`, e.g. `Object [console]`; null for plain objects.
     tag: ?[]const u8 = null,
+    /// What a builtin object holds besides its properties.
+    internal: Internal = .none,
+    /// Methods (and constants) it has that aren't its own enumerable properties, like `Math.max`
+    /// or a `Map`'s `get`. Its own properties come first.
+    methods: ?*const Table = null,
+    /// `Object.freeze` has been called on it, so its properties can't be added, changed or
+    /// deleted.
+    frozen: bool = false,
+
+    pub const Internal = union(enum) {
+        none,
+        map: *Collection,
+        set: *Collection,
+        iterator: *Iterator,
+    };
 
     pub fn get(this: *const Object, name: []const u8) Value {
-        return this.properties.get(name) orelse .undefined;
+        if (this.properties.get(name)) |v| {
+            return v;
+        }
+        if (this.methods) |methods| {
+            if (methods.get(name)) |v| {
+                return v;
+            }
+        }
+        return .undefined;
     }
 
     /// OrdinaryOwnPropertyKeys (§10.1.11.1): array indices in ascending order, then the other
@@ -198,6 +221,25 @@ pub const Object = struct {
         }
     };
 };
+
+/// What `String(o)` gives for an object: `[object Object]`, or `[object Map]` and so on for the
+/// builtin objects, by their `Symbol.toStringTag`.
+pub fn objectString(o: *const Object) []const u8 {
+    return switch (o.internal) {
+        .none => if (o.tag) |tag|
+            if (std.mem.eql(u8, tag, "Object [Math]")) "[object Math]" else if (std.mem.eql(u8, tag, "Object [JSON]")) "[object JSON]" else if (std.mem.eql(u8, tag, "Object [console]")) "[object console]" else "[object Object]"
+        else
+            "[object Object]",
+        .map => "[object Map]",
+        .set => "[object Set]",
+        .iterator => |it| switch (it.source) {
+            .array => "[object Array Iterator]",
+            .string => "[object String Iterator]",
+            .map => "[object Map Iterator]",
+            .set => "[object Set Iterator]",
+        },
+    };
+}
 
 /// `key` as an array index (CanonicalNumericIndexString below 2^32 - 1), if it's one.
 pub fn arrayIndex(key: []const u8) ?u32 {
@@ -245,23 +287,69 @@ pub const Closure = struct {
     }
 };
 
+/// What converting a value to a primitive can fail with.
+pub const ConvertError = error{
+    OutOfMemory,
+    /// An array nested deeper than `Array.max_join_depth` was joined, where V8 would run out of
+    /// stack. The interpreter throws it as a RangeError.
+    NestedTooDeep,
+};
+
 pub const Array = struct {
     elements: std.ArrayList(Value),
+    /// `Object.freeze` has been called on it.
+    frozen: bool = false,
 
     pub fn items(this: *const Array) []Value {
         return this.elements.items;
     }
 
+    /// How deep `join` goes into arrays inside arrays. V8 runs out of stack a little past 4,000 on
+    /// a default stack; this is about as far as a function can recurse in V8.
+    pub const max_join_depth = 10_000;
+
     /// Array.prototype.join with `,`, which is also what `String(array)` gives.
-    pub fn join(this: *const Array, allocator: std.mem.Allocator) error{OutOfMemory}![]const u8 {
+    pub fn join(this: *const Array, allocator: std.mem.Allocator) ConvertError![]const u8 {
+        return this.joinWith(allocator, ",");
+    }
+
+    /// Array.prototype.join: the elements' string forms between `separator`s, with arrays inside
+    /// it joined with `,`. An array inside itself joins as "" there, as in V8. It keeps its own
+    /// stack rather than recursing, so it can't overflow the native one.
+    pub fn joinWith(this: *const Array, allocator: std.mem.Allocator, separator: []const u8) ConvertError![]const u8 {
+        const Frame = struct { array: *const Array, next: usize = 0 };
+        var stack: std.ArrayList(Frame) = .empty;
+        defer stack.deinit(allocator);
+        // The arrays on `stack`.
+        var joining: std.AutoHashMapUnmanaged(*const Array, void) = .empty;
+        defer joining.deinit(allocator);
+        try stack.append(allocator, .{ .array = this });
+        try joining.put(allocator, this, {});
         var out: std.ArrayList(u8) = .empty;
-        for (this.items(), 0..) |item, i| {
-            if (i > 0) {
-                try out.append(allocator, ',');
+        while (stack.items.len > 0) {
+            const top = &stack.items[stack.items.len - 1];
+            const elements = top.array.items();
+            if (top.next == elements.len) {
+                _ = joining.remove(stack.pop().?.array);
+                continue;
             }
-            switch (item) {
+            const i = top.next;
+            top.next += 1;
+            if (i > 0) {
+                try out.appendSlice(allocator, if (stack.items.len == 1) separator else ",");
+            }
+            switch (elements[i]) {
                 .undefined, .null => {},
-                else => try out.appendSlice(allocator, try item.toString(allocator)),
+                .array => |inner| {
+                    const entry = try joining.getOrPut(allocator, inner);
+                    if (!entry.found_existing) {
+                        if (stack.items.len == max_join_depth) {
+                            return error.NestedTooDeep;
+                        }
+                        try stack.append(allocator, .{ .array = inner });
+                    }
+                },
+                else => |item| try out.appendSlice(allocator, try item.toString(allocator)),
             }
         }
         return out.toOwnedSlice(allocator);
@@ -272,8 +360,166 @@ pub const NativeFunction = struct {
     name: []const u8,
     /// What `String(f)` gives, e.g. `function log() { [native code] }`.
     source: []const u8,
-    call: *const fn (context: *anyopaque, this: Value, args: []const Value) anyerror!Value,
+    /// Null for a constructor that can only be called with `new`, like `Map`.
+    call: ?Call,
+    /// What `new` does with it, for a constructor.
+    construct: ?Call = null,
+    /// Its own properties, like `Number.isInteger`.
+    statics: ?*const Table = null,
+    /// Its `length`: how many arguments it expects.
+    length: u32 = 0,
+    /// It's a constructor JavaScript can call (or construct with) where `call` (or `construct`) is
+    /// null, which we don't support yet.
+    unsupported: bool = false,
+
+    pub const Call = *const fn (context: *anyopaque, this: Value, args: []const Value) anyerror!Value;
 };
+
+/// Builtin properties, found by name: a prototype's methods or a namespace's members.
+pub const Table = std.StaticStringMap(Value);
+
+/// The entries of a `Map` or a `Set`, in the order they were added. A deleted entry stays where
+/// it was, marked `removed`, so iterators that are going through them don't lose their place.
+pub const Collection = struct {
+    entries: std.ArrayList(Entry) = .empty,
+    /// Where each key's entry is.
+    index: std.HashMapUnmanaged(Value, u32, KeyContext, std.hash_map.default_max_load_percentage) = .empty,
+    size: u32 = 0,
+
+    pub const Entry = struct {
+        key: Value,
+        /// The same as `key` in a `Set`.
+        value: Value,
+        removed: bool = false,
+    };
+
+    pub fn get(this: *const Collection, key: Value) ?Value {
+        const i = this.index.get(normalizeKey(key)) orelse return null;
+        return this.entries.items[i].value;
+    }
+
+    pub fn has(this: *const Collection, key: Value) bool {
+        return this.index.contains(normalizeKey(key));
+    }
+
+    pub fn set(this: *Collection, allocator: std.mem.Allocator, key: Value, v: Value) error{OutOfMemory}!void {
+        const k = normalizeKey(key);
+        const entry = try this.index.getOrPut(allocator, k);
+        if (entry.found_existing) {
+            this.entries.items[entry.value_ptr.*].value = v;
+            return;
+        }
+        entry.value_ptr.* = @intCast(this.entries.items.len);
+        try this.entries.append(allocator, .{ .key = k, .value = v });
+        this.size += 1;
+    }
+
+    /// Adds a value to a `Set`, where it's its own key: `-0` goes in as `0`.
+    pub fn add(this: *Collection, allocator: std.mem.Allocator, v: Value) error{OutOfMemory}!void {
+        const k = normalizeKey(v);
+        return this.set(allocator, k, k);
+    }
+
+    pub fn delete(this: *Collection, key: Value) bool {
+        const removed = this.index.fetchRemove(normalizeKey(key)) orelse return false;
+        this.entries.items[removed.value].removed = true;
+        this.size -= 1;
+        return true;
+    }
+
+    pub fn clear(this: *Collection) void {
+        for (this.entries.items) |*e| {
+            e.removed = true;
+        }
+        this.index.clearRetainingCapacity();
+        this.size = 0;
+    }
+
+    /// `-0` is the same key as `0`.
+    fn normalizeKey(key: Value) Value {
+        if (key == .number and key.number == 0) {
+            return .{ .number = 0 };
+        }
+        return key;
+    }
+};
+
+/// SameValueZero (§7.2.11) as a hash map's equality, which is how `Map` and `Set` compare keys.
+const KeyContext = struct {
+    pub fn hash(_: KeyContext, key: Value) u64 {
+        var h: std.hash.Wyhash = .init(@backingInt(std.meta.activeTag(key)));
+        switch (key) {
+            .number => |n| {
+                const bits: u64 = if (std.math.isNan(n)) 0x7FF8000000000000 else @bitCast(n);
+                h.update(std.mem.asBytes(&bits));
+            },
+            .string => |str| h.update(str),
+            .boolean => |b| h.update(&.{@intFromBool(b)}),
+            .undefined, .null, .uninitialized => {},
+            inline .object, .native_function, .function, .array => |ptr| h.update(std.mem.asBytes(&@intFromPtr(ptr))),
+        }
+        return h.final();
+    }
+
+    pub fn eql(_: KeyContext, a: Value, b: Value) bool {
+        return sameValueZero(a, b);
+    }
+};
+
+/// SameValueZero (§7.2.11): `===`, except that `NaN` is itself.
+pub fn sameValueZero(a: Value, b: Value) bool {
+    if (a == .number and b == .number and std.math.isNan(a.number) and std.math.isNan(b.number)) {
+        return true;
+    }
+    return a.strictEquals(b);
+}
+
+/// The state of a builtin iterator: what it goes through and how far it's got.
+pub const Iterator = struct {
+    source: Source,
+    kind: Kind = .values,
+    /// The next index (or byte offset, for a string) to look at.
+    position: usize = 0,
+    done: bool = false,
+
+    pub const Source = union(enum) {
+        array: *Array,
+        string: []const u8,
+        map: *Collection,
+        set: *Collection,
+    };
+
+    pub const Kind = enum { keys, values, entries };
+};
+
+/// Joins strings, as `+` does. Since they're WTF-8, a lone high surrogate at the end of one and a
+/// lone low surrogate at the start of the next make one code point together.
+pub fn concatStrings(allocator: std.mem.Allocator, parts: []const []const u8) error{OutOfMemory}![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (parts) |part| {
+        var rest = part;
+        if (out.items.len >= 3 and rest.len >= 3 and isHighSurrogate(out.items[out.items.len - 3 ..]) and isLowSurrogate(rest[0..3])) {
+            const high = std.unicode.wtf8Decode(out.items[out.items.len - 3 ..]) catch unreachable;
+            const low = std.unicode.wtf8Decode(rest[0..3]) catch unreachable;
+            out.shrinkRetainingCapacity(out.items.len - 3);
+            var buffer: [4]u8 = undefined;
+            const code_point = 0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00);
+            const n = std.unicode.utf8Encode(code_point, &buffer) catch unreachable;
+            try out.appendSlice(allocator, buffer[0..n]);
+            rest = rest[3..];
+        }
+        try out.appendSlice(allocator, rest);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn isHighSurrogate(bytes: []const u8) bool {
+    return bytes[0] == 0xED and bytes[1] >= 0xA0 and bytes[1] <= 0xAF;
+}
+
+fn isLowSurrogate(bytes: []const u8) bool {
+    return bytes[0] == 0xED and bytes[1] >= 0xB0 and bytes[1] <= 0xBF;
+}
 
 /// Compares two strings by UTF-16 code units, which is how `<` orders strings in JS. Plain byte
 /// order differs only when one side has a code point above U+FFFF and the other is in
@@ -342,7 +588,7 @@ pub fn exponentiate(base: f64, exponent: f64) f64 {
     if (@abs(base) == 1 and std.math.isInf(exponent)) {
         return std.math.nan(f64);
     }
-    return std.math.pow(f64, base, exponent);
+    return @import("fdlibm.zig").pow(base, exponent);
 }
 
 // Formatting like node's `util.inspect`, used by `console.log` and the REPL.
@@ -350,7 +596,12 @@ pub fn exponentiate(base: f64, exponent: f64) f64 {
 pub const InspectError = error{ WriteFailed, OutOfMemory };
 
 pub fn inspect(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: Value) InspectError!void {
-    var inspector: Inspector = .{ .allocator = allocator };
+    return inspectDepth(allocator, writer, value, 2);
+}
+
+/// `util.inspect` with nested objects shown `depth` levels deep.
+pub fn inspectDepth(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: Value, depth: usize) InspectError!void {
+    var inspector: Inspector = .{ .allocator = allocator, .max_depth = depth };
     try writer.writeAll(try inspector.format(value, 0));
 }
 
@@ -367,8 +618,10 @@ const Inspector = struct {
     /// Objects referred to circularly; `*1` is the first.
     circular: std.ArrayList(*const anyopaque) = .empty,
 
+    /// How deep nested objects are shown.
+    max_depth: usize = 2,
+
     const break_length = 80;
-    const max_depth = 2;
     const max_array_length = 100;
 
     fn format(this: *Inspector, value: Value, depth: usize) InspectError![]const u8 {
@@ -385,9 +638,23 @@ const Inspector = struct {
             else
                 std.fmt.allocPrint(this.allocator, "[Function: {s}]", .{f.name()}),
             .array => |a| this.formatObject(.{ .array = a }, depth),
-            .object => |o| this.formatObject(.{ .object = o }, depth),
+            .object => |o| switch (o.internal) {
+                .none => this.formatObject(.{ .object = o }, depth),
+                .map, .set => |c| this.formatObject(.{ .collection = .{ .object = o, .entries = c, .map = o.internal == .map } }, depth),
+                .iterator => |it| this.formatIterator(o, it, depth),
+            },
             .uninitialized => unreachable,
         };
+    }
+
+    /// An array or string iterator shows as its tag; a map or set iterator as what's left.
+    fn formatIterator(this: *Inspector, o: *const Object, it: *const Iterator, depth: usize) InspectError![]const u8 {
+        const collection, const map = switch (it.source) {
+            .array, .string => return std.fmt.allocPrint(this.allocator, "{s} {{}}", .{o.tag.?}),
+            .map => |c| .{ c, true },
+            .set => |c| .{ c, false },
+        };
+        return this.formatObject(.{ .remaining = .{ .iterator = it, .entries = collection, .map = map } }, depth);
     }
 
     /// `formatPrimitive` for a string: quoted, and split after each line break if it's too long
@@ -414,10 +681,17 @@ const Inspector = struct {
     const Container = union(enum) {
         array: *const Array,
         object: *const Object,
+        /// A `Map` or `Set`.
+        collection: struct { object: *const Object, entries: *const Collection, map: bool },
+        /// What a `Map` or `Set` iterator has left.
+        remaining: struct { iterator: *const Iterator, entries: *const Collection, map: bool },
 
         fn ptr(this: Container) *const anyopaque {
             return switch (this) {
-                inline else => |p| p,
+                .array => |p| p,
+                .object => |p| p,
+                .collection => |c| c.object,
+                .remaining => |r| r.iterator,
             };
         }
     };
@@ -452,9 +726,23 @@ const Inspector = struct {
                     return std.fmt.allocPrint(this.allocator, "{s}}}", .{open});
                 }
             },
+            .collection => |c| {
+                open = try std.fmt.allocPrint(this.allocator, "{s}({d}) {{", .{ if (c.map) "Map" else "Set", c.entries.size });
+                if (c.entries.size == 0) {
+                    return std.fmt.allocPrint(this.allocator, "{s}}}", .{open});
+                }
+            },
+            .remaining => |r| {
+                const entries = r.iterator.kind == .entries;
+                open = if (r.map) (if (entries) "[Map Entries] {" else "[Map Iterator] {") else if (entries) "[Set Entries] {" else "[Set Iterator] {";
+            },
         }
-        if (depth > max_depth) {
-            return if (container == .array) "[Array]" else "[Object]";
+        if (depth > this.max_depth) {
+            return switch (container) {
+                .array => "[Array]",
+                .collection => |c| if (c.map) "[Map]" else "[Set]",
+                else => "[Object]",
+            };
         }
         const inner = depth + 1;
         try this.seen.append(this.allocator, ptr);
@@ -474,6 +762,33 @@ const Inspector = struct {
             .object => |o| for (keys) |key| {
                 const name = if (isIdentifier(key)) key else try quoted(this.allocator, key);
                 try output.append(this.allocator, try std.fmt.allocPrint(this.allocator, "{s}: {s}", .{ name, try this.entry(o.get(key), inner) }));
+            },
+            .collection => |c| for (c.entries.entries.items) |e| {
+                if (e.removed) {
+                    continue;
+                }
+                if (c.map) {
+                    try output.append(this.allocator, try std.fmt.allocPrint(this.allocator, "{s} => {s}", .{ try this.entry(e.key, inner), try this.entry(e.value, inner) }));
+                } else {
+                    try output.append(this.allocator, try this.entry(e.value, inner));
+                }
+            },
+            .remaining => |r| for (r.entries.entries.items[@min(r.iterator.position, r.entries.entries.items.len)..]) |e| {
+                if (e.removed or r.iterator.done) {
+                    continue;
+                }
+                try output.append(this.allocator, switch (r.iterator.kind) {
+                    .keys => try this.entry(e.key, inner),
+                    .values => try this.entry(e.value, inner),
+                    .entries => blk: {
+                        // Each entry is shown as the array `next()` gives.
+                        this.indentation += 2;
+                        defer this.indentation -= 2;
+                        var pair = [_]Value{ e.key, e.value };
+                        var array: Array = .{ .elements = .fromOwnedSlice(&pair) };
+                        break :blk try this.formatObject(.{ .array = &array }, inner);
+                    },
+                });
             },
         }
         var base: []const u8 = "";
@@ -639,7 +954,21 @@ fn quoteString(writer: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
     const has_backtick = std.mem.indexOfScalar(u8, s, '`') != null;
     const quote: u8 = if (!has_single) '\'' else if (!has_double) '"' else if (!has_backtick) '`' else '\'';
     try writer.writeByte(quote);
-    for (s) |c| {
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        // Lone surrogates, which WTF-8 has as three bytes, and the C1 controls are escaped.
+        if (c == 0xED and i + 2 < s.len and s[i + 1] >= 0xA0) {
+            const code_point = std.unicode.wtf8Decode(s[i .. i + 3]) catch 0xFFFD;
+            try writer.print("\\u{x}", .{code_point});
+            i += 2;
+            continue;
+        }
+        if (c == 0xC2 and i + 1 < s.len and s[i + 1] >= 0x80 and s[i + 1] <= 0x9F) {
+            try writer.print("\\x{X}", .{s[i + 1]});
+            i += 1;
+            continue;
+        }
         switch (c) {
             '\n' => try writer.writeAll("\\n"),
             '\t' => try writer.writeAll("\\t"),

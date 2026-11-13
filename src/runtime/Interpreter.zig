@@ -10,6 +10,7 @@ const ast = @import("../syntax/ast.zig");
 const Checker = @import("../check/Checker.zig");
 const value = @import("value.zig");
 const number = @import("number.zig");
+const builtins = @import("builtins.zig");
 const Value = value.Value;
 const Env = value.Env;
 const Expr = ast.Expr;
@@ -46,12 +47,17 @@ max_stack: usize,
 stack_limit: usize = 0,
 /// What was thrown, when a call returns `error.RuntimeError`.
 exception: ?Exception = null,
+/// State the builtins keep, like `console.count`'s counts.
+builtin_state: builtins.State = .{},
 
 pub const Error = error{
     OutOfMemory,
     WriteFailed,
     /// An exception was thrown and not caught; it's in `exception`.
     RuntimeError,
+    /// See `value.ConvertError`. Nothing can catch an exception yet, so `run` throws it as a
+    /// RangeError where it reaches the top.
+    NestedTooDeep,
 };
 
 /// A runtime error, or a value a `throw` statement threw. There's no `catch` yet, so these always
@@ -65,6 +71,7 @@ pub const Exception = struct {
         TypeError,
         ReferenceError,
         RangeError,
+        SyntaxError,
         /// A value from a `throw` statement.
         thrown,
         /// Something that works in JavaScript but isn't implemented yet. Not a JavaScript error,
@@ -81,12 +88,10 @@ pub const Exception = struct {
     }
 };
 
-pub fn init(arena: std.mem.Allocator, stdout: *std.Io.Writer, stderr: *std.Io.Writer, max_stack: usize) error{OutOfMemory}!Interpreter {
+pub fn init(arena: std.mem.Allocator, stdout: *std.Io.Writer, stderr: *std.Io.Writer, max_stack: usize, random_seed: u64) error{OutOfMemory}!Interpreter {
     var interpreter: Interpreter = .{ .arena = arena, .stdout = stdout, .stderr = stderr, .max_stack = max_stack };
-    try @import("builtins/console.zig").install(&interpreter);
-    try interpreter.globals.put(arena, "undefined", .undefined);
-    try interpreter.globals.put(arena, "NaN", .{ .number = std.math.nan(f64) });
-    try interpreter.globals.put(arena, "Infinity", .{ .number = std.math.inf(f64) });
+    interpreter.builtin_state.random = .init(random_seed);
+    try builtins.install(&interpreter);
     return interpreter;
 }
 
@@ -104,10 +109,28 @@ pub fn throw(this: *Interpreter, name: Exception.Name, comptime fmt: []const u8,
     return error.RuntimeError;
 }
 
+/// Throws a RangeError when the native stack is nearly full. Anything that recurses on a value's
+/// depth checks this at each level, as calls do.
+pub fn checkStack(this: *Interpreter) Error!void {
+    if (@frameAddress() < this.stack_limit) {
+        return this.throw(.RangeError, "Maximum call stack size exceeded", .{});
+    }
+}
+
 /// Runs the statements in order, returning the program's completion value (ECMA-262 §8.4): for
 /// the most part, the value of the last expression statement that ran. It's what the REPL
 /// prints.
-pub fn run(this: *Interpreter, program: Program) Error!Value {
+pub fn run(this: *Interpreter, program: Program) error{ OutOfMemory, WriteFailed, RuntimeError }!Value {
+    return this.runProgram(program) catch |err| switch (err) {
+        error.NestedTooDeep => {
+            this.exception = .{ .name = .RangeError, .message = "Maximum call stack size exceeded" };
+            return error.RuntimeError;
+        },
+        else => |e| e,
+    };
+}
+
+fn runProgram(this: *Interpreter, program: Program) Error!Value {
     const owned = try this.arena.create(Program);
     owned.* = program;
     this.setProgram(owned);
@@ -235,8 +258,8 @@ noinline fn bindPattern(this: *Interpreter, pattern: *const ast.Pattern, v: Valu
         .array => |a| {
             const array = switch (v) {
                 .array => |x| x,
-                .string => return this.throw(.Unsupported, "Destructuring a string is not supported yet.", .{}),
-                else => return this.throw(.TypeError, "{s} is not iterable", .{try v.toString(this.arena)}),
+                // Only as many values as the pattern takes are taken from an iterator.
+                else => try this.takeValues(v, if (a.rest != null) null else a.elements.len),
             };
             for (a.elements, 0..) |element, i| {
                 const e = element orelse continue;
@@ -256,7 +279,57 @@ noinline fn bindPattern(this: *Interpreter, pattern: *const ast.Pattern, v: Valu
     }
 }
 
-fn newArray(this: *Interpreter, items: []const Value) Error!Value {
+/// The values iterating over `v` gives, as an array: up to `limit` of them, if given.
+fn takeValues(this: *Interpreter, v: Value, limit: ?usize) Error!*value.Array {
+    var iter = try this.iterate(v);
+    const array = try this.arena.create(value.Array);
+    array.* = .{ .elements = .empty };
+    while (limit == null or array.items().len < limit.?) {
+        const item = try iter.next(this) orelse break;
+        try array.elements.append(this.arena, item);
+    }
+    return array;
+}
+
+/// Going through what `for...of` and spreading go through: an array's elements, or what an
+/// iterator gives.
+pub const Iteration = union(enum) {
+    array: struct { array: *value.Array, index: usize = 0 },
+    iterator: *value.Iterator,
+
+    pub fn next(this: *Iteration, interpreter: *Interpreter) Error!?Value {
+        switch (this.*) {
+            // Elements added along the way are visited too.
+            .array => |*a| {
+                if (a.index >= a.array.items().len) {
+                    return null;
+                }
+                a.index += 1;
+                return a.array.items()[a.index - 1];
+            },
+            .iterator => |it| return builtins.iterators.step(interpreter, it),
+        }
+    }
+};
+
+/// GetIterator (§7.4.2) for the iterables there are: arrays, strings, maps, sets and their
+/// iterators.
+pub fn iterate(this: *Interpreter, v: Value) Error!Iteration {
+    switch (v) {
+        .array => |a| return .{ .array = .{ .array = a } },
+        .string => |str| return .{ .iterator = try builtins.iterators.create(this, .{ .string = str }, .values) },
+        .object => |o| switch (o.internal) {
+            .map => |c| return .{ .iterator = try builtins.iterators.create(this, .{ .map = c }, .entries) },
+            .set => |c| return .{ .iterator = try builtins.iterators.create(this, .{ .set = c }, .values) },
+            .iterator => |it| return .{ .iterator = it },
+            .none => {},
+        },
+        else => {},
+    }
+    return this.throw(.TypeError, "{s} is not iterable", .{try v.toString(this.arena)});
+}
+
+pub fn newArray(this: *Interpreter, items: []const Value) Error!Value {
     const array = try this.arena.create(value.Array);
     array.* = .{ .elements = .empty };
     try array.elements.appendSlice(this.arena, items);
@@ -265,7 +338,7 @@ fn newArray(this: *Interpreter, items: []const Value) Error!Value {
 
 /// The names of a value's own enumerable properties, in the order `for...in` and spread visit
 /// them.
-fn ownKeys(this: *Interpreter, v: Value) Error![]const []const u8 {
+pub fn ownKeys(this: *Interpreter, v: Value) Error![]const []const u8 {
     switch (v) {
         // A copy, since the loop body can add and delete properties.
         .object => |o| return this.arena.dupe([]const u8, try o.keys(this.arena)),
@@ -276,7 +349,13 @@ fn ownKeys(this: *Interpreter, v: Value) Error![]const []const u8 {
             }
             return keys;
         },
-        .string => return this.throw(.Unsupported, "The properties of a string are not supported yet.", .{}),
+        .string => |str| {
+            const keys = try this.arena.alloc([]const u8, builtins.strings.length(str));
+            for (keys, 0..) |*key, i| {
+                key.* = try std.fmt.allocPrint(this.arena, "{d}", .{i});
+            }
+            return keys;
+        },
         else => return &.{},
     }
 }
@@ -389,7 +468,7 @@ fn statement(this: *Interpreter, stmt: *const Stmt, labels: []const []const u8) 
             return .{ .normal = null };
         },
         // Types only.
-        .interface, .type_alias => return .{ .normal = null },
+        .interface, .type_alias, .declare => return .{ .normal = null },
         // Created when its scope was entered.
         .function => return .{ .normal = null },
         .@"return" => |e| return .{ .@"return" = if (e) |v| try this.evaluate(v) else .undefined },
@@ -504,15 +583,9 @@ noinline fn forEach(this: *Interpreter, f: ast.ForEach, labels: []const []const 
     try this.enterScope(f.scope);
     const right = try this.evaluate(f.right);
     if (f.of) {
-        const array = switch (right) {
-            .array => |a| a,
-            .string => return this.throw(.Unsupported, "Iterating over a string is not supported yet.", .{}),
-            else => return this.throw(.TypeError, "{s} is not iterable", .{try right.toString(this.arena)}),
-        };
-        // Elements added during the loop are visited too.
-        var i: usize = 0;
-        while (i < array.items().len) : (i += 1) {
-            const result = try this.iteration(f, array.items()[i], saved);
+        var it = try this.iterate(right);
+        while (try it.next(this)) |item| {
+            const result = try this.iteration(f, item, saved);
             if (!loopContinues(result, labels)) {
                 return result.updateEmpty(v);
             }
@@ -602,6 +675,8 @@ fn evaluate(this: *Interpreter, expr: *const Expr) Error!Value {
         .non_null => |inner| this.evaluate(inner),
         .assertion => |a| this.evaluate(a.expr),
         .index, .object, .array, .chain => this.evaluateObject(expr),
+        .new => |n| this.construct(n),
+        .spread => unreachable,
     };
 }
 
@@ -730,8 +805,12 @@ noinline fn arrayLiteral(this: *Interpreter, a: ast.ArrayLiteral) Error!Value {
             .expr => |e| try array.elements.append(this.arena, try this.evaluate(e)),
             .spread => |e| switch (try this.evaluate(e)) {
                 .array => |source| try array.elements.appendSlice(this.arena, source.items()),
-                .string => return this.throw(.Unsupported, "Spreading a string is not supported yet.", .{}),
-                else => |v| return this.throw(.TypeError, "{s} is not iterable", .{try v.toString(this.arena)}),
+                else => |v| {
+                    var it = try this.iterate(v);
+                    while (try it.next(this)) |item| {
+                        try array.elements.append(this.arena, item);
+                    }
+                },
             },
         }
     }
@@ -739,7 +818,7 @@ noinline fn arrayLiteral(this: *Interpreter, a: ast.ArrayLiteral) Error!Value {
 }
 
 /// ToPropertyKey (§7.1.19).
-fn propertyKey(this: *Interpreter, key: Value) Error![]const u8 {
+pub fn propertyKey(this: *Interpreter, key: Value) Error![]const u8 {
     return key.toString(this.arena);
 }
 
@@ -867,15 +946,15 @@ fn template(this: *Interpreter, t: ast.Template) Error!Value {
     if (t.substitutions.len == 0) {
         return .{ .string = t.quasis[0] };
     }
-    var out: std.ArrayList(u8) = .empty;
+    var parts: std.ArrayList([]const u8) = .empty;
     for (t.quasis, 0..) |quasi, i| {
-        try out.appendSlice(this.arena, quasi);
+        try parts.append(this.arena, quasi);
         if (i < t.substitutions.len) {
             const sub = try this.evaluate(t.substitutions[i]);
-            try out.appendSlice(this.arena, try sub.toString(this.arena));
+            try parts.append(this.arena, try sub.toString(this.arena));
         }
     }
-    return .{ .string = try out.toOwnedSlice(this.arena) };
+    return .{ .string = try value.concatStrings(this.arena, parts.items) };
 }
 
 fn unary(this: *Interpreter, u: ast.Unary) Error!Value {
@@ -899,7 +978,14 @@ noinline fn delete(this: *Interpreter, operand: *const Expr) Error!Value {
     const r = try this.reference(operand);
     const p = r.property;
     switch (p.object) {
-        .object => |o| _ = o.properties.orderedRemove(try this.propertyKey(p.key)),
+        .object => |o| {
+            const key = try this.propertyKey(p.key);
+            if (o.frozen) {
+                // Without strict mode, it silently stays.
+                return .{ .boolean = !o.properties.contains(key) };
+            }
+            _ = o.properties.orderedRemove(key);
+        },
         .array => |a| {
             const key = try this.propertyKey(p.key);
             if (value.arrayIndex(key)) |i| {
@@ -918,13 +1004,13 @@ noinline fn delete(this: *Interpreter, operand: *const Expr) Error!Value {
 noinline fn hasProperty(this: *Interpreter, key: Value, object: Value) Error!bool {
     const name = try this.propertyKey(key);
     return switch (object) {
-        .object => |o| o.properties.contains(name),
-        .array => |a| std.mem.eql(u8, name, "length") or if (value.arrayIndex(name)) |i| i < a.items().len else false,
+        .object => |o| o.properties.contains(name) or (if (o.methods) |m| m.has(name) else false) or builtins.objects.prototype.has(name) or (o.internal == .map or o.internal == .set) and std.mem.eql(u8, name, "size"),
+        .array => |a| std.mem.eql(u8, name, "length") or (if (value.arrayIndex(name)) |i| i < a.items().len else false) or builtins.arrays.methods.has(name) or builtins.objects.prototype.has(name),
         .function => if (std.mem.eql(u8, name, "prototype"))
             this.throw(.Unsupported, "Functions' 'prototype' is not supported yet.", .{})
         else
             std.mem.eql(u8, name, "name") or std.mem.eql(u8, name, "length"),
-        .native_function => std.mem.eql(u8, name, "name") or std.mem.eql(u8, name, "length"),
+        .native_function => |f| std.mem.eql(u8, name, "name") or std.mem.eql(u8, name, "length") or (if (f.statics) |statics| statics.has(name) else false),
         else => this.throw(.TypeError, "Cannot use 'in' operator to search for '{s}' in {s}", .{ name, try object.toString(this.arena) }),
     };
 }
@@ -1015,7 +1101,7 @@ fn add(this: *Interpreter, left: Value, right: Value) Error!Value {
     if (lp == .string or rp == .string) {
         const ls = try lp.toString(this.arena);
         const rs = try rp.toString(this.arena);
-        return .{ .string = try std.mem.concat(this.arena, u8, &.{ ls, rs }) };
+        return .{ .string = try value.concatStrings(this.arena, &.{ ls, rs }) };
     }
     return .{ .number = lp.toNumber() + rp.toNumber() };
 }
@@ -1039,7 +1125,7 @@ fn lessThan(this: *Interpreter, a: Value, b: Value) Error!?bool {
 }
 
 /// `object[key]`.
-fn getProperty(this: *Interpreter, object: Value, key: Value) Error!Value {
+pub fn getProperty(this: *Interpreter, object: Value, key: Value) Error!Value {
     // The common case, an array element, without making the key a string.
     if (object == .array and key == .number) {
         const n = key.number;
@@ -1052,9 +1138,25 @@ fn getProperty(this: *Interpreter, object: Value, key: Value) Error!Value {
 }
 
 /// `object.name`.
-fn getNamed(this: *Interpreter, object: Value, name: []const u8) Error!Value {
-    switch (object) {
-        .object => |o| return o.get(name),
+pub fn getNamed(this: *Interpreter, object: Value, name: []const u8) Error!Value {
+    const prototype: *const value.Table = switch (object) {
+        .object => |o| {
+            if (o.properties.get(name)) |v| {
+                return v;
+            }
+            if (o.methods) |methods| {
+                if (methods.get(name)) |v| {
+                    return v;
+                }
+            }
+            switch (o.internal) {
+                .map, .set => |c| if (std.mem.eql(u8, name, "size")) {
+                    return .{ .number = @floatFromInt(c.size) };
+                },
+                else => {},
+            }
+            return this.inherited(&builtins.objects.prototype, object, name);
+        },
         .function => |f| {
             if (std.mem.eql(u8, name, "name")) {
                 return .{ .string = f.name() };
@@ -1062,32 +1164,87 @@ fn getNamed(this: *Interpreter, object: Value, name: []const u8) Error!Value {
             if (std.mem.eql(u8, name, "length")) {
                 return .{ .number = @floatFromInt(f.function.length()) };
             }
+            return this.functionProperty(object, name);
         },
         .native_function => |f| {
             if (std.mem.eql(u8, name, "name")) {
                 return .{ .string = f.name };
             }
+            if (std.mem.eql(u8, name, "length")) {
+                return .{ .number = @floatFromInt(f.length) };
+            }
+            if (f.statics) |statics| {
+                if (statics.get(name)) |v| {
+                    return v;
+                }
+            }
+            return this.functionProperty(object, name);
         },
-        .array => |a| {
+        .array => |a| blk: {
             if (std.mem.eql(u8, name, "length")) {
                 return .{ .number = @floatFromInt(a.items().len) };
             }
             if (value.arrayIndex(name)) |i| {
                 return if (i < a.items().len) a.items()[i] else .undefined;
             }
+            break :blk &builtins.arrays.methods;
         },
+        .string => |str| blk: {
+            if (std.mem.eql(u8, name, "length")) {
+                return .{ .number = @floatFromInt(builtins.strings.lengthOf(this, str)) };
+            }
+            if (value.arrayIndex(name)) |i| {
+                return builtins.strings.at(this, str, i);
+            }
+            break :blk &builtins.strings.methods;
+        },
+        .number => &builtins.numbers.methods,
+        .boolean => &builtins.numbers.boolean_methods,
         .undefined, .null => return this.throw(.TypeError, "Cannot read properties of {t} (reading '{s}')", .{ object, name }),
-        else => {},
+        .uninitialized => unreachable,
+    };
+    if (prototype.get(name)) |v| {
+        return v;
     }
-    return this.throw(.Unsupported, "Reading the property '{s}' of a {s} is not supported yet.", .{ name, object.typeOf() });
+    return this.inherited(&builtins.objects.prototype, object, name);
+}
+
+/// A property a value inherits from a prototype, or `undefined`. One JavaScript has that we
+/// don't is reported as unsupported rather than quietly being `undefined`.
+fn inherited(this: *Interpreter, prototype: *const value.Table, object: Value, name: []const u8) Error!Value {
+    if (prototype.get(name)) |v| {
+        return v;
+    }
+    if (builtins.unimplemented(object, name)) {
+        return this.throw(.Unsupported, "'{s}' of a {s} is not supported yet.", .{ name, object.typeOf() });
+    }
+    return .undefined;
+}
+
+/// A property of a function other than its name and length.
+fn functionProperty(this: *Interpreter, object: Value, name: []const u8) Error!Value {
+    for ([_][]const u8{ "prototype", "apply", "bind", "call", "toString", "arguments", "caller" }) |unsupported| {
+        if (std.mem.eql(u8, name, unsupported)) {
+            return this.throw(.Unsupported, "Functions' '{s}' is not supported yet.", .{name});
+        }
+    }
+    return this.inherited(&builtins.objects.prototype, object, name);
 }
 
 /// `object[key] = v`.
-fn setProperty(this: *Interpreter, object: Value, key: Value, v: Value) Error!void {
+pub fn setProperty(this: *Interpreter, object: Value, key: Value, v: Value) Error!void {
     const name = try this.propertyKey(key);
     switch (object) {
-        .object => |o| return o.properties.put(this.arena, name, v),
-        .array => |a| if (value.arrayIndex(name)) |i| {
+        .object => |o| {
+            if (o.frozen) {
+                // Without strict mode, the assignment silently does nothing.
+                return;
+            }
+            return o.properties.put(this.arena, name, v);
+        },
+        .array => |a| if (a.frozen) {
+            return;
+        } else if (value.arrayIndex(name)) |i| {
             if (i < a.items().len) {
                 a.items()[i] = v;
                 return;
@@ -1121,21 +1278,90 @@ fn call(this: *Interpreter, c: ast.Call) Error!Value {
 
 /// Evaluates a call's arguments and calls `callee` with them.
 fn callValue(this: *Interpreter, c: ast.Call, callee: Value, receiver: Value) Error!Value {
-    const args = try this.arena.alloc(Value, c.arguments.len);
-    for (c.arguments, args) |arg, *slot| {
-        slot.* = try this.evaluate(arg);
-    }
+    const args = try this.arguments(c.arguments);
     return switch (callee) {
-        .native_function => |f| f.call(this, receiver, args) catch |err| switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.WriteFailed => error.WriteFailed,
-            error.RuntimeError => error.RuntimeError,
-            else => unreachable,
-        },
+        .native_function => this.invoke(callee, receiver, args),
         .function => |f| this.callFunction(f, args),
         // Only possible through `any`.
         else => this.throw(.TypeError, "{s} is not a function", .{calleeText(c.callee)}),
     };
+}
+
+/// Evaluates arguments, spreading the spread ones.
+fn arguments(this: *Interpreter, list: []const *Expr) Error![]Value {
+    for (list) |arg| {
+        if (arg.data == .spread) {
+            break;
+        }
+    } else {
+        const args = try this.arena.alloc(Value, list.len);
+        for (list, args) |arg, *slot| {
+            slot.* = try this.evaluate(arg);
+        }
+        return args;
+    }
+    var args: std.ArrayList(Value) = .empty;
+    for (list) |arg| {
+        if (arg.data != .spread) {
+            try args.append(this.arena, try this.evaluate(arg));
+            continue;
+        }
+        var it = try this.iterate(try this.evaluate(arg.data.spread));
+        while (try it.next(this)) |item| {
+            try args.append(this.arena, item);
+        }
+    }
+    return args.items;
+}
+
+fn callNative(this: *Interpreter, f: value.NativeFunction.Call, receiver: Value, args: []const Value) Error!Value {
+    return f(this, receiver, args) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.WriteFailed => error.WriteFailed,
+        error.RuntimeError => error.RuntimeError,
+        error.NestedTooDeep => error.NestedTooDeep,
+        else => unreachable,
+    };
+}
+
+/// Calls a function value, as the builtins call the callbacks they're given.
+pub fn invoke(this: *Interpreter, callee: Value, receiver: Value, args: []const Value) Error!Value {
+    return switch (callee) {
+        .native_function => |f| if (f.call) |call_native|
+            callNative(this, call_native, receiver, args)
+        else if (f.unsupported)
+            this.throw(.Unsupported, "Calling '{s}' is not supported yet.", .{f.name})
+        else
+            this.throw(.TypeError, "Constructor {s} requires 'new'", .{f.name}),
+        .function => |f| this.callFunction(f, args),
+        else => this.throw(.TypeError, "{s} is not a function", .{try this.describe(callee)}),
+    };
+}
+
+/// A value as V8 names it in some messages: `undefined`, `5`, `#<Object>`.
+pub fn describe(this: *Interpreter, v: Value) Error![]const u8 {
+    return switch (v) {
+        .object => "#<Object>",
+        .array => |a| if (a.items().len == 0) "" else a.join(this.arena),
+        .string => |str| std.fmt.allocPrint(this.arena, "\"{s}\"", .{str}),
+        else => v.toString(this.arena),
+    };
+}
+
+/// `new C(arguments)`.
+noinline fn construct(this: *Interpreter, n: ast.New) Error!Value {
+    const callee = try this.evaluate(n.callee);
+    const args = try this.arguments(n.arguments);
+    if (callee == .native_function) {
+        const f = callee.native_function;
+        if (f.construct) |construct_native| {
+            return callNative(this, construct_native, .undefined, args);
+        }
+        if (f.unsupported) {
+            return this.throw(.Unsupported, "Constructing '{s}' is not supported yet.", .{f.name});
+        }
+    }
+    return this.throw(.TypeError, "{s} is not a constructor", .{calleeText(n.callee)});
 }
 
 /// How node names a callee in "is not a function".
@@ -1150,9 +1376,7 @@ fn calleeText(expr: *const Expr) []const u8 {
 
 /// Calls a function from the source with evaluated arguments.
 pub fn callFunction(this: *Interpreter, c: *const value.Closure, args: []const Value) Error!Value {
-    if (@frameAddress() < this.stack_limit) {
-        return this.throw(.RangeError, "Maximum call stack size exceeded", .{});
-    }
+    try this.checkStack();
     const f = c.function;
     const saved_program = this.program;
     const saved_env = this.env;

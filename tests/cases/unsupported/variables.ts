@@ -4,8 +4,8 @@ let b = null; //! ZV9001
 let c = undefined; //! ZV9001
 // Builtins aren't writable yet.
 NaN = 1; //! ZV9001
-// Type names other than the primitives.
-let d: Number = 1; //! ZV9001
+// Library types we don't have yet.
+let d: Date; //! ZV9001
 // A declaration in one `case` read from another throws a ReferenceError, which isn't
 // implemented yet. (tsc only catches this when the type can't hold `undefined`.)
 switch (1 + 1) {

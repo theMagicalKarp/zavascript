@@ -22,6 +22,10 @@ const Inference = struct {
     candidates: std.ArrayList(*const Type) = .empty,
     /// Candidates from where it's used for what's passed back, like a callback's parameters.
     contra: std.ArrayList(*const Type) = .empty,
+    /// Candidates for it as the one type parameter in a union, from what matched none of the
+    /// union's other members (`number` for `T` from `number` to `T | T[]`), only used when there
+    /// are no direct ones (tsc's `NakedTypeVariable` priority).
+    naked: std.ArrayList(*const Type) = .empty,
     /// Candidates from inside mapped types, like `T` from `Partial<T>`, only used when there are
     /// no others (tsc's lower inference priorities).
     weak: std.ArrayList(*const Type) = .empty,
@@ -62,7 +66,7 @@ pub const Context = struct {
     /// Whether any candidate has been found for the type parameter at `index`.
     pub fn hasCandidates(this: *const Context, index: usize) bool {
         const i = this.inferences[index];
-        return i.candidates.items.len > 0 or i.contra.items.len > 0 or i.weak.items.len > 0;
+        return i.candidates.items.len > 0 or i.contra.items.len > 0 or i.naked.items.len > 0 or i.weak.items.len > 0;
     }
 
     /// Infers from a value of type `source` being used where `target` is expected.
@@ -86,6 +90,12 @@ pub const Context = struct {
         }
         if (target.* == .@"union") {
             return this.inferToUnion(source, target, contra, top, depth);
+        }
+        if (target.* == .intersection) {
+            for (target.intersection) |m| {
+                try this.inferIn(source, m, contra, false, depth + 1);
+            }
+            return;
         }
         if (source.* == .@"union") {
             for (source.@"union") |m| {
@@ -111,10 +121,13 @@ pub const Context = struct {
                 else => {},
             },
             .object => |to| {
-                if (source.* != .object) {
-                    return;
+                if (source.* == .function and to.calls.len == 1) {
+                    const t: Type = .{ .function = to.calls[0] };
+                    return this.inferIn(source, &t, contra, false, depth + 1);
                 }
-                const so = source.object;
+                // A primitive or array is matched by its apparent type, as `number[]` is by
+                // `Array<number>` to `Iterable<T>`.
+                const so = if (source.* == .object) source.object else types.apparentObject(source) orelse return;
                 if (to.generic != null and so.generic == to.generic and so.type_arguments.len == to.type_arguments.len) {
                     // `Box<number>` to `Box<T>`.
                     for (so.type_arguments, to.type_arguments) |s, t| {
@@ -126,8 +139,37 @@ pub const Context = struct {
                     const sp = so.find(tp.name) orelse continue;
                     try this.inferIn(sp.type, tp.type, contra, false, depth + 1);
                 }
+                if (to.string_index) |index| {
+                    // An object's properties make its implicit index signature.
+                    if (so.string_index) |si| {
+                        try this.inferIn(si.type, index.type, contra, false, depth + 1);
+                    } else if (!so.interface) {
+                        var parts: std.ArrayList(*const Type) = .empty;
+                        for (so.properties) |p| {
+                            try parts.append(this.arena, p.type);
+                        }
+                        if (parts.items.len > 0) {
+                            try this.inferIn(try types.unionOf(this.arena, parts.items), index.type, contra, false, depth + 1);
+                        }
+                    }
+                }
+                if (to.number_index) |index| {
+                    if (so.number_index orelse so.string_index) |si| {
+                        try this.inferIn(si.type, index.type, contra, false, depth + 1);
+                    }
+                }
+                if (to.calls.len == 1 and so.calls.len > 0) {
+                    const s: Type = .{ .function = so.calls[so.calls.len - 1] };
+                    const t: Type = .{ .function = to.calls[0] };
+                    try this.inferIn(&s, &t, contra, false, depth + 1);
+                }
             },
             .function => |tf| {
+                if (source.* == .object and source.object.calls.len > 0) {
+                    // An overloaded function is matched by its last signature.
+                    const s: Type = .{ .function = source.object.calls[source.object.calls.len - 1] };
+                    return this.inferIn(&s, target, contra, false, depth + 1);
+                }
                 if (source.* != .function) {
                     return;
                 }
@@ -139,6 +181,9 @@ pub const Context = struct {
                     const s = sf.parameterType(index) orelse continue;
                     const t = tf.parameterType(index) orelse continue;
                     try this.inferIn(s, t, !contra, false, depth + 1);
+                }
+                if (sf.predicate != null and tf.predicate != null) {
+                    try this.inferIn(sf.predicate.?.type, tf.predicate.?.type, contra, false, depth + 1);
                 }
                 try this.inferIn(sf.returns, tf.returns, contra, false, depth + 1);
             },
@@ -184,7 +229,7 @@ pub const Context = struct {
             return;
         }
         const t = try types.unionOf(this.arena, unmatched.items);
-        try (if (contra) &i.contra else &i.candidates).append(this.arena, t);
+        try (if (contra) &i.contra else &i.naked).append(this.arena, t);
         if (!top) {
             i.top_level = false;
         }
@@ -307,6 +352,14 @@ pub const Context = struct {
                 }
             } else if (i.contra.items.len > 0) {
                 t = commonSubtype(i.contra.items);
+            } else if (i.naked.items.len > 0) {
+                const primitive = if (param.constraint) |c| hasPrimitiveConstraint(c) else false;
+                const widen = !primitive and i.top_level and (fixing or !atTopLevel(returns, i.parameter));
+                const base = try this.arena.alloc(*const Type, i.naked.items.len);
+                for (base, i.naked.items) |*b, c| {
+                    b.* = if (primitive) try types.regular(this.arena, c) else if (widen) try types.widenFresh(this.arena, c) else c;
+                }
+                t = try commonSupertype(this.arena, base);
             } else if (i.weak.items.len > 0) {
                 t = try commonSupertype(this.arena, i.weak.items);
             }

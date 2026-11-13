@@ -203,7 +203,7 @@ fn isDecimalLiteral(s: []const u8) bool {
 }
 
 /// Strips the characters JS counts as whitespace or line terminators.
-fn trimWhitespace(s: []const u8) []const u8 {
+pub fn trimWhitespace(s: []const u8) []const u8 {
     var start: usize = 0;
     var end: usize = s.len;
     while (start < end) {
@@ -227,7 +227,8 @@ fn trimWhitespace(s: []const u8) []const u8 {
     return s[start..end];
 }
 
-fn whitespaceAt(s: []const u8) usize {
+/// How many bytes of whitespace (or a line terminator) `s` starts with: one character's worth.
+pub fn whitespaceAt(s: []const u8) usize {
     switch (s[0]) {
         ' ', '\t', '\n', '\r', 0x0B, 0x0C => return 1,
         else => {},
@@ -241,6 +242,396 @@ fn whitespaceAt(s: []const u8) usize {
         0xA0, 0x1680, 0x2000...0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000, 0xFEFF => len,
         else => 0,
     };
+}
+
+/// The shortest digits that round-trip `x` (positive and finite), and the exponent `n` that makes
+/// the value 0.digits × 10^n.
+fn shortestDigits(buffer: *[32]u8, x: f64) struct { []const u8, i32 } {
+    var scratch: [64]u8 = undefined;
+    const scientific = std.fmt.bufPrint(&scratch, "{e}", .{x}) catch unreachable;
+    const e_index = std.mem.indexOfScalar(u8, scientific, 'e').?;
+    var k: usize = 0;
+    for (scientific[0..e_index]) |c| {
+        if (c == '.') {
+            continue;
+        }
+        buffer[k] = c;
+        k += 1;
+    }
+    const n: i32 = (std.fmt.parseInt(i32, scientific[e_index + 1 ..], 10) catch unreachable) + 1;
+    return .{ buffer[0..k], n };
+}
+
+const Big = std.math.big.int.Managed;
+
+/// A positive finite double as the exact fraction `numerator / denominator`.
+fn exactFraction(allocator: std.mem.Allocator, x: f64) error{OutOfMemory}!struct { Big, Big } {
+    const bits: u64 = @bitCast(x);
+    const biased: i32 = @intCast((bits >> 52) & 0x7FF);
+    const fraction = bits & ((1 << 52) - 1);
+    const mantissa: u64 = if (biased == 0) fraction else fraction | (1 << 52);
+    const exponent: i32 = (if (biased == 0) 1 else biased) - 1075;
+    var numerator = try Big.initSet(allocator, mantissa);
+    var denominator = try Big.initSet(allocator, 1);
+    if (exponent >= 0) {
+        try numerator.shiftLeft(&numerator, @intCast(exponent));
+    } else {
+        try denominator.shiftLeft(&denominator, @intCast(-exponent));
+    }
+    return .{ numerator, denominator };
+}
+
+/// round(numerator × 10^scale / denominator), with a tie going up (the larger `n` the spec picks).
+fn roundScaled(allocator: std.mem.Allocator, numerator: Big, denominator: Big, scale: i32) error{OutOfMemory}!Big {
+    var num = try numerator.clone();
+    var den = try denominator.clone();
+    var ten = try Big.initSet(allocator, 10);
+    var power = try Big.init(allocator);
+    try power.pow(&ten, @abs(scale));
+    if (scale >= 0) {
+        try num.mul(&num, &power);
+    } else {
+        try den.mul(&den, &power);
+    }
+    // floor((2 × num + den) / (2 × den))
+    try num.shiftLeft(&num, 1);
+    try num.add(&num, &den);
+    try den.shiftLeft(&den, 1);
+    var quotient = try Big.init(allocator);
+    var remainder = try Big.init(allocator);
+    try quotient.divFloor(&remainder, &num, &den);
+    return quotient;
+}
+
+fn bigDigits(allocator: std.mem.Allocator, n: Big) error{OutOfMemory}![]const u8 {
+    return n.toString(allocator, 10, .lower) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => unreachable,
+    };
+}
+
+/// Number.prototype.toFixed (§21.1.3.3) for `digits` in 0..100.
+pub fn toFixed(allocator: std.mem.Allocator, x: f64, digits: u32) error{OutOfMemory}![]const u8 {
+    if (!std.math.isFinite(x) or @abs(x) >= 1e21) {
+        return toString(allocator, x);
+    }
+    var m: []const u8 = "0";
+    if (x != 0) {
+        const fraction = try exactFraction(allocator, @abs(x));
+        m = try bigDigits(allocator, try roundScaled(allocator, fraction[0], fraction[1], @intCast(digits)));
+    }
+    var out: std.ArrayList(u8) = .empty;
+    // `(-0).toFixed()` is "0", but `(-0.0001).toFixed(2)` is "-0.00".
+    if (x < 0) {
+        try out.append(allocator, '-');
+    }
+    if (digits == 0) {
+        try out.appendSlice(allocator, m);
+        return out.toOwnedSlice(allocator);
+    }
+    // At least one digit before the point.
+    if (m.len <= digits) {
+        const padded = try allocator.alloc(u8, digits + 1);
+        @memset(padded[0 .. digits + 1 - m.len], '0');
+        @memcpy(padded[digits + 1 - m.len ..], m);
+        m = padded;
+    }
+    const integer_digits = m.len - digits;
+    try out.appendSlice(allocator, m[0..integer_digits]);
+    try out.append(allocator, '.');
+    try out.appendSlice(allocator, m[integer_digits..]);
+    return out.toOwnedSlice(allocator);
+}
+
+/// `p` significant digits of `|x|` (positive and finite), rounded with ties up, and the decimal
+/// exponent of the first: `x ≈ d.ddd × 10^e`.
+fn precisionDigits(allocator: std.mem.Allocator, x: f64, p: u32) error{OutOfMemory}!struct { []const u8, i32 } {
+    const fraction = try exactFraction(allocator, x);
+    var e: i32 = @intFromFloat(@floor(std.math.log10(x)));
+    // The estimate can be off by one either way.
+    var digits = try bigDigits(allocator, try roundScaled(allocator, fraction[0], fraction[1], @as(i32, @intCast(p)) - 1 - e));
+    if (digits.len > p) {
+        e += 1;
+        digits = try bigDigits(allocator, try roundScaled(allocator, fraction[0], fraction[1], @as(i32, @intCast(p)) - 1 - e));
+    } else if (digits.len < p) {
+        e -= 1;
+        digits = try bigDigits(allocator, try roundScaled(allocator, fraction[0], fraction[1], @as(i32, @intCast(p)) - 1 - e));
+    }
+    if (digits.len > p) {
+        // Rounding up made it `10^p`.
+        e += 1;
+        digits = digits[0..p];
+    }
+    return .{ digits, e };
+}
+
+fn exponentPart(out: *std.ArrayList(u8), allocator: std.mem.Allocator, e: i32) error{OutOfMemory}!void {
+    try out.print(allocator, "e{c}{d}", .{ @as(u8, if (e < 0) '-' else '+'), @abs(e) });
+}
+
+/// Number.prototype.toExponential (§21.1.3.2); null `digits` means as many as it takes.
+pub fn toExponential(allocator: std.mem.Allocator, x: f64, digits: ?u32) error{OutOfMemory}![]const u8 {
+    if (!std.math.isFinite(x)) {
+        return toString(allocator, x);
+    }
+    var out: std.ArrayList(u8) = .empty;
+    if (x < 0) {
+        try out.append(allocator, '-');
+    }
+    var m: []const u8 = undefined;
+    var e: i32 = 0;
+    if (x == 0) {
+        const zeros_ = try allocator.alloc(u8, (digits orelse 0) + 1);
+        @memset(zeros_, '0');
+        m = zeros_;
+    } else if (digits) |f| {
+        m, e = try precisionDigits(allocator, @abs(x), f + 1);
+    } else {
+        var buffer: [32]u8 = undefined;
+        const shortest, const n = shortestDigits(&buffer, @abs(x));
+        m = try allocator.dupe(u8, shortest);
+        e = n - 1;
+    }
+    try out.append(allocator, m[0]);
+    if (m.len > 1) {
+        try out.append(allocator, '.');
+        try out.appendSlice(allocator, m[1..]);
+    }
+    try exponentPart(&out, allocator, e);
+    return out.toOwnedSlice(allocator);
+}
+
+/// Number.prototype.toPrecision (§21.1.3.5) for `p` in 1..100.
+pub fn toPrecision(allocator: std.mem.Allocator, x: f64, p: u32) error{OutOfMemory}![]const u8 {
+    if (!std.math.isFinite(x)) {
+        return toString(allocator, x);
+    }
+    var out: std.ArrayList(u8) = .empty;
+    if (x < 0) {
+        try out.append(allocator, '-');
+    }
+    var m: []const u8 = undefined;
+    var e: i32 = 0;
+    if (x == 0) {
+        const zeros_ = try allocator.alloc(u8, p);
+        @memset(zeros_, '0');
+        m = zeros_;
+    } else {
+        m, e = try precisionDigits(allocator, @abs(x), p);
+    }
+    const pi: i32 = @intCast(p);
+    if (e < -6 or e >= pi) {
+        try out.append(allocator, m[0]);
+        if (p > 1) {
+            try out.append(allocator, '.');
+            try out.appendSlice(allocator, m[1..]);
+        }
+        try exponentPart(&out, allocator, e);
+    } else if (e == pi - 1) {
+        try out.appendSlice(allocator, m);
+    } else if (e >= 0) {
+        const point: usize = @intCast(e + 1);
+        try out.appendSlice(allocator, m[0..point]);
+        try out.append(allocator, '.');
+        try out.appendSlice(allocator, m[point..]);
+    } else {
+        try out.appendSlice(allocator, "0.");
+        try out.appendNTimes(allocator, '0', @intCast(-(e + 1)));
+        try out.appendSlice(allocator, m);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Number.prototype.toString with a radix other than 10, the way V8 does it
+/// (`DoubleToRadixCString`): the fraction gets only as many digits as the double's precision
+/// has, rounded to even.
+pub fn toRadix(allocator: std.mem.Allocator, x: f64, radix: u8) error{OutOfMemory}![]const u8 {
+    if (radix == 10 or !std.math.isFinite(x) or x == 0) {
+        return toString(allocator, x);
+    }
+    const chars = "0123456789abcdefghijklmnopqrstuvwxyz";
+    const size = 2200;
+    var buffer: [size]u8 = undefined;
+    var integer_cursor: usize = size / 2;
+    var fraction_cursor: usize = integer_cursor;
+    const negative = x < 0;
+    const v = @abs(x);
+    const r: f64 = @floatFromInt(radix);
+    var integer = @floor(v);
+    var fraction = v - integer;
+    var delta = 0.5 * (std.math.nextAfter(f64, v, std.math.inf(f64)) - v);
+    delta = @max(std.math.nextAfter(f64, 0.0, 1.0), delta);
+    if (fraction >= delta) {
+        buffer[fraction_cursor] = '.';
+        fraction_cursor += 1;
+        while (true) {
+            fraction *= r;
+            delta *= r;
+            const digit: usize = @intFromFloat(fraction);
+            buffer[fraction_cursor] = chars[digit];
+            fraction_cursor += 1;
+            fraction -= @floatFromInt(digit);
+            if (fraction > 0.5 or (fraction == 0.5 and (digit & 1) == 1)) {
+                if (fraction + delta > 1) {
+                    // Round up, carrying through the digits already written.
+                    while (true) {
+                        fraction_cursor -= 1;
+                        if (fraction_cursor == size / 2) {
+                            integer += 1;
+                            break;
+                        }
+                        const c = buffer[fraction_cursor];
+                        const d: usize = if (c > '9') c - 'a' + 10 else c - '0';
+                        if (d + 1 < radix) {
+                            buffer[fraction_cursor] = chars[d + 1];
+                            fraction_cursor += 1;
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+            if (!(fraction >= delta)) {
+                break;
+            }
+        }
+    }
+    // Digits past the double's precision are zeros.
+    while (integer / r >= 9007199254740992.0) {
+        integer /= r;
+        integer_cursor -= 1;
+        buffer[integer_cursor] = '0';
+    }
+    while (true) {
+        const remainder = @mod(integer, r);
+        integer_cursor -= 1;
+        buffer[integer_cursor] = chars[@intFromFloat(remainder)];
+        integer = (integer - remainder) / r;
+        if (!(integer > 0)) {
+            break;
+        }
+    }
+    if (negative) {
+        integer_cursor -= 1;
+        buffer[integer_cursor] = '-';
+    }
+    return allocator.dupe(u8, buffer[integer_cursor..fraction_cursor]);
+}
+
+/// parseInt (§19.2.5) of a string, with `radix` already ToInt32'd.
+pub fn parseInt(s: []const u8, radix_given: i32) f64 {
+    var rest = trimStart(s);
+    var sign: f64 = 1;
+    if (rest.len > 0 and (rest[0] == '+' or rest[0] == '-')) {
+        if (rest[0] == '-') {
+            sign = -1;
+        }
+        rest = rest[1..];
+    }
+    var radix = radix_given;
+    var strip_prefix = true;
+    if (radix != 0) {
+        if (radix < 2 or radix > 36) {
+            return std.math.nan(f64);
+        }
+        if (radix != 16) {
+            strip_prefix = false;
+        }
+    } else {
+        radix = 10;
+    }
+    if (strip_prefix and rest.len >= 2 and rest[0] == '0' and (rest[1] == 'x' or rest[1] == 'X')) {
+        rest = rest[2..];
+        radix = 16;
+    }
+    const r: u8 = @intCast(radix);
+    var end: usize = 0;
+    while (end < rest.len) : (end += 1) {
+        _ = std.fmt.charToDigit(rest[end], r) catch break;
+    }
+    const digits = rest[0..end];
+    if (digits.len == 0) {
+        return std.math.nan(f64);
+    }
+    const magnitude = switch (r) {
+        10 => std.fmt.parseFloat(f64, digits) catch unreachable,
+        2, 4, 8, 16, 32 => parseRadix(digits, r),
+        else => blk: {
+            var n: f64 = 0;
+            for (digits) |c| {
+                n = n * @as(f64, @floatFromInt(r)) + @as(f64, @floatFromInt(std.fmt.charToDigit(c, r) catch unreachable));
+            }
+            break :blk n;
+        },
+    };
+    return sign * magnitude;
+}
+
+/// parseFloat (§19.2.4): the longest prefix (after whitespace) that's a decimal literal.
+pub fn parseFloat(s: []const u8) f64 {
+    const rest = trimStart(s);
+    var i: usize = 0;
+    var sign: f64 = 1;
+    if (i < rest.len and (rest[i] == '+' or rest[i] == '-')) {
+        if (rest[i] == '-') {
+            sign = -1;
+        }
+        i += 1;
+    }
+    if (std.mem.startsWith(u8, rest[i..], "Infinity")) {
+        return sign * std.math.inf(f64);
+    }
+    const start = i;
+    var mantissa_digits: usize = 0;
+    while (i < rest.len and std.ascii.isDigit(rest[i])) : (i += 1) {
+        mantissa_digits += 1;
+    }
+    if (i < rest.len and rest[i] == '.') {
+        const point = i;
+        i += 1;
+        var fraction_digits: usize = 0;
+        while (i < rest.len and std.ascii.isDigit(rest[i])) : (i += 1) {
+            fraction_digits += 1;
+        }
+        mantissa_digits += fraction_digits;
+        if (fraction_digits == 0) {
+            i = point + 1;
+        }
+    }
+    if (mantissa_digits == 0) {
+        return std.math.nan(f64);
+    }
+    var end = i;
+    if (i < rest.len and (rest[i] == 'e' or rest[i] == 'E')) {
+        var j = i + 1;
+        if (j < rest.len and (rest[j] == '+' or rest[j] == '-')) {
+            j += 1;
+        }
+        const exponent_start = j;
+        while (j < rest.len and std.ascii.isDigit(rest[j])) {
+            j += 1;
+        }
+        if (j > exponent_start) {
+            end = j;
+        }
+    }
+    var text = rest[start..end];
+    if (text[text.len - 1] == '.') {
+        text = text[0 .. text.len - 1];
+    }
+    return sign * (std.fmt.parseFloat(f64, text) catch std.math.nan(f64));
+}
+
+fn trimStart(s: []const u8) []const u8 {
+    var start: usize = 0;
+    while (start < s.len) {
+        const len = whitespaceAt(s[start..]);
+        if (len == 0) {
+            break;
+        }
+        start += len;
+    }
+    return s[start..];
 }
 
 fn expectFormat(expected: []const u8, x: f64) !void {
